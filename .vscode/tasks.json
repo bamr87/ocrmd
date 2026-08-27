@@ -1,0 +1,53 @@
+{
+  // Terminal > Run Task. The default build task (Cmd+Shift+B) runs lint + tests.
+  "version": "2.0.0",
+  "options": { "cwd": "${workspaceFolder}" },
+  "tasks": [
+    {
+      "label": "ocrmd: test",
+      "type": "shell",
+      "command": ".venv/bin/python -m pytest tests -p no:cacheprovider",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "ocrmd: lint (ruff)",
+      "type": "shell",
+      "command": ".venv/bin/ruff check ocrmd tests",
+      "problemMatcher": []
+    },
+    {
+      "label": "ocrmd: lint + test",
+      "dependsOn": ["ocrmd: lint (ruff)", "ocrmd: test"],
+      "dependsOrder": "sequence",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "ocrmd: serve (web UI)",
+      "type": "shell",
+      "command": ".venv/bin/ocrmd serve",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "reveal": "always" }
+    },
+    {
+      "label": "ocrmd: doctor",
+      "type": "shell",
+      "command": ".venv/bin/ocrmd doctor --costs",
+      "problemMatcher": []
+    },
+    {
+      "label": "ocrmd: status",
+      "type": "shell",
+      "command": ".venv/bin/ocrmd status",
+      "problemMatcher": []
+    },
+    {
+      "label": "ocrmd: install (editable, dev extras)",
+      "type": "shell",
+      "command": "python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'",
+      "problemMatcher": []
+    }
+  ]
+}

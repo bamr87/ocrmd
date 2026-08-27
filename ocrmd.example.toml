@@ -1,0 +1,42 @@
+# ocrmd configuration. Copy to <root>/ocrmd.toml (or ~/.config/ocrmd/config.toml).
+# Every key can also be set as an environment variable: OCRMD_<KEY> (e.g. OCRMD_MODEL=claude-haiku-4-5).
+# Precedence: defaults < ~/.config/ocrmd/config.toml < <root>/ocrmd.toml < OCRMD_* env < CLI flags.
+
+# --- LLM ---------------------------------------------------------------------------------------
+model = "claude-opus-5"        # OAuth (subscription) tokens only serve claude-haiku-4-5, see README
+provider = "anthropic"         # anthropic | xai
+llm_workers = 2                # concurrent LLM calls during a scan
+llm_timeout = 180.0            # seconds per request
+llm_max_retries = 3            # SDK retries on 429/5xx/connection errors
+llm_failure_limit = 3          # consecutive service failures before a scan drops to OCR-only
+llm_effort = "medium"          # transcription is perception, not reasoning
+
+# --- camera / auto-shutter (fixed rig over a textbook) -----------------------------------------
+camera_index = 0
+focus = "settle"               # continuous | locked | settle (continuous until the first capture, then lock) | off
+settle_after = 1
+stable_frames = 8              # ~0.8 s of stillness before the shutter can fire
+motion_threshold = 4.0
+novelty_threshold = 12
+blur_threshold = 60.0
+occlusion_cover = 0.05         # fraction of the page a hand must cover to hold the shutter
+occlusion_rebaseline = 30      # frames a persistent non-hand intrusion is tolerated before re-baselining
+burst_frames = 3               # frames read at the shutter; the sharpest is kept (1 = off)
+capture_cooldown = 1.0
+# resolution = "1280x960"      # default: the camera's largest mode
+
+# --- OCR ---------------------------------------------------------------------------------------
+# ocr_engines = ["apple_vision", "rapidocr"]   # default []: the best installed engine, plus a second one when ocr_ensemble
+ocr_ensemble = true            # two engines vote per line: agreed words trusted, disagreements flagged (~+1.5 s/page)
+ocr_languages = ["en-US"]      # Vision recognition languages; [] = automatic
+ocr_min_side = 1400            # crops are upscaled (<= 3x) until the short side reaches this
+
+# --- quality / reconcile -----------------------------------------------------------------------
+min_page_width = 900           # px across one page; below it OCR is unreliable and the HUD says "move closer"
+near_duplicate_distance = 4
+flag_threshold = 0.95
+suspect_threshold = 0.35
+
+# --- logging -----------------------------------------------------------------------------------
+log_file = "ocrmd.log"         # relative to root; "" disables
+log_level = "INFO"

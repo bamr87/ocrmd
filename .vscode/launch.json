@@ -1,0 +1,247 @@
+{
+  // ocrmd debug configurations. All run the CLI in-process (module: ocrmd.cli) so breakpoints work
+  // anywhere in the package, and load .env (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / OCRMD_MODEL).
+  // Settings also come from ocrmd.toml and OCRMD_* variables; add "env": {"OCRMD_MODEL": "..."} to a
+  // configuration to override one for that run.
+  "version": "0.2.0",
+  "configurations": [
+    // ---- diagnostics ------------------------------------------------------------------------
+    {
+      "name": "ocrmd: doctor",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["doctor", "--costs"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: ocr-bench (compare installed engines)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["ocr-bench", "--doc", "${input:docSlug}", "--compare", "--verbose"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: status (problem pages)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["status", "--doc", "${input:docSlug}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ---- web UI -----------------------------------------------------------------------------
+    {
+      // uvicorn runs in-process: breakpoints in ocrmd/web/*.py and the session/pipeline fire from the browser.
+      "name": "ocrmd: serve (web UI, opens browser)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["serve", "--port", "8765"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: serve (debug logs, no browser)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["--debug", "serve", "--port", "8765", "--no-open"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ---- scanning ---------------------------------------------------------------------------
+    {
+      // The recommended fixed-rig setup: camera by name (indices shuffle on macOS), autofocus until the
+      // first capture then locked, LLM pass on.
+      "name": "ocrmd: scan (C525, settle focus)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["scan", "--doc", "${input:docSlug}", "--camera", "${input:cameraName}", "--focus", "settle"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: scan (no LLM, OCR only)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["scan", "--doc", "${input:docSlug}", "--camera", "${input:cameraName}", "--focus", "settle", "--no-llm"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      // Unattended smoke test: no window, stops by itself. Handy for stepping through the capture gates.
+      "name": "ocrmd: scan (headless, 60 s, debug logs)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["--debug", "scan", "--doc", "${input:docSlug}", "--camera", "${input:cameraName}", "--focus", "settle", "--no-preview", "--duration", "60"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: scan (camera index 0)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["scan", "--doc", "${input:docSlug}", "--camera", "0"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: ingest (prompt for path)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["ingest", "${input:imagePath}", "--doc", "${input:docSlug}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ---- processing -------------------------------------------------------------------------
+    {
+      "name": "ocrmd: verify (missing LLM pass)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["verify", "--doc", "${input:docSlug}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: verify (flagged only)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["verify", "--doc", "${input:docSlug}", "--flagged-only"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      // Re-runs every page made by an older prompt or a different model. Costs tokens.
+      "name": "ocrmd: verify --refresh (COSTS TOKENS)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["verify", "--doc", "${input:docSlug}", "--refresh"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: reprocess (asks to confirm)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["reprocess", "--doc", "${input:docSlug}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: review (flagged pages, terminal)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["review", "--doc", "${input:docSlug}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "ocrmd: build",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocrmd.cli",
+      "args": ["build"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ---- tests / misc -----------------------------------------------------------------------
+    {
+      "name": "pytest: all",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests", "-x", "-p", "no:cacheprovider"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-x", "-p", "no:cacheprovider"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "python: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "docSlug",
+      "type": "promptString",
+      "description": "Document slug (letters, digits, - _ .)",
+      "default": "lsat"
+    },
+    {
+      "id": "cameraName",
+      "type": "promptString",
+      "description": "Camera: index or a device-name substring (indices shuffle between runs on macOS)",
+      "default": "c525"
+    },
+    {
+      "id": "imagePath",
+      "type": "promptString",
+      "description": "Image/PDF file or directory to ingest",
+      "default": "inbox"
+    }
+  ]
+}

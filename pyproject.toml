@@ -1,0 +1,44 @@
+[project]
+name = "ocrmd"
+version = "0.4.0"
+description = "Incremental webcam/image scanning to cross-checked Markdown"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  # opencv 5.0.0.93's KleidiCV HAL segfaults in cv2.resize on some page crops (arm64 macOS, measured); stay on 4.x
+  "opencv-python>=4.9,<5", "numpy>=1.26", "anthropic>=1.0", "pydantic>=2", "rapidfuzz", "pyyaml", "typer>=0.12",
+  "python-dotenv", "pillow", "fastapi>=0.110", "uvicorn>=0.27", "python-multipart",
+  "pyobjc-framework-Vision; sys_platform == 'darwin'", "pyobjc-framework-AVFoundation; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+rapidocr = ["rapidocr>=3.0", "onnxruntime>=1.20"]   # PP-OCR on ONNX Runtime: second engine on macOS, the primary elsewhere
+tesseract = ["pytesseract"]     # last-resort engine (needs the tesseract binary); weak on camera images
+pdf = ["pymupdf"]               # `ocrmd ingest file.pdf`
+dev = ["pytest>=8", "ruff>=0.5", "httpx"]   # httpx: FastAPI's TestClient
+
+[project.scripts]
+ocrmd = "ocrmd.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ocrmd*"]
+
+[tool.setuptools.package-data]
+"ocrmd.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E401", "E501", "E701", "E702", "E731", "B008"]   # compact imports/one-liners are deliberate; B008 is the typer idiom

@@ -1,0 +1,627 @@
+/* ocrmd web UI — vanilla JS single-page app. No build step, no external dependencies. */
+"use strict";
+
+const $ = (sel, el = document) => el.querySelector(sel);
+const view = $("#view");
+const STATUSES = ["verified", "reviewed", "flagged", "suspect", "illegible", "blank", "unverified", "error"];
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtTime = (t) => (t ? new Date(t * 1000).toLocaleTimeString() : "");
+const fmtNum = (v, d = 2) => (v == null ? "" : Number(v).toFixed(d));
+let timers = [];
+
+function toast(msg, kind = "") {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`; el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    if (opts.body instanceof FormData) init.body = opts.body;
+    else { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
+  }
+  const r = await fetch(path, init);
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { msg = (await r.json()).detail || msg; } catch (_) { /* ignore */ }
+    throw new Error(msg);
+  }
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? r.json() : r.text();
+}
+
+function every(ms, fn) { const id = setInterval(fn, ms); timers.push(id); return id; }
+function clearTimers() { timers.forEach(clearInterval); timers = []; }
+
+/* ---------- tiny markdown renderer for the ocrmd dialect ---------- */
+function inline(s) {
+  s = esc(s);
+  s = s.replace(/==\[(.+?)\]==\[\^ocrmd-(\d+)\]/g, '<mark>$1</mark><sup>[$2]</sup>');
+  s = s.replace(/\[\^([^\]]+)\]/g, '<sup>[$1]</sup>');
+  s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*]+)\*/g, "$1<i>$2</i>");
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  return s;
+}
+function renderMd(md) {
+  const lines = md.split("\n"); const out = []; let para = [], list = null, table = null, quote = [];
+  const flushP = () => { if (para.length) { out.push(`<p>${inline(para.join(" "))}</p>`); para = []; } };
+  const flushL = () => { if (list) { out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`); list = null; } };
+  const flushT = () => { if (table) { out.push(`<table>${table.map((r, i) => `<tr>${r.map((c) => `<${i ? "td" : "th"}>${inline(c)}</${i ? "td" : "th"}>`).join("")}</tr>`).join("")}</table>`); table = null; } };
+  const flushQ = () => { if (quote.length) { out.push(`<blockquote>${inline(quote.join(" "))}</blockquote>`); quote = []; } };
+  const flushAll = () => { flushP(); flushL(); flushT(); flushQ(); };
+  for (const raw of lines) {
+    const l = raw.replace(/\s+$/, "");
+    let m;
+    if (!l.trim()) { flushAll(); continue; }
+    if ((m = l.match(/^(#{1,6})\s+(.*)/))) { flushAll(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); continue; }
+    if ((m = l.match(/^\[\^([^\]]+)\]:\s*(.*)/))) { flushAll(); out.push(`<div class="fn"><sup>[${esc(m[1])}]</sup> ${inline(m[2])}</div>`); continue; }
+    if ((m = l.match(/^>\s?(.*)/))) { flushP(); flushL(); flushT(); quote.push(m[1]); continue; }
+    if (/^\|.*\|$/.test(l)) { flushP(); flushL(); flushQ(); if (/^\|[\s:|-]+\|$/.test(l)) continue; table = table || []; table.push(l.slice(1, -1).split("|").map((c) => c.trim())); continue; }
+    if ((m = l.match(/^\s*[-*+]\s+(.*)/))) { flushP(); flushT(); flushQ(); if (!list || list.tag !== "ul") { flushL(); list = { tag: "ul", items: [] }; } list.items.push(m[1]); continue; }
+    if ((m = l.match(/^\s*\d+[.)]\s+(.*)/))) { flushP(); flushT(); flushQ(); if (!list || list.tag !== "ol") { flushL(); list = { tag: "ol", items: [] }; } list.items.push(m[1]); continue; }
+    flushL(); flushT(); flushQ(); para.push(l);
+  }
+  flushAll();
+  return out.join("\n");
+}
+
+/* ---------- shared widgets ---------- */
+function statusBar(counts) {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  return `<div class="statusbar">${STATUSES.filter((s) => counts[s]).map((s) => `<span class="bg-${s}" style="width:${(100 * counts[s]) / total}%" title="${counts[s]} ${s}"></span>`).join("")}</div>`;
+}
+function countChips(counts, active, onclickAttr) {
+  return `<div class="chips">${STATUSES.filter((s) => counts[s]).map((s) => `<span class="chip ${active === s ? "on" : ""} s-${s}" ${onclickAttr ? `onclick="${onclickAttr}('${s}')"` : ""}>${counts[s]} ${s}</span>`).join("")}</div>`;
+}
+const badge = (s) => `<span class="badge s-${s}">${esc(s)}</span>`;
+function logHtml(entries) {
+  return entries.map((e) => `<div class="${esc(e.level)}"><span class="t">${fmtTime(e.at)}</span>${esc(e.line)}</div>`).join("");
+}
+
+/* ---------- top status (scan / jobs) ---------- */
+async function refreshTop() {
+  try {
+    const [scan, jobs] = await Promise.all([api("/api/scan"), api("/api/jobs")]);
+    const running = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
+    $("#top-status").innerHTML = (scan.running ? `<span class="live">● scanning ${esc(scan.doc)}</span>` : "") +
+      (running ? ` &nbsp; <a href="#/jobs">${running} job(s) running</a>` : "");
+  } catch (_) { /* server down */ }
+}
+
+/* ---------- views ---------- */
+async function dashboard() {
+  const [docs, doctor] = await Promise.all([api("/api/documents"), api("/api/doctor?cameras=false")]);
+  view.innerHTML = `
+  <div class="grid side">
+    <div>
+      <div class="row"><h1>Documents</h1><span class="right"></span>
+        <a class="btn" href="#/scan">New scan</a></div>
+      <div class="cards">${docs.map((d) => `
+        <div class="card">
+          <div class="row"><h3><a href="#/doc/${esc(d.slug)}">${esc(d.title || d.slug)}</a></h3>
+            ${d.scanning ? '<span class="right ok small">● scanning</span>' : ""}</div>
+          <div class="muted small">${esc(d.slug)} · ${d.pages} page(s)${d.kind ? " · " + esc(d.kind) : ""}</div>
+          ${statusBar(d.counts)}
+          ${countChips(d.counts)}
+          <div class="row small" style="margin-top:8px">
+            ${d.needs_reshoot.length ? `<span class="err">${d.needs_reshoot.length} to re-shoot</span>` : ""}
+            ${d.flagged ? `<a href="#/review/${esc(d.slug)}">${d.flagged} to review</a>` : ""}
+            ${d.unverified ? `<span class="muted">${d.unverified} without LLM pass</span>` : ""}
+            <span class="right"></span>
+            ${d.document_md ? `<a href="${d.document_md}" download>document.md</a>` : ""}
+          </div>
+        </div>`).join("") || '<div class="muted">No documents yet. Start a scan or upload images.</div>'}
+      </div>
+    </div>
+    <div>
+      <h2>System</h2>
+      <div class="panel">
+        <dl class="kv">
+          <dt>OCR</dt><dd>${esc(doctor.ocr_engine || "none")}</dd>
+          <dt>LLM</dt><dd>${esc(doctor.config.provider)} / ${esc(doctor.config.model)} ${doctor.credentials.anthropic || doctor.credentials.xai ? '<span class="ok">credentials found</span>' : '<span class="warn">no credentials — OCR only</span>'}</dd>
+          <dt>Prompt</dt><dd>${esc(doctor.config.prompt_version)}</dd>
+          <dt>Database</dt><dd>${doctor.db_integrity === "ok" ? '<span class="ok">ok</span>' : `<span class="err">${esc(doctor.db_integrity)}</span>`}</dd>
+          <dt>Root</dt><dd class="mono">${esc(doctor.root)}</dd>
+          ${doctor.orphan_artifacts ? `<dt>Orphans</dt><dd>${doctor.orphan_artifacts} file(s)</dd>` : ""}
+          ${doctor.open_batches ? `<dt>Batches</dt><dd>${doctor.open_batches} open</dd>` : ""}
+        </dl>
+        <div style="margin-top:8px"><a href="#/settings">full doctor report →</a></div>
+      </div>
+      <h2>Spend</h2>
+      <div class="panel">
+        ${doctor.costs.length ? `<table><tr><th>model</th><th class="num">calls</th><th class="num">in</th><th class="num">out</th><th class="num">avg ms</th></tr>
+        ${doctor.costs.map((c) => `<tr><td class="mono">${esc(c.model)}</td><td class="num">${c.n}</td><td class="num">${c.tokens_in.toLocaleString()}</td><td class="num">${c.tokens_out.toLocaleString()}</td><td class="num">${c.avg_latency_ms}</td></tr>`).join("")}</table>` : '<span class="muted">no LLM calls yet</span>'}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- scan ---------- */
+let scanState = null;
+async function scanView() {
+  const [docs, cams, snap, settings] = await Promise.all([api("/api/documents"), api("/api/cameras").catch(() => []), api("/api/scan"), api("/api/settings")]);
+  scanState = snap;
+  view.innerHTML = `
+  <div class="grid side">
+    <div>
+      <div class="video" id="video">
+        <img id="stream" alt="" style="${snap.running ? "" : "display:none"}">
+        <div class="overlay"><span class="gate" id="gate">${snap.running ? "…" : "idle"}</span><span id="pxpage" class="pxpage"></span><span id="occ" class="mono small" style="color:#ccc;display:none"></span></div>
+        <div id="video-placeholder" class="loading" style="${snap.running ? "display:none" : ""}">No scan running. Configure and start on the right.</div>
+      </div>
+      <div class="meters" id="meters"></div>
+      <div class="controls" id="controls" style="${snap.running ? "" : "display:none"}">
+        <button class="primary" data-cmd="capture" title="space">Capture now</button>
+        <button data-cmd="focus_lock" title="f">Lock focus</button>
+        <button data-cmd="focus_auto" title="F">Autofocus</button>
+        <button data-cmd="rotate" title="r">Rotate ⟳</button>
+        <button data-cmd="rotate_ccw" title="R">Rotate ⟲</button>
+        <button data-cmd="zoom_in" title="+">Zoom +</button>
+        <button data-cmd="zoom_out" title="-">Zoom −</button>
+        <button data-cmd="pan_up">↑</button><button data-cmd="pan_down">↓</button><button data-cmd="pan_left">←</button><button data-cmd="pan_right">→</button>
+        <button data-cmd="reset" title="0">Reset view</button>
+        <span class="right"></span>
+        <button class="danger" id="stop">Stop scan</button>
+      </div>
+      <h2>Events</h2>
+      <div class="log" id="scanlog"></div>
+    </div>
+    <div>
+      <div class="panel" id="scan-form" style="${snap.running ? "display:none" : ""}">
+        <h3 style="margin-top:0">Start a scan</h3>
+        <label>Document</label>
+        <div class="row"><select id="f-doc" class="grow">${docs.map((d) => `<option value="${esc(d.slug)}">${esc(d.slug)}${d.title ? " — " + esc(d.title) : ""}</option>`).join("")}<option value="__new__">new document…</option></select></div>
+        <input id="f-newdoc" placeholder="new-slug (letters, digits, - _ .)" style="display:${docs.length ? "none" : "block"};width:100%;margin-top:6px">
+        <label>Camera</label>
+        <select id="f-cam" style="width:100%">${cams.map((c) => `<option value="${c.index}">${c.index}: ${esc(c.name)}${c.format ? ` (${c.format[0]}×${c.format[1]})` : ""}</option>`).join("") || '<option value="0">0 (no cameras probed)</option>'}</select>
+        <div class="grid cols-2">
+          <div><label>Focus</label><select id="f-focus" style="width:100%">${["settle", "continuous", "locked", "off"].map((f) => `<option ${f === settings.focus || (f === "settle" && settings.focus === "continuous") ? "selected" : ""}>${f}</option>`).join("")}</select></div>
+          <div><label>Resolution</label><input id="f-res" placeholder="largest (e.g. 1280x960)" style="width:100%"></div>
+          <div><label>Stop after (s)</label><input id="f-dur" type="number" min="10" placeholder="unlimited" style="width:100%"></div>
+          <div><label>Max pages</label><input id="f-max" type="number" min="1" placeholder="unlimited" style="width:100%"></div>
+        </div>
+        <label>Title (new documents)</label><input id="f-title" style="width:100%">
+        <label><input type="checkbox" id="f-nollm"> OCR only (no LLM pass)</label>
+        <div class="row" style="margin-top:12px"><button class="primary" id="start">Start scan</button>
+          <span class="muted small">LLM: ${esc(settings.provider)}/${esc(settings.model)} × ${settings.llm_workers}</span></div>
+      </div>
+      <div class="panel" id="scan-status" style="${snap.running ? "" : "display:none"}">
+        <h3 style="margin-top:0">Session</h3>
+        <dl class="kv" id="scan-kv"></dl>
+        <h3>Recent pages</h3>
+        <div class="recent" id="recent"></div>
+        <div id="advice" class="warn small" style="margin-top:8px"></div>
+      </div>
+      <div class="panel small" style="margin-top:12px">
+        <b>Keys</b> (when the video has focus): <kbd>space</kbd> capture · <kbd>f</kbd>/<kbd>F</kbd> focus · <kbd>r</kbd> rotate · <kbd>+</kbd>/<kbd>-</kbd> zoom · <kbd>w a s d</kbd> pan · <kbd>0</kbd> reset.<br>
+        Start with your hands out of the frame; the hand gate learns what paper looks like from the first frames.
+      </div>
+    </div>
+  </div>`;
+  $("#f-doc").onchange = () => { $("#f-newdoc").style.display = $("#f-doc").value === "__new__" ? "block" : "none"; };
+  $("#start").onclick = startScan;
+  $("#stop").onclick = () => api("/api/scan/stop", { method: "POST" }).then(() => toast("stopping — finishing queued pages")).catch((e) => toast(e.message, "err"));
+  view.querySelectorAll("[data-cmd]").forEach((b) => (b.onclick = () => sendCmd(b.dataset.cmd)));
+  document.onkeydown = (ev) => {
+    if (!scanState?.running || ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) return;
+    const map = { " ": "capture", f: "focus_lock", F: "focus_auto", r: "rotate", R: "rotate_ccw", "+": "zoom_in", "=": "zoom_in", "-": "zoom_out", w: "pan_up", s: "pan_down", a: "pan_left", d: "pan_right", "0": "reset" };
+    if (map[ev.key]) { ev.preventDefault(); sendCmd(map[ev.key]); }
+  };
+  if (snap.running) attachStream();
+  renderScan(snap);
+  every(500, pollScan);
+}
+function sendCmd(cmd) { api("/api/scan/command", { method: "POST", body: { command: cmd } }).catch((e) => toast(e.message, "err")); }
+function attachStream() { const img = $("#stream"); if (img && !img.src) { img.src = `/api/scan/stream?t=${Date.now()}`; img.style.display = "block"; $("#video-placeholder").style.display = "none"; } }
+async function startScan() {
+  const docSel = $("#f-doc").value;
+  const doc = docSel === "__new__" ? $("#f-newdoc").value.trim() : docSel;
+  if (!doc) return toast("choose or name a document", "err");
+  const body = { doc, camera: $("#f-cam").value, focus: $("#f-focus").value, no_llm: $("#f-nollm").checked,
+    resolution: $("#f-res").value || null, duration: Number($("#f-dur").value) || null, max_pages: Number($("#f-max").value) || null,
+    title: $("#f-title").value || null };
+  try {
+    const snap = await api("/api/scan/start", { method: "POST", body });
+    scanState = snap;
+    if (snap.error) return toast(snap.error, "err");
+    $("#scan-form").style.display = "none"; $("#scan-status").style.display = ""; $("#controls").style.display = "";
+    attachStream(); renderScan(snap); toast(`scanning into ${doc}`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function pollScan() {
+  try { scanState = await api("/api/scan"); } catch (_) { return; }
+  renderScan(scanState);
+}
+function renderScan(s) {
+  if (!$("#gate")) return;
+  const g = s.running ? (s.gate || {}) : {};
+  const gateEl = $("#gate");
+  const label = { hand: "HAND IN FRAME", "same page": "SAME PAGE" }[g.gate] || (g.gate || (s.running ? "…" : "idle")).toUpperCase();
+  gateEl.textContent = label;
+  gateEl.className = `gate ${(g.gate || "").replace(" page", "")}`;
+  const px = $("#pxpage");
+  if (g.page_px) { px.textContent = `${g.page_px}px/page`; px.className = `pxpage ${g.page_px >= (g.min_page_px || 900) ? "ok" : "low"}`; } else px.textContent = "";
+  $("#occ").textContent = g.occlusion ? `${g.occlusion}${g.clipped?.length ? "  CUT OFF: " + g.clipped.join("+") : ""}` : "";
+  $("#meters").innerHTML = s.running ? [
+    ["still", Math.min(1, (g.still || 0) / (g.stable_frames || 8)), `motion ${fmtNum(g.motion, 1)}`],
+    ["new page", Math.min(1, (g.novelty || 0) / (g.novelty_threshold || 12)), `${g.novelty ?? ""}`],
+    ["sharpness", Math.min(1, (g.sharp || 0) / ((g.floor || 60) * 3)), `${fmtNum(g.sharp, 0)} / floor ${fmtNum(g.floor, 0)}`],
+  ].map(([n, v, d]) => `<div class="meter"><div class="row"><span>${n}</span><span class="right muted">${d}</span></div><div class="bar"><i style="width:${v * 100}%"></i></div></div>`).join("") : "";
+  const kv = $("#scan-kv");
+  if (kv) kv.innerHTML = `
+    <dt>Document</dt><dd><a href="#/doc/${esc(s.doc)}">${esc(s.doc)}</a></dd>
+    <dt>Camera</dt><dd>${esc(s.camera?.name || "")} ${g.resolution ? `${g.resolution[0]}×${g.resolution[1]}` : ""}</dd>
+    <dt>Focus</dt><dd>${esc(g.focus || "")}${g.adjusting ? " (adjusting)" : ""}</dd>
+    <dt>View</dt><dd class="mono small">${esc(g.view || "")}</dd>
+    <dt>Captured</dt><dd>${s.captured}</dd>
+    <dt>Queue</dt><dd>${s.queued} ${s.degraded ? '<span class="err">LLM OFF (degraded)</span>' : ""}</dd>
+    <dt>Working</dt><dd>${esc(s.working || "idle")}</dd>
+    <dt>LLM</dt><dd>${s.llm ? esc(s.llm.provider + "/" + s.llm.model) : "OCR only"}</dd>`;
+  const rec = $("#recent");
+  if (rec) rec.innerHTML = (s.recent || []).map((r) => `<span class="s-${r.status}">${esc(r.label)} ${esc(r.status)}</span>`).join("");
+  const adv = $("#advice"); if (adv) adv.textContent = s.last_error || s.advice || "";
+  const log = $("#scanlog");
+  if (log && s.events) { const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20; log.innerHTML = logHtml(s.events); if (atBottom) log.scrollTop = log.scrollHeight; }
+  if (!s.running && $("#controls")?.style.display !== "none") {
+    $("#controls").style.display = "none"; $("#scan-status").style.display = "none"; $("#scan-form").style.display = "";
+    const img = $("#stream"); if (img) { img.src = ""; img.style.display = "none"; } $("#video-placeholder").style.display = "";
+    if (s.error) toast(s.error, "err");
+  }
+}
+
+/* ---------- document ---------- */
+let docFilter = null;
+async function docView(slug) {
+  const d = await api(`/api/documents/${encodeURIComponent(slug)}`);
+  const rows = d.page_list.filter((p) => !docFilter || p.status === docFilter);
+  view.innerHTML = `
+  <div class="row"><h1>${esc(d.title || slug)}</h1><span class="muted">${esc(slug)} · ${d.pages} pages</span><span class="right"></span>
+    ${d.flagged ? `<a class="btn" href="#/review/${esc(slug)}">Review ${d.flagged} flagged</a>` : ""}
+    <button id="j-verify">Verify</button><button id="j-build">Build</button><button id="j-reprocess" class="danger">Reprocess</button>
+    ${d.document_md ? `<a class="btn" href="${d.document_md}" download>document.md</a>` : ""}
+    <a class="btn" href="#/settings/${esc(slug)}">Metadata</a>
+    <button id="j-delete-doc" class="danger" title="delete the whole document">Delete…</button></div>
+  ${statusBar(d.counts)}
+  <div class="row">${countChips(d.counts, docFilter, "setDocFilter")} ${docFilter ? '<span class="chip on" onclick="setDocFilter(null)">× all</span>' : ""}
+    <span class="right muted small">${d.duplicates ? d.duplicates + " duplicate capture(s) skipped · " : ""}${d.needs_reshoot.length ? `<span class="err">${d.needs_reshoot.length} to re-shoot</span>` : ""}</span></div>
+  <div class="grid side" style="margin-top:12px">
+    <div>
+    <div class="row small" id="bulkbar" style="margin-bottom:6px">
+      <label style="margin:0"><input type="checkbox" id="sel-all"> select all shown</label>
+      <span id="sel-count" class="muted"></span>
+      <span class="right"></span>
+      <button class="danger small" id="del-sel" disabled>Delete selected…</button>
+    </div>
+    <table><tr><th></th><th class="num">seq</th><th>label</th><th>status</th><th class="num">px</th><th class="num">agree</th><th class="num">overlap</th><th>note</th></tr>
+    ${rows.map((p) => `<tr class="click" onclick="location.hash='#/doc/${esc(slug)}/page/${p.sequence}'">
+      <td onclick="event.stopPropagation()"><input type="checkbox" class="sel" value="${p.sequence}"></td>
+      <td class="num mono">${String(p.sequence).padStart(4, "0")}</td><td>${esc(p.page_label || "")}${p.part ? ` <span class="muted small">${p.part}</span>` : ""}</td>
+      <td>${badge(p.status)}</td><td class="num ${p.width_px && p.width_px < 900 ? "warn" : ""}">${p.width_px ?? ""}</td>
+      <td class="num">${fmtNum(p.agreement)}</td><td class="num">${fmtNum(p.overlap)}</td>
+      <td class="small">${p.llm_error ? `<span class="err">${esc(p.llm_error)}</span>` : ""}${p.continuity ? `<span class="warn">${esc(p.continuity)}</span> ` : ""}<span class="muted">${esc(p.advice || "")}</span></td></tr>`).join("")}
+    </table>
+    </div>
+    <div>
+      <div class="dropzone" id="drop">Drop page images here (or click) to ingest into <b>${esc(slug)}</b><input type="file" id="files" multiple accept="image/*" style="display:none"></div>
+      <div id="job-out" style="margin-top:12px"></div>
+    </div>
+  </div>`;
+  const run = (kind, options = {}) => runJob(kind, slug, options, $("#job-out"));
+  $("#j-verify").onclick = () => run("verify");
+  $("#j-build").onclick = () => run("build");
+  $("#j-reprocess").onclick = () => confirm(`Reprocess '${slug}': every page is rebuilt from raw and cached OCR/LLM results are discarded (the LLM pass re-runs and costs tokens). Continue?`) && run("reprocess");
+  const selected = () => [...view.querySelectorAll(".sel:checked")].map((c) => Number(c.value));
+  const syncSel = () => { const n = selected().length; $("#del-sel").disabled = !n; $("#sel-count").textContent = n ? `${n} selected` : ""; };
+  view.querySelectorAll(".sel").forEach((c) => (c.onchange = syncSel));
+  $("#sel-all").onchange = (e) => { view.querySelectorAll(".sel").forEach((c) => (c.checked = e.target.checked)); syncSel(); };
+  $("#del-sel").onclick = () => deletePages(slug, selected());
+  $("#j-delete-doc").onclick = () => deleteDocument(slug, d.pages);
+  const drop = $("#drop"), files = $("#files");
+  drop.onclick = () => files.click();
+  files.onchange = () => upload(slug, files.files, $("#job-out"));
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); upload(slug, e.dataTransfer.files, $("#job-out")); };
+}
+window.setDocFilter = (s) => { docFilter = s; route(); };
+async function upload(slug, fileList, out) {
+  if (!fileList.length) return;
+  const fd = new FormData();
+  for (const f of fileList) fd.append("files", f, f.name);
+  try {
+    const job = await api(`/api/documents/${encodeURIComponent(slug)}/ingest`, { method: "POST", body: fd });
+    toast(`ingesting ${fileList.length} file(s)`, "ok"); followJob(job.id, out, () => route());
+  } catch (e) { toast(e.message, "err"); }
+}
+async function runJob(kind, doc, options, out) {
+  try {
+    const job = await api("/api/jobs", { method: "POST", body: { kind, doc, options } });
+    toast(`${kind} started`, "ok"); followJob(job.id, out, () => route());
+  } catch (e) { toast(e.message, "err"); }
+}
+function followJob(id, out, onDone) {
+  if (!out) return;
+  out.innerHTML = `<div class="panel"><div class="row"><b id="jt"></b><span class="right muted small" id="jp"></span></div><div class="progress" style="margin:6px 0"><i id="jb" style="width:0"></i></div><div class="log" id="jl" style="height:200px"></div></div>`;
+  let offset = 0; const lines = [];
+  const id2 = every(700, async () => {
+    try {
+      const j = await api(`/api/jobs/${id}?since=${offset}`);
+      lines.push(...j.log); offset += j.log.length;
+      $("#jt").textContent = `${j.kind} ${j.doc || ""} — ${j.status}`;
+      $("#jp").textContent = j.total ? `${j.done}/${j.total}` : "";
+      $("#jb").style.width = j.total ? `${(100 * j.done) / j.total}%` : (j.status === "done" ? "100%" : "0");
+      const l = $("#jl"); if (l) { l.innerHTML = logHtml(lines); l.scrollTop = l.scrollHeight; }
+      if (["done", "failed", "cancelled"].includes(j.status)) { clearInterval(id2); if (j.status === "failed") toast(j.error, "err"); if (onDone && j.status === "done") setTimeout(onDone, 800); }
+    } catch (_) { clearInterval(id2); }
+  });
+}
+
+/* ---------- deletion ---------- */
+async function deletePages(slug, sequences, opts = {}) {
+  if (!sequences.length) return;
+  const label = sequences.length === 1 ? `page ${String(sequences[0]).padStart(4, "0")}` : `${sequences.length} pages`;
+  const whole = opts.askWhole && confirm(`Also delete the other half of the same capture(s) (the spread partner)?\n\nOK = both halves, Cancel = just ${label}.`);
+  if (!confirm(`Delete ${label} from '${slug}'?\n\nRemoves the page file(s), OCR/LLM artifacts and — when nothing else refers to it — the raw capture. This cannot be undone.`)) return;
+  try {
+    const r = await api(`/api/documents/${encodeURIComponent(slug)}/pages/delete`, { method: "POST", body: { sequences, purge_raw: true, whole_capture: !!whole } });
+    toast(r.summary, "ok");
+    if (opts.after) opts.after(r); else route();
+  } catch (e) { toast(e.message, "err"); }
+}
+async function deleteDocument(slug, pages) {
+  const typed = prompt(`Delete document '${slug}' with ${pages} page(s), its files and raw captures?\nThis cannot be undone. Type the slug to confirm:`);
+  if (typed == null) return;
+  if (typed !== slug) return toast("slug did not match; nothing deleted", "err");
+  try {
+    const r = await api(`/api/documents/${encodeURIComponent(slug)}?confirm=${encodeURIComponent(slug)}`, { method: "DELETE" });
+    toast(`deleted '${slug}': ${r.summary}`, "ok");
+    location.hash = "#/";
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- page ---------- */
+let pageTab = "edit", imgKind = "processed", imgZoom = 1, reviewMode = false;
+async function pageView(slug, seq) {
+  const p = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`);
+  const fm = p.frontmatter || {}, v = fm.verification || {}, ctx = fm.context || {}, proc = fm.processing || {};
+  const kinds = Object.keys(p.images);
+  if (!kinds.includes(imgKind)) imgKind = kinds[0];
+  view.innerHTML = `
+  <div class="row" style="margin-bottom:10px">
+    <a href="#/doc/${esc(slug)}">${esc(slug)}</a> <span class="muted">/</span> <b>page ${String(seq).padStart(4, "0")}</b>
+    ${p.page_label ? `<span class="muted">printed ${esc(p.page_label)}</span>` : ""} ${p.part ? `<span class="muted small">${p.part}</span>` : ""}
+    ${badge(p.status)} <span class="muted small">agree ${fmtNum(v.agreement)} · overlap ${fmtNum(v.overlap)} · ${p.width_px || "?"}px</span>
+    <span class="right"></span>
+    ${reviewMode ? '<span class="chip on">review mode</span>' : ""}
+    <button ${p.prev == null ? "disabled" : ""} onclick="go('${esc(slug)}',${p.prev})" title="p">◀ prev</button>
+    <button ${p.next == null ? "disabled" : ""} onclick="go('${esc(slug)}',${p.next})" title="n">next ▶</button>
+    <button ${p.next_flagged == null ? "disabled" : ""} onclick="go('${esc(slug)}',${p.next_flagged})" title="shift+n">next flagged ⏭</button>
+    ${p.status === "reviewed" ? `<button id="reopen">Reopen</button>` : `<button class="primary" id="signoff" ${p.unresolved ? "disabled" : ""} title="${p.unresolved ? p.unresolved + " unresolved" : "sign off as reviewed"}">Sign off</button>`}
+    <button class="danger" id="delete-page" title="delete this page">Delete…</button>
+  </div>
+  <div class="grid page">
+    <div>
+      <div class="row small" style="margin-bottom:6px">
+        ${kinds.map((k) => `<span class="chip ${k === imgKind ? "on" : ""}" onclick="setImg('${k}')">${k}</span>`).join("")}
+        <span class="right"></span><button class="small" onclick="zoomImg(-0.25)">−</button><span class="mono">${Math.round(imgZoom * 100)}%</span><button class="small" onclick="zoomImg(0.25)">+</button><button class="small" onclick="zoomImg(0)">fit</button>
+      </div>
+      <div class="imgbox"><img id="pimg" src="${p.images[imgKind] || ""}" style="width:${imgZoom * 100}%"></div>
+      ${p.advice ? `<div class="warn small" style="margin-top:6px">${esc(p.advice)}</div>` : ""}
+      ${proc.continuity ? `<div class="warn small">${esc(proc.continuity)}</div>` : ""}
+      ${p.llm_error ? `<div class="err small">LLM: ${esc(p.llm_error)}</div>` : ""}
+      ${v.illegible_reason ? `<div class="muted small">model: ${esc(v.illegible_reason)}</div>` : ""}
+    </div>
+    <div>
+      <div class="tabs">${["edit", "preview", "meta"].map((t) => `<button class="${t === pageTab ? "on" : ""}" onclick="setTab('${t}')">${t}${t === "edit" && p.unresolved ? ` (${p.unresolved})` : ""}</button>`).join("")}</div>
+      <div id="tab"></div>
+    </div>
+  </div>`;
+  const tab = $("#tab");
+  if (pageTab === "edit") {
+    tab.innerHTML = `
+      ${p.flags.length ? `<h3 style="margin-top:0">Disagreements</h3>` + p.flags.map((f) => `
+        <div class="flag" data-n="${f.n}">
+          <div class="ctx">${esc(f.context).replace(/\[(.+?)\]/, "<b>[$1]</b>")}</div>
+          <div class="opts">
+            <button class="small" onclick="resolveFlag('${esc(slug)}',${seq},${f.n},${JSON.stringify(f.ocr).replace(/"/g, "&quot;")})">OCR: <span class="val">${esc(f.ocr)}</span></button>
+            <button class="small" onclick="resolveFlag('${esc(slug)}',${seq},${f.n},${JSON.stringify(f.llm).replace(/"/g, "&quot;")})">LLM: <span class="val">${esc(f.llm)}</span></button>
+            <button class="small" onclick="resolveCustom('${esc(slug)}',${seq},${f.n})">type…</button>
+          </div>
+        </div>`).join("") : '<div class="muted small" style="margin-bottom:8px">No open disagreements.</div>'}
+      <label>Markdown body</label>
+      <textarea id="body" rows="22">${esc(p.body)}</textarea>
+      <div class="row" style="margin-top:8px"><button class="primary" id="save">Save body</button><span class="muted small">Saving marks the page as hand-edited; a later verify keeps your text only once signed off.</span></div>`;
+    $("#save").onclick = async () => {
+      try { await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`, { method: "PUT", body: { body: $("#body").value } }); toast("saved", "ok"); route(); } catch (e) { toast(e.message, "err"); }
+    };
+  } else if (pageTab === "preview") {
+    tab.innerHTML = `<div class="md">${renderMd(p.body) || '<span class="muted">empty page</span>'}</div>`;
+  } else {
+    const field = (k, val, ph = "") => `<label>${k}</label><input data-ctx="${k}" value="${esc(Array.isArray(val) ? val.join(", ") : val ?? "")}" placeholder="${ph}" style="width:100%">`;
+    tab.innerHTML = `
+      <div class="grid cols-2">
+        <div><label>printed page label</label><input id="m-label" value="${esc(p.page_label || "")}" style="width:100%"></div>
+        <div>${field("chapter", ctx.chapter)}</div><div>${field("section", ctx.section)}</div><div>${field("running_head", ctx.running_head)}</div>
+        <div>${field("title", ctx.title)}</div><div>${field("tags", ctx.tags, "comma separated")}</div>
+      </div>
+      <div class="row" style="margin:10px 0"><button class="primary" id="save-meta">Save metadata</button></div>
+      <h3>Verification</h3>
+      <dl class="kv">
+        <dt>status</dt><dd>${badge(v.status || p.status)}</dd>
+        <dt>agreement / overlap / cer</dt><dd>${fmtNum(v.agreement)} / ${fmtNum(v.overlap)} / ${fmtNum(v.cer)}</dd>
+        <dt>flagged spans</dt><dd>${v.flagged_spans ?? 0}</dd>
+        ${v.reviewed_by ? `<dt>reviewed by</dt><dd>${esc(v.reviewed_by.who || v.reviewed_by)} ${esc(v.reviewed_by.at || "")}</dd>` : ""}
+        ${v.llm_uncertain?.length ? `<dt>model unsure of</dt><dd class="mono small">${v.llm_uncertain.map(esc).join(", ")}</dd>` : ""}
+        ${v.llm_notes ? `<dt>model notes</dt><dd class="small">${esc(v.llm_notes)}</dd>` : ""}
+      </dl>
+      <h3>Provenance</h3>
+      <dl class="kv small">
+        <dt>captured</dt><dd>${esc(fm.captured_at || "")} via ${esc(fm.source?.type || "")} ${esc(fm.source?.device || "")}</dd>
+        <dt>processing</dt><dd>${esc(proc.pipeline || "")} · orientation ${proc.orientation ?? ""}° · deskew ${proc.deskew ?? ""}° · blur ${proc.blur ?? ""} · ${proc.page_width_px ?? ""}px${proc.clipped_edges?.length ? " · clipped " + proc.clipped_edges.join("+") : ""}</dd>
+        <dt>ocr</dt><dd>${esc(fm.ocr?.engine || "")} conf ${fmtNum(fm.ocr?.confidence)}${fm.ocr?.agreement != null ? ` · engines agree ${fmtNum(fm.ocr.agreement)}` : ""}</dd>
+        <dt>llm</dt><dd>${fm.llm ? `${esc(fm.llm.provider)}/${esc(fm.llm.model)} ${esc(fm.llm.prompt)} · tokens ${fm.llm.tokens?.in ?? "?"}→${fm.llm.tokens?.out ?? "?"} · <span class="mono">${esc(fm.llm.request_id || "")}</span>` : "none"}</dd>
+        <dt>id</dt><dd class="mono">${esc(p.id)}</dd>
+        <dt>file</dt><dd class="mono">documents/${esc(slug)}/pages/${String(seq).padStart(4, "0")}.md</dd>
+      </dl>`;
+    $("#save-meta").onclick = async () => {
+      const context = {};
+      tab.querySelectorAll("[data-ctx]").forEach((i) => { const k = i.dataset.ctx; context[k] = k === "tags" ? i.value.split(",").map((x) => x.trim()).filter(Boolean) : (i.value || null); });
+      try { await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`, { method: "PUT", body: { page_label: $("#m-label").value, context } }); toast("saved", "ok"); route(); } catch (e) { toast(e.message, "err"); }
+    };
+  }
+  const so = $("#signoff");
+  if (so) so.onclick = async () => {
+    const who = localStorage.getItem("ocrmd.who") || prompt("Your name (recorded as reviewer)", "reviewer");
+    if (!who) return; localStorage.setItem("ocrmd.who", who);
+    try {
+      const r = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/signoff`, { method: "POST", body: { who } });
+      toast(`page ${seq} signed off`, "ok");
+      if (reviewMode && r.next_flagged != null) go(slug, r.next_flagged); else route();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#delete-page").onclick = () => deletePages(slug, [seq], {
+    askWhole: !!p.part,
+    after: (r) => {   // the spread partner may have gone too: pick the nearest page that still exists
+      const to = [p.next, p.prev].find((x) => x != null && !(r.deleted || []).includes(x));
+      location.hash = to != null ? `#/doc/${slug}/page/${to}${reviewMode ? "?review=1" : ""}` : `#/doc/${slug}`;
+    },
+  });
+  const ro = $("#reopen");
+  if (ro) ro.onclick = () => api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/reopen`, { method: "POST" }).then(route).catch((e) => toast(e.message, "err"));
+  document.onkeydown = (ev) => {
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) return;
+    if (ev.key === "n" && p.next != null) go(slug, p.next);
+    if (ev.key === "p" && p.prev != null) go(slug, p.prev);
+    if (ev.key === "N" && p.next_flagged != null) go(slug, p.next_flagged);
+  };
+}
+window.go = (slug, seq) => { location.hash = `#/doc/${slug}/page/${seq}${reviewMode ? "?review=1" : ""}`; };
+window.setTab = (t) => { pageTab = t; route(); };
+window.setImg = (k) => { imgKind = k; route(); };
+window.zoomImg = (d) => { imgZoom = d === 0 ? 1 : Math.max(0.25, Math.min(4, imgZoom + d)); const img = $("#pimg"); if (img) img.style.width = `${imgZoom * 100}%`; view.querySelector(".mono").textContent = `${Math.round(imgZoom * 100)}%`; };
+window.resolveFlag = async (slug, seq, n, chosen) => {
+  try { await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/resolve`, { method: "POST", body: { n, chosen } }); route(); } catch (e) { toast(e.message, "err"); }
+};
+window.resolveCustom = (slug, seq, n) => { const t = prompt("Replacement text"); if (t != null) resolveFlag(slug, seq, n, t); };
+
+async function reviewView(slug) {
+  const d = await api(`/api/documents/${encodeURIComponent(slug)}`);
+  const first = d.page_list.find((p) => p.status === "flagged");
+  reviewMode = true;
+  if (!first) { view.innerHTML = `<div class="panel">No flagged pages in <b>${esc(slug)}</b>. <a href="#/doc/${esc(slug)}">Back to the document</a>.</div>`; return; }
+  location.replace(`#/doc/${slug}/page/${first.sequence}?review=1`);
+}
+
+/* ---------- jobs ---------- */
+async function jobsView() {
+  const [jobs, docs] = await Promise.all([api("/api/jobs"), api("/api/documents")]);
+  view.innerHTML = `
+  <div class="grid side">
+    <div>
+      <h1>Jobs</h1>
+      <table><tr><th>when</th><th>kind</th><th>document</th><th>status</th><th class="num">progress</th><th></th></tr>
+      ${jobs.map((j) => `<tr class="click" onclick="showJob('${j.id}')"><td class="small">${fmtTime(j.created_at)}</td><td>${esc(j.kind)}</td><td>${esc(j.doc || "all")}</td>
+        <td class="${j.status === "failed" ? "err" : j.status === "done" ? "ok" : ""}">${esc(j.status)}${j.error ? ` — ${esc(j.error)}` : ""}</td>
+        <td class="num">${j.total ? `${j.done}/${j.total}` : ""}</td>
+        <td>${["queued", "running"].includes(j.status) ? `<button class="small" onclick="event.stopPropagation();cancelJob('${j.id}')">cancel</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">no jobs yet</td></tr>'}
+      </table>
+      <div id="job-out" style="margin-top:12px"></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">Run</h3>
+      <label>Kind</label><select id="k" style="width:100%"><option>verify</option><option>build</option><option>reprocess</option></select>
+      <label>Document</label><select id="d" style="width:100%"><option value="">all</option>${docs.map((x) => `<option>${esc(x.slug)}</option>`).join("")}</select>
+      <label><input type="checkbox" id="o-flag"> flagged only (verify)</label>
+      <label><input type="checkbox" id="o-refresh"> refresh: re-run pages made by an older prompt/model — costs tokens</label>
+      <label><input type="checkbox" id="o-nollm"> OCR only (no LLM)</label>
+      <div style="margin-top:10px"><button class="primary" id="run">Run</button></div>
+    </div>
+  </div>`;
+  $("#run").onclick = () => {
+    const kind = $("#k").value, doc = $("#d").value || null;
+    if (kind === "reprocess" && !doc) return toast("reprocess needs a document", "err");
+    if (kind === "reprocess" && !confirm("Reprocess discards cached OCR/LLM results and re-runs the LLM pass (costs tokens). Continue?")) return;
+    runJob(kind, doc, { flagged_only: $("#o-flag").checked, refresh: $("#o-refresh").checked, no_llm: $("#o-nollm").checked }, $("#job-out"));
+  };
+  every(2000, async () => { if (location.hash.startsWith("#/jobs") && !$("#jl")) jobsView(); });
+}
+window.showJob = (id) => followJob(id, $("#job-out"));
+window.cancelJob = (id) => api(`/api/jobs/${id}/cancel`, { method: "POST" }).then(() => route()).catch((e) => toast(e.message, "err"));
+
+/* ---------- settings ---------- */
+async function settingsView(slug) {
+  const [settings, doctor, docs] = await Promise.all([api("/api/settings"), api("/api/doctor"), api("/api/documents")]);
+  slug = slug || docs[0]?.slug;
+  const meta = slug ? await api(`/api/documents/${encodeURIComponent(slug)}/meta`) : null;
+  const F = ["title", "author", "edition", "publisher", "year", "isbn", "citation", "citation_key", "kind", "tags", "project"];
+  view.innerHTML = `
+  <div class="grid cols-2">
+    <div>
+      <h1>Document metadata</h1>
+      <div class="panel">
+        <label>Document</label><select id="m-doc" style="width:100%">${docs.map((d) => `<option ${d.slug === slug ? "selected" : ""}>${esc(d.slug)}</option>`).join("")}</select>
+        ${meta ? F.map((k) => `<label>${k}</label><input data-k="${k}" value="${esc(Array.isArray(meta[k]) ? meta[k].join(", ") : meta[k] ?? "")}" style="width:100%">`).join("") : ""}
+        <div class="row" style="margin-top:12px"><button class="primary" id="save-doc" ${meta ? "" : "disabled"}>Save document.yaml</button><span class="muted small">Inherited into every page on build; a page's own value wins.</span></div>
+      </div>
+      <h2>Effective settings</h2>
+      <div class="panel"><dl class="kv small">${Object.entries(settings).map(([k, v]) => `<dt>${esc(k)}</dt><dd class="mono">${esc(JSON.stringify(v))}</dd>`).join("")}</dl>
+        <div class="muted small" style="margin-top:8px">Set in <code>ocrmd.toml</code> or <code>OCRMD_*</code> environment variables; restart the server to apply.</div></div>
+    </div>
+    <div>
+      <h1>Doctor</h1>
+      <div class="panel"><dl class="kv">
+        <dt>root</dt><dd class="mono">${esc(doctor.root)}</dd>
+        <dt>OCR</dt><dd>${esc(doctor.ocr_engine || "NONE — macOS: pyobjc-framework-Vision; elsewhere pip install 'ocrmd[rapidocr]'")}
+          <span class="muted">installed: ${esc((doctor.ocr_engines_installed || []).join(", ") || "none")}</span></dd>
+        <dt>anthropic</dt><dd>${doctor.credentials.anthropic ? '<span class="ok">credentials found</span>' : '<span class="warn">no credentials (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in .env)</span>'}</dd>
+        <dt>xai</dt><dd>${doctor.credentials.xai ? '<span class="ok">XAI_API_KEY set</span>' : '<span class="muted">no credentials</span>'}</dd>
+        <dt>dictionary</dt><dd>${doctor.dictionary ? "present" : '<span class="warn">/usr/share/dict/words missing</span>'}</dd>
+        <dt>camera access</dt><dd>${doctor.camera_authorized === false ? '<span class="err">NOT authorized — System Settings › Privacy & Security › Camera</span>' : "ok"}</dd>
+        <dt>database</dt><dd><span class="mono">${esc(doctor.db_path)}</span> ${doctor.db_integrity === "ok" ? '<span class="ok">ok</span>' : `<span class="err">${esc(doctor.db_integrity)}</span>`}</dd>
+        <dt>artifacts</dt><dd>${doctor.missing_artifacts.raw.length} without raw, ${doctor.missing_artifacts.processed.length} without processed, ${doctor.orphan_artifacts} orphan(s)</dd>
+        <dt>batches</dt><dd>${doctor.open_batches} open</dd>
+      </dl></div>
+      <h2>Cameras</h2>
+      <div class="panel">${doctor.cameras.map((c) => `<div><b>${c.index}: ${esc(c.name)}</b> ${c.format ? `${c.format[0]}×${c.format[1]}` : ""} <span class="muted small">focus ${esc(c.focus || "?")} (${(c.focus_modes || []).join(", ") || "fixed"}) · exposure ${esc(c.exposure || "?")}</span>${c.warning ? `<div class="warn small">${esc(c.warning)}</div>` : ""}</div>`).join("") || '<span class="muted">none found</span>'}</div>
+      <h2>Documents</h2>
+      <div class="panel">${doctor.documents.map((d) => `<div><b>${esc(d.slug)}</b> ${d.pages} page(s): ${Object.entries(d.counts).map(([k, n]) => `${n} ${k}`).join(", ")}</div>`).join("") || '<span class="muted">none</span>'}</div>
+    </div>
+  </div>`;
+  $("#m-doc").onchange = () => { location.hash = `#/settings/${$("#m-doc").value}`; };
+  const sd = $("#save-doc");
+  if (sd) sd.onclick = async () => {
+    const body = {};
+    view.querySelectorAll("[data-k]").forEach((i) => { const k = i.dataset.k; body[k] = ["author", "tags"].includes(k) ? i.value.split(",").map((x) => x.trim()).filter(Boolean) : k === "year" ? (i.value ? Number(i.value) : null) : (i.value || null); });
+    try { await api(`/api/documents/${encodeURIComponent(slug)}/meta`, { method: "PUT", body }); toast("document.yaml saved — run Build to inherit into pages", "ok"); } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+/* ---------- router ---------- */
+async function route() {
+  clearTimers();
+  document.onkeydown = null;
+  const hash = location.hash || "#/";
+  const [path, query] = hash.slice(1).split("?");
+  const parts = path.split("/").filter(Boolean);
+  reviewMode = new URLSearchParams(query || "").get("review") === "1";
+  const nav = parts[0] || "dash";
+  document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav || (nav === "doc" && a.dataset.nav === "dash")));
+  try {
+    if (!parts.length) await dashboard();
+    else if (parts[0] === "scan") await scanView();
+    else if (parts[0] === "jobs") await jobsView();
+    else if (parts[0] === "settings") await settingsView(parts[1] && decodeURIComponent(parts[1]));
+    else if (parts[0] === "review") await reviewView(decodeURIComponent(parts[1]));
+    else if (parts[0] === "doc" && parts[2] === "page") await pageView(decodeURIComponent(parts[1]), Number(parts[3]));
+    else if (parts[0] === "doc") await docView(decodeURIComponent(parts[1]));
+    else view.innerHTML = '<div class="panel">not found</div>';
+  } catch (e) {
+    view.innerHTML = `<div class="panel err">${esc(e.message)}</div>`;
+  }
+  refreshTop();
+}
+window.addEventListener("hashchange", route);
+every(3000, refreshTop);
+route();

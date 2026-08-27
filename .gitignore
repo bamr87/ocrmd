@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+.env
+.ocrmd-camera.json
+
+# generated scan data — all of it is local user data, including the built markdown
+raw/
+processed/
+ocr/
+llm/
+documents/
+ocrmd.db
+
+# 0.2 runtime files
+ocrmd.log*
+ocrmd.db-wal
+ocrmd.db-shm
+ocrmd.toml
+*.md.tmp
+inbox/
+.playwright-mcp/
+/*.png
