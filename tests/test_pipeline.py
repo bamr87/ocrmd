@@ -501,3 +501,62 @@ def test_a_partly_refused_spread_is_not_listed_as_needing_a_re_shoot(root, store
     got = pipeline.ingest_frame(root, store, spread, "book", "webcam:cam", admit=True)
     assert got.pages and got.rejected
     assert store.rejected_captures("book") == []      # nothing here needs shooting again
+
+
+# --- the page model ---------------------------------------------------------------------------------
+def _page_with_figure(root, store, slug="figbook"):
+    import cv2
+    img = text_page(["Chapter One", "the quick brown fox jumps over the lazy dog",
+                     "and then it runs away across the field", "while nobody is watching at all"] * 2)
+    cv2.circle(img, (700, 1300), 120, (20, 20, 20), 8)
+    cv2.line(img, (560, 1300), (840, 1300), (20, 20, 20), 8)
+    ids = pipeline.ingest_frame(root, store, on_desk(img), slug, "file:test").pages
+    assert len(ids) == 1
+    return ids[0]
+
+
+@needs_ocr
+def test_the_layout_stage_writes_the_page_model_and_cuts_the_figure_out(root, store):
+    pid = _page_with_figure(root, store)
+    r = pipeline.run_page(root, store, store.page(pid), None, "figbook")
+    assert store.stage_done(pid, "layout", pipeline.LAYOUT_VER)
+    lay = pipeline.load_layout(root, pid)
+    assert lay is not None and lay.page_id == pid and lay.blocks
+    assert len(lay.figures) == 1 and lay.figures[0].asset == f"{pid}-1.png"
+    assert (pipeline.figures_dir(root, "figbook") / f"{pid}-1.png").exists()
+    fm, body = render.read_page(r.path)
+    assert body.count(f"![figure](../figures/{pid}-1.png)") == 1
+    assert fm["processing"]["layout"]["figures"] == 1 and fm["references"]["figures"][0]["asset"] == f"{pid}-1.png"
+    # a second render neither duplicates the reference nor counts it as a human edit
+    r2 = pipeline.run_page(root, store, store.page(pid), None, "figbook")
+    assert render.read_page(r2.path)[1].count("![figure]") == 1 and r2.preserved == []
+
+
+@needs_ocr
+def test_the_layout_stage_reruns_when_its_version_moves_and_keeps_a_humans_boxes(root, store):
+    pid = _page_with_figure(root, store)
+    pipeline.run_page(root, store, store.page(pid), None, "figbook")
+    lay = pipeline.load_layout(root, pid)
+    f = lay.figures[0]
+    f.caption, f.source = "my caption", "human"
+    pipeline.save_layout(root, store, lay)
+    store.mark_stage(pid, "layout", "layout@0")            # pretend an older join made it
+    fresh = pipeline.page_layout(root, store, store.page(pid))
+    assert store.stage_done(pid, "layout", pipeline.LAYOUT_VER)
+    assert fresh.figures[0].caption == "my caption" and fresh.figures[0].source == "human"
+    r = pipeline.run_page(root, store, store.page(pid), None, "figbook")
+    assert "layout.f1" in r.preserved
+    fm, _ = render.read_page(r.path)
+    assert fm["references"]["figures"][0]["caption"] == "my caption"
+
+
+@needs_ocr
+def test_open_flags_are_located_on_the_page(root, store):
+    pid = _ingest(root, store, lines=["the quick brown fox jumps over the lazy dog"] * 6 + ["invoice total 44.60 paid"])
+    md = "\n\n".join(["the quick brown fox jumps over the lazy dog"] * 6 + ["invoice total 44.80 paid"])
+    r = pipeline.run_page(root, store, store.page(pid), FakeProvider(markdown=md), "book")
+    body = render.read_page(r.path)[1]
+    lay = pipeline.page_layout(root, store, store.page(pid))
+    flags = pipeline.locate_flags(lay, body)
+    assert flags and flags[0]["bbox"] is not None
+    assert flags[0]["bbox"][1] == max(ln.bbox[1] for ln in lay.lines)       # the last line on the page

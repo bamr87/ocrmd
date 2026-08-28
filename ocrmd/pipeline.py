@@ -13,11 +13,13 @@ from .config import Settings
 from .store import Store
 from .fingerprint import sha256_bytes, dhash, similarity, detail_similarity
 from . import preprocess, ocr, reconcile as rc, render, review, multifocus, legibility, annotate
+from . import layout as layout_mod, pdfsrc
 from .reconcile import token_overlap, _content_tokens
 from .llm import Provider, LLMResult, LLMError, PageHint, Transcription, FocusViews
 
 log = logging.getLogger("ocrmd.pipeline")
 PRE_VER = preprocess.PIPELINE_VERSION
+LAYOUT_VER = layout_mod.LAYOUT_VERSION
 
 
 @dataclass
@@ -289,7 +291,10 @@ def derive_pages(s: Settings, st: Store, img: np.ndarray, slug: str, sha: str, p
 def _drop_page_artifacts(s: Settings, pid: str) -> int:
     n = 0
     for f in (list(s.processed.glob(f"{pid}.*")) + list(s.ocr_dir.glob(f"{pid}.json"))
-              + list(s.ocr_dir.glob(f"{pid}.focus.json")) + list(s.llm_dir.glob(f"{pid}.*.json"))):
+              + list(s.ocr_dir.glob(f"{pid}.focus.json")) + list(s.ocr_dir.glob(f"{pid}.pdf.json"))
+              + list(s.llm_dir.glob(f"{pid}.*.json"))
+              + list(s.layout_dir.glob(f"{pid}.json")) + list(s.documents.glob(f"*/figures/{pid}-*"))
+              + list(s.export_dir.glob(f"*/*/{pid}.*"))):
         f.unlink(); n += 1
     return n
 
@@ -319,6 +324,66 @@ def reprocess_document(s: Settings, st: Store, slug: str) -> tuple[list[str], in
             st.set_capture_page(r["raw_sha256"], new[0])
         ids += new
     return ids, removed
+
+
+def ingest_pdf(s: Settings, st: Store, path: Path, slug: str, on_page=None) -> list[tuple[str, Ingested]]:
+    """Ingest a PDF page by page, keeping what the file already knows (see `pdfsrc`).
+
+    The raster is stored as the immutable capture and *is* the processed crop — no page detection,
+    no deskew, no spread split: a PDF page is already a page. The text layer, when there is one, is
+    written beside the OCR artifacts as `ocr/<pid>.pdf.json` and becomes the primary reading of the
+    OCR stage (`run_ocr`), with the local engines voting on it. Placed images are recorded in the
+    page's processing meta so the layout stage takes their boxes rather than hunting for ink.
+    Duplicates are exact only (same raster bytes): a book can legitimately repeat a page.
+    """
+    out: list[tuple[str, Ingested]] = []
+    for pg in pdfsrc.pages(path):
+        source = f"file:{pg.name}"
+        ok, buf = cv2.imencode(".jpg", pg.image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        raw = buf.tobytes()
+        sha = sha256_bytes(raw)
+        gray = cv2.cvtColor(pg.image, cv2.COLOR_BGR2GRAY)
+        ph = dhash(gray)
+        prior = st.find_capture(sha)
+        if prior is not None:
+            res = Ingested(duplicate_of=prior["duplicate_of"] or prior["page_id"])
+            out.append((pg.name, res))
+            if on_page: on_page(pg.name, res)
+            continue
+        den = cv2.fastNlMeansDenoising(gray, h=7)
+        binar = cv2.adaptiveThreshold(den, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+        meta = {"pipeline": PRE_VER, "page_detected": True, "clipped_edges": [], "orientation": 0, "part": None,
+                "deskew": 0.0, **preprocess.quality(gray), "page_width_px": int(pg.image.shape[1]),
+                "source": "pdf", "pdf": pg.meta()}
+        (s.raw / f"{sha}.jpg").write_bytes(raw)
+        st.ensure_document(slug)
+        ids = derive_pages(s, st, pg.image, slug, sha, ph, parts=[(pg.image, binar, meta)])
+        for pid in ids:
+            if pg.text_layer:
+                (s.ocr_dir / f"{pid}.pdf.json").write_text(
+                    ocr.OcrResult(text=pg.text, blocks=pg.blocks, mean_confidence=1.0, engine=pdfsrc.version(),
+                                  words=[(w, 1.0) for b in pg.blocks for w in b.text.split()],
+                                  engines=[pdfsrc.version()]).model_dump_json(indent=1))
+        st.add_capture(sha, ph, ids[0] if ids else None, None, source, document=slug)
+        res = Ingested(pages=ids)
+        out.append((pg.name, res))
+        if on_page: on_page(pg.name, res)
+    return out
+
+
+def pdf_text_path(s: Settings, pid: str) -> Path:
+    return s.ocr_dir / f"{pid}.pdf.json"
+
+
+def pdf_text(s: Settings, pid: str) -> ocr.OcrResult | None:
+    """The PDF's own text layer for this page, or None when the page did not come from one / had none."""
+    p = pdf_text_path(s, pid)
+    if not p.exists():
+        return None
+    try:
+        return ocr.OcrResult.model_validate_json(p.read_text())
+    except ValueError:
+        return None
 
 
 # --- stages ------------------------------------------------------------------------------------
@@ -353,9 +418,20 @@ def ocr_version(s: Settings) -> str | None:
         return None
 
 
+def page_ocr_version(s: Settings, pid: str, version: str | None = None) -> str | None:
+    """The OCR stage version this page should be at: the engine set's, with the PDF text layer named
+    first when the page has one — it is the primary reading there, and a change of engines still
+    re-votes on it."""
+    version = version if version is not None else ocr_version(s)
+    if pdf_text_path(s, pid).exists():
+        names = version.split(":", 1)[1] if version else ""
+        return f"{ocr.OCR_VERSION}:{pdfsrc.ENGINE}" + (f"+{names}" if names else "")
+    return version
+
+
 def ocr_stale(s: Settings, st: Store, page, version: str | None = None) -> bool:
     """The page's OCR was made by a different engine set / OCR version than the current one."""
-    version = version or ocr_version(s)
+    version = page_ocr_version(s, page["id"], version or ocr_version(s))
     return version is not None and not st.stage_done(page["id"], "ocr", version)
 
 
@@ -415,18 +491,47 @@ def run_ocr(s: Settings, st: Store, page) -> ocr.OcrResult:
     next time it is processed — local and free, unlike the LLM stage."""
     pid = page["id"]
     out = s.ocr_dir / f"{pid}.json"
-    rec = ocr.recognizer(s)
-    if st.stage_done(pid, "ocr", rec.version) and out.exists():
+    layer = pdf_text(s, pid)
+    try:
+        rec = ocr.recognizer(s)
+    except RuntimeError:
+        if layer is None:
+            raise
+        rec = None                                  # no engine, but the PDF spelled the page out itself
+    version = page_ocr_version(s, pid, rec.version if rec else f"{ocr.OCR_VERSION}:")
+    if st.stage_done(pid, "ocr", version) and out.exists():
         return ocr.OcrResult.model_validate_json(out.read_text())
     img = cv2.imread(str(s.processed / f"{pid}.png"))
     if img is None:
         raise FileNotFoundError(f"processed image missing for page {pid}")
-    res = rec.run(img)
-    res = run_multifocus(s, pid, rec, res)
+    if layer is not None:
+        res = merge_pdf_text(layer, rec.run(img) if rec else None)
+    else:
+        res = rec.run(img)
+        res = run_multifocus(s, pid, rec, res)
     out.write_text(res.model_dump_json(indent=1))
-    st.mark_stage(pid, "ocr", rec.version)
+    st.mark_stage(pid, "ocr", version)
     log.debug("ocr %s: %s %.2fs agreement=%s", pid, res.engine, sum(res.timings.values()), res.agreement)
     return res
+
+
+def merge_pdf_text(layer: ocr.OcrResult, engines: ocr.OcrResult | None) -> ocr.OcrResult:
+    """The PDF's text layer as the primary reading, the engines voting on it.
+
+    Confidence 1.0 is what the file claims, not what was measured, so the vote is the measurement:
+    a word no engine confirms is doubted (`ocr.DOUBTED`) exactly as a doubted Vision word would be,
+    and the reconcile stage flags it against the model's reading. A text layer that is not a
+    reading of the pixels at all — a bad OCR layer on a scan, a watermark, a wrong page — comes out
+    with a low agreement, which is the point of running the engines on a PDF at all.
+    """
+    if engines is None or not engines.blocks:
+        return layer
+    others = {engines.engine: engines.blocks}
+    blocks, words, agreement = ocr.merge(layer.blocks, others, fill=True, swap=False)
+    conf = float(np.mean([b.confidence for b in blocks])) if blocks else 0.0
+    return ocr.OcrResult(text="\n".join(b.text for b in blocks), blocks=blocks, mean_confidence=conf,
+                         engine="+".join([layer.engine] + engines.engines), words=words,
+                         engines=[layer.engine] + engines.engines, agreement=agreement, timings=engines.timings)
 
 
 def focus_views(s: Settings, pid: str) -> FocusViews | None:
@@ -507,6 +612,157 @@ def run_llm(s: Settings, st: Store, page, provider: Provider, ocr_res: ocr.OcrRe
     return res
 
 
+# --- layout: the page model ---------------------------------------------------------------------
+def layout_path(s: Settings, pid: str) -> Path:
+    return s.layout_dir / f"{pid}.json"
+
+
+def figures_dir(s: Settings, slug: str) -> Path:
+    """Figure crops live beside the page files, so the Markdown's `![…](../figures/…)` is portable."""
+    return s.documents / slug / "figures"
+
+
+def load_layout(s: Settings, pid: str) -> layout_mod.Layout | None:
+    p = layout_path(s, pid)
+    if not p.exists():
+        return None
+    try:
+        return layout_mod.Layout.model_validate_json(p.read_text())
+    except ValueError as e:                     # an artifact from an older run must not block the page
+        log.warning("layout for %s unreadable (%s); rebuilding", pid, e)
+        return None
+
+
+def save_layout(s: Settings, st: Store, lay: layout_mod.Layout) -> Path:
+    p = layout_path(s, lay.page_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(lay.model_dump_json(indent=1))
+    tmp.replace(p)
+    st.mark_stage(lay.page_id, "layout", LAYOUT_VER)
+    return p
+
+
+def write_figure_assets(s: Settings, slug: str, pid: str, img: np.ndarray, lay: layout_mod.Layout) -> int:
+    """Cut every figure out of the crop into `documents/<slug>/figures/<pid>-<n>.png` and name it on the
+    block. A figure that a human placed keeps its asset if it already has one."""
+    out = figures_dir(s, slug)
+    n = 0
+    for i, f in enumerate(lay.figures, 1):
+        if f.asset and (out / f.asset).exists() and f.source == "human":
+            continue
+        name = f"{pid}-{i}.png"
+        out.mkdir(parents=True, exist_ok=True)
+        region = layout_mod.crop(img, f.bbox)
+        if region.size == 0:
+            continue
+        cv2.imwrite(str(out / name), region)
+        f.asset = name
+        n += 1
+    return n
+
+
+def run_layout(s: Settings, st: Store, page, ocr_res: ocr.OcrResult, body: str, slug: str,
+               img: np.ndarray | None = None) -> tuple[layout_mod.Layout, list[str]]:
+    """The layout stage: join OCR geometry to the finished body, find figures, write the model.
+
+    Runs on every render — it is a pure function of artifacts already on disk and costs no tokens —
+    and is versioned like every other stage so `verify` rebuilds one made by an older join. Returns
+    the model and the ids of blocks carried over from a human's edits to the previous one.
+    """
+    pid = page["id"]
+    if img is None:
+        img = cv2.imread(str(s.processed / f"{pid}.png"))
+    if img is None:
+        raise FileNotFoundError(f"processed image missing for page {pid}")
+    meta_p = s.processed / f"{pid}.json"
+    boxes = None
+    if meta_p.exists():
+        try:
+            boxes = (json.loads(meta_p.read_text()).get("pdf") or {}).get("images")
+        except ValueError:
+            boxes = None
+    lay = layout_mod.assemble(ocr_res, body, img, page_id=pid, figure_boxes=boxes)
+    kept = layout_mod.merge_human_layout(lay, load_layout(s, pid))
+    write_figure_assets(s, slug, pid, img, lay)
+    save_layout(s, st, lay)
+    return lay, kept
+
+
+def page_layout(s: Settings, st: Store, page) -> layout_mod.Layout:
+    """The page model, from disk when the stage is current, rebuilt from the artifacts when not."""
+    pid = page["id"]
+    lay = load_layout(s, pid) if st.stage_done(pid, "layout", LAYOUT_VER) else None
+    if lay is not None:
+        return lay
+    md_path = render.page_path(s.documents / page["document"], page["sequence"])
+    body = render.read_page(md_path)[1] if md_path.exists() else ""
+    lay, _ = run_layout(s, st, page, run_ocr(s, st, page), body, page["document"])
+    return lay
+
+
+def figure_ref(pid: str, asset: str, caption: str | None) -> str:
+    return f"![{caption or 'figure'}](../figures/{asset})"
+
+
+def insert_figure_refs(body: str, lay: layout_mod.Layout) -> str:
+    """Put `![caption](../figures/<asset>)` into the body where each figure sits in reading order.
+
+    Only for figures the body does not already reference; a reference that is there — from a
+    previous render, or typed by hand — is left exactly as it is. The line is placed after the last
+    text block that reads before the figure, so a figure between two paragraphs lands between them.
+    """
+    blocks = sorted(lay.blocks, key=lambda b: b.order)
+    missing = [f for f in lay.figures if f.asset and f"figures/{f.asset}" not in body]
+    if not missing:
+        return body
+    paras = body.rstrip().split("\n\n") if body.strip() else []
+    text_blocks = [b for b in blocks if b.role != "figure" and b.text.strip()]
+    # map each text block to the paragraph that carries its first words, so an insertion point in
+    # block space becomes one in paragraph space
+    def para_of(b: layout_mod.Block) -> int | None:
+        head = " ".join(b.text.split()[:4])
+        for i, p in enumerate(paras):
+            if head and head in " ".join(p.split()):
+                return i
+        return None
+    inserts: list[tuple[int, str]] = []
+    for f in missing:
+        before = [b for b in text_blocks if b.order < f.order]
+        at = len(paras)
+        for b in reversed(before):
+            i = para_of(b)
+            if i is not None:
+                at = i + 1
+                break
+        else:
+            at = 0
+        inserts.append((at, figure_ref(lay.page_id, f.asset, f.caption)))
+    for at, ref in sorted(inserts, key=lambda x: -x[0]):
+        paras.insert(at, ref)
+    return "\n\n".join(paras).rstrip() + "\n"
+
+
+def locate_flags(lay: layout_mod.Layout, body: str) -> list[dict]:
+    """Where each open `==[…]==` flag sits on the page: the line whose reconciled words contain the
+    flagged reading, so the image pane can draw it. A flag with no line gets no box, not a guess."""
+    out = []
+    norm = lambda t: " ".join(layout_mod._norm(w) for w in t.split())
+    for f in review.parse_flags(body):
+        key = norm(f.llm) or norm(f.ocr)
+        hit = None
+        if key:
+            for b in lay.blocks:
+                for ln in b.lines:
+                    if key in norm(ln.text):
+                        hit = (b, ln); break
+                if hit:
+                    break
+        out.append({"n": f.n, "llm": f.llm, "ocr": f.ocr,
+                    "bbox": hit[1].bbox if hit else None, "block": hit[0].id if hit else None})
+    return out
+
+
 def _ocr_only_markdown(res: ocr.OcrResult) -> str:
     """Without an LLM: paragraphs from OCR line boxes (vertical gap > 1.6x median line height),
     de-hyphenated. Headings/lists are not inferred."""
@@ -579,7 +835,7 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
         "context": {"title": None, "author": [], "chapter": None, "section": None, "running_head": None,
                     "citation_key": None, "tags": [], "project": None},
         "references": {"cites": [], "figures": [], "footnotes": 0, "related": []},
-        "source": {"type": "webcam" if source.startswith("webcam") else "file",
+        "source": {"type": "webcam" if source.startswith("webcam") else "pdf" if meta.get("source") == "pdf" else "file",
                    "device": source.split(":", 1)[1] if ":" in source else None,
                    "raw": f"raw/{page['raw_sha256']}.jpg",
                    "sha256": page["raw_sha256"], "phash": page["phash"], "part": page["part"]},
@@ -614,6 +870,8 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
         fm["context"].update(title=tr.title, chapter=tr.context.chapter, section=tr.context.section,
                              running_head=tr.context.running_head)
         fm["references"].update(cites=tr.context.cites, figures=tr.context.figures)
+        if tr.columns > 1 or tr.has_math or tr.tables:
+            fm["processing"]["structure"] = {"columns": tr.columns, "math": tr.has_math, "tables": tr.tables}
         fm["llm"] = {"provider": llm_res.provider, "model": llm_res.model, "prompt": s.prompt_version,
                      "request_id": llm_res.request_id,
                      "tokens": {"in": llm_res.usage.get("input_tokens"), "out": llm_res.usage.get("output_tokens"),
@@ -638,9 +896,8 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
         result.continuity = continuity_advice(st, slug, page["sequence"], tr.page_number)
         if result.continuity:
             fm["processing"]["continuity"] = result.continuity
-    fm["history"] = st.stage_history(pid)
-
     # human edits: if the file changed since the pipeline last wrote it, keep what the human wrote
+    frozen = False                      # a signed-off body is never touched, not even to add a figure
     if result.path.exists():
         try:
             old_fm, old_body = render.read_page(result.path)
@@ -658,6 +915,30 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
             if reviewer and not page["reviewed_by"]:
                 who = reviewer.get("who") if isinstance(reviewer, dict) else str(reviewer)
                 st.set_reviewed(pid, who, "reviewed")
+            frozen = bool(reviewer)
+
+    # the page model: geometry joined to the finished body, figures cut out, captions matched
+    try:
+        lay, kept_layout = run_layout(s, st, page, ocr_res, body, slug)
+    except FileNotFoundError as e:
+        log.warning("page %s: no layout (%s)", pid, e)
+        lay, kept_layout = None, []
+    if lay is not None:
+        tr_ = llm_res.transcription if llm_res is not None else None
+        llm_caps = ([f.caption for f in tr_.figures] or list(tr_.context.figures or [])) if tr_ is not None else []
+        for f, cap in zip(lay.figures, llm_caps, strict=False):
+            if not f.caption and cap:
+                f.caption = cap
+        if not frozen:
+            body = insert_figure_refs(body, lay)
+        if kept_layout:
+            result.preserved += [f"layout.{b}" for b in kept_layout]
+        save_layout(s, st, lay)
+        fm["processing"]["layout"] = {"version": lay.version, "blocks": len(lay.blocks), "columns": lay.columns,
+                                      "figures": len(lay.figures), "artifact": f"layout/{pid}.json"}
+        fm["references"]["figures"] = [{"asset": f.asset, "caption": f.caption, "bbox": [round(v, 4) for v in f.bbox]}
+                                       for f in lay.figures]
+    fm["history"] = st.stage_history(pid)
     result.status = status
     fm["verification"]["status"] = status
     render.write_page(doc_dir, page["sequence"], fm, body)
@@ -970,7 +1251,7 @@ def orphan_artifacts(s: Settings, st: Store) -> list[Path]:
     """Files in processed/ocr/llm that no page refers to (left behind by an interrupted reprocess)."""
     ids = {p["id"] for p in st.pages()}
     out = []
-    for d in (s.processed, s.ocr_dir, s.llm_dir):
+    for d in (s.processed, s.ocr_dir, s.llm_dir, s.layout_dir):
         for f in d.glob("*"):
             if f.name.split(".")[0] not in ids:
                 out.append(f)

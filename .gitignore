@@ -12,6 +12,8 @@ ocr/
 llm/
 documents/
 etl/
+layout/
+export/
 reconstructed/
 ocrmd.db
 

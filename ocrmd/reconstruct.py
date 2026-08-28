@@ -32,7 +32,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .layout import Figure, Layout, crop
+from .layout import Block as Figure, Layout, crop
 
 log = logging.getLogger("ocrmd.reconstruct")
 
@@ -324,7 +324,6 @@ def fidelity(original: np.ndarray, svg: str) -> tuple[float | None, str, np.ndar
 
 def rebuild(img: np.ndarray, lay: Layout, title: str | None = None) -> Rendered:
     """The whole round trip for one page: figures, SVG, LaTeX, render, score."""
-    lay.figures = lay.figures or []
     prepared = prepare_figures(img, lay.figures)
     svg = to_svg(lay, prepared)
     score, backend, shot = fidelity(img, svg)

@@ -24,12 +24,28 @@ Three things are ocrmd's rather than DocETL's, and they are the reason this live
   kind would probably contain.
 - **Results are cached per operation and versioned by the prompt.** Change a prompt and only that
   operator re-runs; change nothing and a re-run costs nothing. Same bargain as `verify`.
+
+Since 0.9 the operators read the *page model* as well as the page text, and can write back into it:
+
+- **Sources** (`source:` in the spec): `pages` — one row per page, with the reconciliation signals
+  the frontmatter records (`agreement`, `cer`, `flagged_spans`, …); `blocks` — one row per layout
+  block with its role, box and reading order; `figures` — one row per figure with its crop, so an
+  operator with `image: true` can look at the picture; `extracted:<name>` — a previous pipeline's
+  rows, for chaining.
+- **Sinks** (`output.type`): `frontmatter`, `layout` and `document` write fields back into the page
+  files, the page model and `document.yaml`, through the same rules as a human edit — a later
+  `verify` keeps them — and every such write is logged (`etl_writes`), so an enrichment is as
+  traceable as an extraction.
+- **A rectangle, not just a page number.** A row from `blocks` or `figures` carries `_block` and
+  `_bbox`; `extract` locates each quoted span on a line of the page and returns it with the line's
+  box (`_spans`), which is what `--score` measures as *locality*: the share of quoted spans that are
+  actually there. A span that cannot be found is the fabrication signal this repository exists for.
 """
 from __future__ import annotations
 import csv, hashlib, json, logging, re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 from rapidfuzz import fuzz
@@ -37,7 +53,7 @@ from rapidfuzz import fuzz
 from .config import Settings
 from .llm import LLMError, strict_schema
 from .store import Store
-from . import render
+from . import pipeline as pipeline_mod, render
 
 log = logging.getLogger("ocrmd.etl")
 
@@ -56,6 +72,12 @@ reading inside the brackets. Return only the structured answer."""
 
 LLM_OPS = ("map", "filter", "extract", "reduce", "resolve")          # the ones that can spend tokens
 OPERATORS = LLM_OPS + ("unnest", "split", "sample")
+SOURCES = ("pages", "blocks", "figures")                              # plus extracted:<name>
+SINKS = ("json", "csv", "md", "markdown", "frontmatter", "layout", "document")
+# what a sink may touch: the fields a person may edit, and nothing the pipeline owns
+FRONTMATTER_KEYS = ("page_label", "context.", "references.cites", "references.tags", "references.related")
+LAYOUT_KEYS = ("role", "caption", "kind", "caption_of", "level")
+DOCUMENT_KEYS_REFUSED = ("slug",)
 _TEMPLATE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*)\s*\}\}")
 
 
@@ -125,6 +147,9 @@ class Operation:
     overlap: int = 40                                  # split: words repeated into the next chunk
     n: int = 10                                        # sample: how many
     max_tokens: int = 4000
+    model: str | None = None                           # this operator's model, when not the runner's
+    image: bool = False                                # map/extract/filter over `figures`: send the crop too
+    extract_key: str = "text"                          # extract: the field the spans must be quoted from
 
     @property
     def schema(self) -> dict:
@@ -133,9 +158,15 @@ class Operation:
     def version(self, model: str) -> str:
         """What invalidates this operation's cache: its prompt, its schema, and the model that answered."""
         blob = json.dumps({"t": self.type, "p": self.prompt, "c": self.comparison_prompt,
-                           "o": self.output, "k": self.reduce_key or self.resolve_key, "m": model},
-                          sort_keys=True)
+                           "o": self.output, "k": self.reduce_key or self.resolve_key, "m": self.model or model,
+                           "i": self.image}, sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    @property
+    def boolean_field(self) -> str | None:
+        """The *named* boolean a filter decides on — the first one the schema declares, not the first
+        one the answer happens to carry."""
+        return next((k for k, v in self.output.items() if str(v).strip().lower() in ("boolean", "bool")), None)
 
 
 @dataclass
@@ -165,8 +196,12 @@ class Pipeline:
                                  f"(have {', '.join(sorted(OPERATORS))})")
             if op.type in ("map", "filter", "reduce") and not op.output:
                 raise ValueError(f"operation {op.name!r}: {op.type} needs an output schema")
+            if op.type == "extract" and not op.output:
+                op.output = {"spans": "list[string]"}
             if op.output:
                 _ = op.schema        # a bad type is an error now, not after the first page has been paid for
+            if op.type == "filter" and op.boolean_field is None:
+                raise ValueError(f"filter {op.name!r} needs a boolean field in its output schema")
             ops[op.name] = op
         pipe = raw.get("pipeline") or {}
         steps = pipe.get("operations") or [s for st in (pipe.get("steps") or []) for s in st.get("operations", [])]
@@ -175,10 +210,26 @@ class Pipeline:
         missing = [s for s in steps if s not in ops]
         if missing:
             raise ValueError(f"pipeline names operation(s) that are not defined: {', '.join(missing)}")
+        source = pipe.get("input") or raw.get("input") or raw.get("source") or "pages"
+        if source not in SOURCES and not source.startswith("extracted:"):
+            raise ValueError(f"unknown source {source!r} (use {', '.join(SOURCES)} or extracted:<name>)")
+        output = pipe.get("output") or raw.get("output") or {"type": "json"}
+        kind = output.get("type", "json")
+        if kind not in SINKS:
+            raise ValueError(f"unknown output type {kind!r} (use {', '.join(SINKS)})")
+        if kind in ("frontmatter", "layout", "document"):
+            fields = output.get("fields")
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError(f"output type {kind!r} needs `fields: {{row field: target}}`")
+            for target in fields.values():
+                if kind == "frontmatter" and not (target in FRONTMATTER_KEYS or any(target.startswith(k) for k in FRONTMATTER_KEYS if k.endswith("."))):
+                    raise ValueError(f"frontmatter sink may not write {target!r} (allowed: {', '.join(FRONTMATTER_KEYS)})")
+                if kind == "layout" and target not in LAYOUT_KEYS:
+                    raise ValueError(f"layout sink may not write {target!r} (allowed: {', '.join(LAYOUT_KEYS)})")
+                if kind == "document" and target in DOCUMENT_KEYS_REFUSED:
+                    raise ValueError(f"document sink may not write {target!r}")
         return cls(name=raw.get("name") or Path(path).stem, operations=list(ops.values()), steps=steps,
-                   source=(pipe.get("input") or raw.get("input") or "pages"),
-                   status=list(raw.get("status") or []),
-                   output=pipe.get("output") or raw.get("output") or {"type": "json"})
+                   source=source, status=list(raw.get("status") or []), output=output)
 
     def op(self, name: str) -> Operation:
         return next(o for o in self.operations if o.name == name)
@@ -186,6 +237,10 @@ class Pipeline:
     @property
     def llm_steps(self) -> list[str]:
         return [s for s in self.steps if self.op(s).type in LLM_OPS]
+
+    @property
+    def writes_back(self) -> bool:
+        return (self.output or {}).get("type") in ("frontmatter", "layout", "document")
 
 
 # --- the rows ------------------------------------------------------------------------------------
@@ -207,17 +262,87 @@ def page_rows(s: Settings, st: Store, slug: str, statuses: list[str] | None = No
         if not path.exists():
             continue
         fm, body = render.read_page(path)
-        ctx = fm.get("context") or {}
         if not body.strip():
             continue
-        rows.append({"_document": slug, "_page": page["sequence"], "_page_id": page["id"],
-                     "text": body.strip(), "page_label": page["page_label"] or "",
-                     "status": page["status"], "chapter": ctx.get("chapter") or "",
-                     "section": ctx.get("section") or "", "title": ctx.get("title") or "",
-                     "document_title": (render.load_document_meta(s.documents / slug).get("title") or slug)})
+        rows.append(_page_row(s, slug, page, fm, body))
         if limit and len(rows) >= limit:
             break
     return rows
+
+
+def _page_row(s: Settings, slug: str, page, fm: dict, body: str) -> dict:
+    ctx, ver, ocr_ = fm.get("context") or {}, fm.get("verification") or {}, fm.get("ocr") or {}
+    return {"_document": slug, "_page": page["sequence"], "_page_id": page["id"],
+            "text": body.strip(), "page_label": page["page_label"] or "",
+            "status": page["status"], "chapter": ctx.get("chapter") or "",
+            "section": ctx.get("section") or "", "title": ctx.get("title") or "",
+            "document_title": (render.load_document_meta(s.documents / slug).get("title") or slug),
+            # the reconciliation signals: what an operator is honestly told about how well the page was read
+            "agreement": ver.get("agreement"), "overlap": ver.get("overlap"), "cer": ver.get("cer"),
+            "flagged_spans": ver.get("flagged_spans") or 0, "llm_uncertain": ver.get("llm_uncertain") or [],
+            "ocr_confidence": ocr_.get("confidence"), "fidelity": page["fidelity"] if "fidelity" in page.keys() else None,
+            "part": page["part"] or ""}
+
+
+def block_rows(s: Settings, st: Store, slug: str, statuses: list[str] | None = None,
+               limit: int | None = None, figures_only: bool = False) -> list[dict]:
+    """One row per block of the page model — or per figure — with its geometry beside its text.
+
+    `_block` and `_bbox` are the provenance: an extraction from a block row can be taken back to a
+    rectangle on the photograph, not just to a page. A figure row also carries `_asset`, the path of
+    its crop, which an operator with `image: true` is shown.
+    """
+    rows = []
+    for prow in page_rows(s, st, slug, statuses, None):
+        page = st.page(prow["_page_id"])
+        try:
+            lay = pipeline_mod.page_layout(s, st, page)
+        except Exception as e:                       # artifacts gone: no geometry, no rows for this page
+            log.warning("etl: no layout for page %s (%s)", prow["_page"], e)
+            continue
+        base = {k: v for k, v in prow.items() if k not in ("text",)}
+        page_text = prow["text"]
+        for b in sorted(lay.blocks, key=lambda b: b.order):
+            if figures_only != (b.role == "figure"):
+                continue
+            row = base | {"_block": b.id, "_bbox": [round(v, 4) for v in b.bbox], "role": b.role, "order": b.order,
+                          "column": b.column, "level": b.level, "confidence": b.confidence, "source": b.source,
+                          "caption": b.caption or "", "text": (page_text if b.role == "figure" else b.text)}
+            if b.role == "figure":
+                row["kind"] = b.kind
+                row["_asset"] = str(pipeline_mod.figures_dir(s, slug) / b.asset) if b.asset else ""
+            else:
+                row["_lines"] = [[ln.text, [round(v, 4) for v in ln.bbox]] for ln in b.lines]
+            rows.append(row)
+            if limit and len(rows) >= limit:
+                return rows
+    return rows
+
+
+def extracted_rows(s: Settings, slug: str, name: str) -> list[dict]:
+    """A previous pipeline's output as this one's input — the rows it wrote, read back."""
+    p = s.documents / slug / "extracted" / f"{Path(name).stem}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"no extraction {name!r} for {slug} (looked for {p.name})")
+    rows = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError(f"{p.name} is not a list of rows")
+    return rows
+
+
+def rows_for(s: Settings, st: Store, slug: str, source: str, statuses: list[str] | None = None,
+             limit: int | None = None) -> list[dict]:
+    """The rows a pipeline starts from, by its `source`."""
+    if source == "pages":
+        return page_rows(s, st, slug, statuses, limit)
+    if source == "blocks":
+        return block_rows(s, st, slug, statuses, limit)
+    if source == "figures":
+        return block_rows(s, st, slug, statuses, limit, figures_only=True)
+    if source.startswith("extracted:"):
+        rows = extracted_rows(s, slug, source.split(":", 1)[1])
+        return rows[:limit] if limit else rows
+    raise ValueError(f"unknown source {source!r}")
 
 
 def template(text: str, row: dict | None = None, rows: list[dict] | None = None) -> str:
@@ -277,12 +402,26 @@ class Runner:
     """Runs a pipeline's operators over rows, caching each operator's answers on disk."""
 
     def __init__(self, s: Settings, st: Store, slug: str, provider=None, use_cache: bool = True,
-                 dry_run: bool = False):
+                 dry_run: bool = False, provider_for: Callable[[str], Any] | None = None):
         self.s, self.st, self.slug, self.provider = s, st, slug, provider
         self.use_cache, self.dry_run = use_cache, dry_run
         self.stats = Stats()
         self.model = getattr(provider, "model", "none")
         self.prompts: list[tuple[str, str]] = []       # (operation, prompt) — what --dry-run shows
+        self.provider_for = provider_for               # model name -> provider, for an operator's own `model:`
+        self._providers: dict[str, Any] = {}
+
+    def _provider(self, op: Operation):
+        if not op.model or op.model == self.model:
+            return self.provider
+        if op.model not in self._providers:
+            if self.provider_for is None:
+                log.warning("etl %s asks for model %s but no provider factory was given; using %s",
+                            op.name, op.model, self.model)
+                self._providers[op.model] = self.provider
+            else:
+                self._providers[op.model] = self.provider_for(op.model)
+        return self._providers[op.model]
 
     # -- cache ------------------------------------------------------------------------------------
     def cache_path(self, op: Operation) -> Path:
@@ -311,20 +450,29 @@ class Runner:
         tmp.replace(p)
 
     # -- the one place that spends anything --------------------------------------------------------
-    def ask(self, op: Operation, prompt: str, cache: dict, key: str, page_id: str | None) -> dict | None:
+    def ask(self, op: Operation, prompt: str, cache: dict, key: str, page_id: str | None,
+            image_path: str | None = None) -> dict | None:
         """One structured answer, from the cache if it is there. None when it could not be had."""
-        h = hashlib.sha256(prompt.encode()).hexdigest()[:24]
+        h = hashlib.sha256((prompt + (f"\n@{image_path}" if image_path else "")).encode()).hexdigest()[:24]
         if h in cache:
             self.stats.cached += 1
             return cache[h]
         self.prompts.append((op.name, prompt))
         if self.dry_run:
             return None
-        if self.provider is None or not hasattr(self.provider, "complete_json"):
+        provider = self._provider(op)
+        if provider is None or not hasattr(provider, "complete_json"):
             self.stats.skipped += 1
             return None
+        image = None
+        if image_path:
+            import cv2
+            image = cv2.imread(image_path)
+            if image is None:
+                log.warning("etl %s: figure crop %s missing; asking without it", op.name, image_path)
         try:
-            res = self.provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens)
+            res = (provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens, image_bgr=image) if image is not None
+                   else provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens))
         except LLMError as e:
             self.stats.errors.append(f"{op.name}: {e}")
             log.warning("etl %s failed on one row: %s", op.name, e)
@@ -348,27 +496,43 @@ class Runner:
     def _map(self, op: Operation, rows: list[dict]) -> list[dict]:
         cache, out = self._cache(op), []
         for r in rows:
-            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"))
+            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"),
+                            image_path=(r.get("_asset") or None) if op.image else None)
             out.append(r | (data or {}))
         self._save(op, cache)
         return out
 
     def _extract(self, op: Operation, rows: list[dict]) -> list[dict]:
-        """A map that must answer in the page's own words. The prompt says so and the schema is a list
-        of strings, because the thing that makes an extraction checkable is that you can find it."""
-        op = Operation(**(op.__dict__ | {"prompt": op.prompt + "\n\nQuote the document's own words "
-                                         "exactly, and return nothing that is not in it verbatim.",
-                                         "output": op.output or {"spans": "list[string]"}}))
-        return self._map(op, rows)
+        """A map that must answer in the page's own words, and is then held to it.
+
+        The prompt says so and the default schema is a list of strings, because the thing that makes
+        an extraction checkable is that you can find it. Each returned span is then *looked for* —
+        in the block's lines when the row has geometry, in its text otherwise — and comes back as
+        `_spans: [{text, bbox, found}]`. A span that is not there is kept, marked `found: false`: it
+        is the fabrication signal, and hiding it would be the one thing this module must not do.
+        """
+        asked = Operation(**(op.__dict__ | {"prompt": op.prompt + "\n\nQuote the document's own words "
+                                            "exactly, and return nothing that is not in it verbatim."}))
+        out = []
+        for r in self._map(asked, rows):
+            spans = next((v for v in r.values() if isinstance(v, list) and v and all(isinstance(x, str) for x in v)), None)
+            if spans is None:
+                spans = r.get(next(iter(op.output), "spans")) if isinstance(r.get(next(iter(op.output), "spans")), list) else []
+            r = dict(r)
+            r["_spans"] = [locate_span(x, r, op.extract_key) for x in (spans or [])]
+            out.append(r)
+        return out
 
     def _filter(self, op: Operation, rows: list[dict]) -> list[dict]:
         cache, out = self._cache(op), []
+        key = op.boolean_field
         for r in rows:
-            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"))
+            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"),
+                            image_path=(r.get("_asset") or None) if op.image else None)
             if data is None:                     # unanswered: keep the row rather than silently dropping it
                 out.append(r)
                 continue
-            keep = next((v for v in data.values() if isinstance(v, bool)), None)
+            keep = data.get(key) if key else next((v for v in data.values() if isinstance(v, bool)), None)
             if keep is None:
                 raise ValueError(f"filter {op.name!r} needs a boolean field in its output schema")
             if keep:
@@ -475,6 +639,189 @@ def _pair_prompt(op: Operation, a: str, b: str) -> str:
         f"{op.comparison_prompt}\n\nA: {a}\nB: {b}")
 
 
+# --- holding an extraction to the page -----------------------------------------------------------
+def _norm_text(s: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]", "", w.lower()) for w in str(s).split() if re.sub(r"[^a-z0-9]", "", w.lower()))
+
+
+def locate_span(span: str, row: dict, key: str = "text") -> dict:
+    """Where a quoted span sits: the line whose words contain it, when the row has lines; otherwise
+    whether the row's text contains it at all. `found: false` is a quote that is not on the page."""
+    target = _norm_text(span)
+    out = {"text": span, "bbox": None, "found": False}
+    if not target:
+        return out
+    for text, bbox in row.get("_lines") or []:
+        if target in _norm_text(text):
+            out["bbox"], out["found"] = bbox, True
+            return out
+    if target in _norm_text(row.get(key, "")):
+        out["found"], out["bbox"] = True, row.get("_bbox")
+    return out
+
+
+def locality(rows: list[dict]) -> tuple[int, int]:
+    """(spans found on the page, spans quoted) across every row that carries `_spans`."""
+    spans = [sp for r in rows for sp in (r.get("_spans") or [])]
+    return sum(1 for sp in spans if sp.get("found")), len(spans)
+
+
+@dataclass
+class Score:
+    """How an extraction did against known answers, and how much of it can be found on the page."""
+    key: str
+    expected: int = 0
+    produced: int = 0
+    hits: int = 0
+    located: int = 0
+    quoted: int = 0
+
+    @property
+    def precision(self) -> float | None:
+        return self.hits / self.produced if self.produced else None
+
+    @property
+    def recall(self) -> float | None:
+        return self.hits / self.expected if self.expected else None
+
+    @property
+    def locality(self) -> float | None:
+        return self.located / self.quoted if self.quoted else None
+
+    def describe(self) -> str:
+        f = lambda v: "n/a" if v is None else f"{v:.2f}"
+        return (f"{self.key}: precision {f(self.precision)} ({self.hits}/{self.produced}), recall {f(self.recall)} "
+                f"({self.hits}/{self.expected}), locality {f(self.locality)} ({self.located}/{self.quoted} spans found)")
+
+
+def score(rows: list[dict], truth: list[dict], key: str) -> Score:
+    """Rows against known answers, matched on (`_page`, `key`) with the same normalisation the
+    reconciler uses; plus locality over every quoted span."""
+    want = {(r.get("_page"), _norm_text(r.get(key, ""))) for r in truth if _norm_text(r.get(key, ""))}
+    got = {(r.get("_page"), _norm_text(r.get(key, ""))) for r in rows if _norm_text(r.get(key, ""))}
+    sc = Score(key=key, expected=len(want), produced=len(got), hits=len(want & got))
+    sc.located, sc.quoted = locality(rows)
+    return sc
+
+
+# --- writing back --------------------------------------------------------------------------------
+def _set_path(d: dict, path: str, value: Any) -> None:
+    keys = path.split(".")
+    for k in keys[:-1]:
+        d = d.setdefault(k, {}) if isinstance(d.get(k), dict) or k not in d else d[k]
+    d[keys[-1]] = value
+
+
+def _merge_value(old: Any, new: Any) -> Any:
+    """Lists accumulate (deduplicated, order kept); scalars are replaced; empties never overwrite."""
+    if new in (None, "", [], {}):
+        return old
+    if isinstance(old, list) or isinstance(new, list):
+        old_l = old if isinstance(old, list) else ([old] if old not in (None, "") else [])
+        new_l = new if isinstance(new, list) else [new]
+        return old_l + [v for v in new_l if v not in old_l]
+    return new
+
+
+def write_back(s: Settings, st: Store, slug: str, pipe: Pipeline, rows: list[dict], operation: str | None = None) -> dict:
+    """Send rows into the page files, the page model or document.yaml, per the spec's `output.fields`.
+
+    Every write goes the way a human edit goes: a page file is rewritten *without* refreshing the
+    pipeline's fingerprint (so `verify` treats the values as a person's and keeps them — see
+    `review.merge_human_edits`, which now also carries `references.cites`/`tags`); a layout block is
+    marked `source: etl` (kept by `layout.merge_human_layout`); document.yaml is the user's file and
+    is only ever added to. Each write is logged in `etl_writes`. Returns counts per target.
+    """
+    out = pipe.output or {}
+    kind, fields = out.get("type"), out.get("fields") or {}
+    counts = {"pages": 0, "blocks": 0, "document": 0, "fields": 0}
+    if kind == "frontmatter":
+        by_page: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            seq = r.get("_page")
+            if seq is None:
+                continue
+            for src, target in fields.items():
+                if src in r:
+                    by_page.setdefault(seq, {})[target] = _merge_value(by_page.get(seq, {}).get(target), r[src])
+        for seq, values in by_page.items():
+            page = st.page_by_sequence(slug, seq)
+            path = render.page_path(s.documents / slug, seq)
+            if page is None or not path.exists():
+                continue
+            fm, body = render.read_page(path)
+            written = []
+            for target, v in values.items():
+                cur = fm
+                for k in target.split(".")[:-1]:
+                    cur = cur.get(k) if isinstance(cur.get(k), dict) else {}
+                merged = _merge_value(cur.get(target.split(".")[-1]) if cur else None, v)
+                if merged in (None, "", []):
+                    continue
+                _set_path(fm, target, merged)
+                written.append(target)
+            if written:
+                render.write_page(s.documents / slug, seq, fm, body)      # no fingerprint refresh: a human edit
+                if "page_label" in written:
+                    st.set_status(page["id"], page["status"], fm.get("page_label"))
+                st.log_etl_write(slug, page["id"], pipe.name, operation, "frontmatter", written)
+                counts["pages"] += 1; counts["fields"] += len(written)
+    elif kind == "layout":
+        by_page: dict[str, list[dict]] = {}
+        for r in rows:
+            if r.get("_page_id") and r.get("_block"):
+                by_page.setdefault(r["_page_id"], []).append(r)
+        for pid, prows in by_page.items():
+            page = st.page(pid)
+            if page is None:
+                continue
+            try:
+                lay = pipeline_mod.page_layout(s, st, page)
+            except Exception as e:
+                log.warning("etl: cannot write layout for %s (%s)", pid, e); continue
+            written = []
+            for r in prows:
+                b = lay.block(r["_block"])
+                if b is None:
+                    continue
+                changed = False
+                for src, target in fields.items():
+                    v = r.get(src)
+                    if v in (None, "", []):
+                        continue
+                    if target == "level":
+                        v = int(v)
+                    if getattr(b, target) != v:
+                        setattr(b, target, v); changed = True
+                if changed:
+                    b.source = "etl"
+                    written.append(f"{b.id}:{','.join(fields.values())}")
+            if written:
+                pipeline_mod.save_layout(s, st, lay)
+                st.log_etl_write(slug, pid, pipe.name, operation, "layout", written)
+                counts["blocks"] += len(written); counts["pages"] += 1
+    elif kind == "document":
+        doc_dir = s.documents / slug
+        meta = render.ensure_document_meta(doc_dir, slug)
+        written = []
+        for r in rows:
+            for src, target in fields.items():
+                if src in r and r[src] not in (None, "", []):
+                    merged = _merge_value(meta.get(target), r[src])
+                    if merged != meta.get(target):
+                        meta[target] = merged; written.append(target)
+        if written:
+            render.document_meta_path(doc_dir).write_text(
+                "# Document-level metadata. Inherited into every page's `context` on `ocrmd build`;\n"
+                "# a page's own value wins. Edit freely — the pipeline never overwrites this file.\n"
+                + yaml.dump(meta, Dumper=render._Dumper, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            st.log_etl_write(slug, None, pipe.name, operation, "document", sorted(set(written)))
+            counts["document"] = 1; counts["fields"] += len(set(written))
+    else:
+        raise ValueError(f"{kind!r} is not a write-back sink")
+    return counts
+
+
 # --- output --------------------------------------------------------------------------------------
 def columns(rows: list[dict], fields: list[str] | None = None) -> list[str]:
     """Provenance first, then every field any row carries, in first-seen order.
@@ -488,7 +835,7 @@ def columns(rows: list[dict], fields: list[str] | None = None) -> list[str]:
         for k in r:
             if k not in seen:
                 seen.append(k)
-    lead = [k for k in ("_document", "_page", "_pages", "_page_id") if k in seen]
+    lead = [k for k in ("_document", "_page", "_pages", "_page_id", "_block", "_bbox") if k in seen]
     if fields:
         return lead + [k for k in fields if k in seen and k not in lead]
     return lead + [k for k in seen if k not in lead]
@@ -499,6 +846,8 @@ def write(rows: list[dict], path: Path, kind: str = "json", fields: list[str] | 
     if fields:
         cols = columns(rows, fields)
         rows = [{k: r[k] for k in cols if k in r} for r in rows]
+    if kind != "json":                              # line geometry is for the JSON reader, not a spreadsheet
+        rows = [{k: v for k, v in r.items() if k != "_lines"} for r in rows]
     if kind == "json":
         path.write_text(json.dumps(rows, indent=1, ensure_ascii=False, default=str))
     elif kind == "csv":
@@ -529,6 +878,17 @@ def output_path(s: Settings, slug: str, pipe: Pipeline, override: Path | None = 
 
 
 # --- handing the same pipeline to DocETL itself ---------------------------------------------------
+def litellm_model(model: str) -> str:
+    """DocETL speaks litellm, which wants the provider in the model id."""
+    if "/" in model:
+        return model
+    if model.startswith("claude"):
+        return f"anthropic/{model}"
+    if model.startswith("grok"):
+        return f"xai/{model}"
+    return model
+
+
 def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -> dict:
     """Write `pipeline.yaml` + `pages.json` that DocETL's own runner can execute.
 
@@ -543,6 +903,14 @@ def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -
     for name in pipe.steps:
         op = pipe.op(name)
         d: dict = {"name": op.name, "type": op.type}
+        if op.model:
+            d["model"] = litellm_model(op.model)
+        if op.type == "extract":
+            # DocETL's extract names the field to quote from and where the quotes land; ours is a prompt
+            d["document_keys"] = [op.extract_key]
+            d["extraction_key"] = next(iter(op.output), "spans")
+            d["prompt"] = op.prompt
+            ops.append(d); continue
         if op.prompt:
             d["prompt"] = op.prompt
         if op.output:
@@ -552,6 +920,12 @@ def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -
         if op.type == "resolve":
             d["comparison_prompt"] = op.comparison_prompt
             d["blocking_threshold"] = op.blocking_threshold
+            # their runner requires a resolution prompt that picks the canonical form; ours takes the
+            # commonest spelling, so the same rule is spelled out for their model
+            d["resolution_prompt"] = ("Given these spellings of one entity:\n{% for input in inputs %}- "
+                                      "{{ input." + (op.resolve_key or "name") + " }}\n{% endfor %}\n"
+                                      "Return the most complete, correctly spelled form as `" + (op.resolve_key or "name") + "`.")
+            d["output"] = {"schema": {(op.resolve_key or "name"): "string"}}
         if op.type == "unnest":
             d["unnest_key"] = op.unnest_key
         if op.type == "split":
@@ -561,7 +935,7 @@ def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -
         if op.type == "sample":
             d["samples"] = op.n
         ops.append(d)
-    spec = {"default_model": model,
+    spec = {"default_model": litellm_model(model),
             "datasets": {"pages": {"type": "file", "path": str((out_dir / "pages.json").resolve())}},
             "operations": ops,
             "pipeline": {"steps": [{"name": pipe.name, "input": "pages", "operations": pipe.steps}],

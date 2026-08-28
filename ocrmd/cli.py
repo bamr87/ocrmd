@@ -1,5 +1,5 @@
 from __future__ import annotations
-import logging, os, time
+import json, logging, os, time
 from pathlib import Path
 import typer, cv2, yaml
 from .config import settings as S, setup_logging
@@ -159,24 +159,39 @@ def etl(doc: str = typer.Option(..., help="document slug"),
         no_cache: bool = typer.Option(False, "--no-cache", help="ignore cached answers and ask again"),
         export_docetl: Path | None = typer.Option(None, help="write a DocETL pipeline + dataset here instead of running"),
         no_llm: bool = typer.Option(False, "--no-llm", help="run only the operators that cost nothing"),
+        source: str | None = typer.Option(None, help="pages | blocks | figures | extracted:<name> (overrides the spec)"),
+        score: Path | None = typer.Option(None, help="a JSON list of expected rows; report precision/recall on --score-key"),
+        score_key: str = typer.Option("name", help="the field --score matches rows on"),
         provider: str = S.provider, model: str = S.model):
     """Extract structured data from a scanned document with a declarative pipeline.
 
-    map / filter / extract / reduce / resolve / split / unnest / sample over the document's pages, each
-    an LLM prompt and an output schema (DocETL's operator model — see ocrmd/etl.py). Every output row
-    carries the page it came from, and every operator's answers are cached and versioned by its prompt,
-    so changing one operator re-runs one operator.
+    map / filter / extract / reduce / resolve / split / unnest / sample over the document's pages,
+    blocks or figures, each an LLM prompt and an output schema (DocETL's operator model — see
+    ocrmd/etl.py). Every output row carries the page — and, from blocks, the rectangle — it came
+    from; every operator's answers are cached and versioned by its prompt, so changing one operator
+    re-runs one operator. A pipeline may write back into the page files, the page model or
+    document.yaml instead of a spreadsheet (`output.type: frontmatter | layout | document`).
+
+    PIPELINE may be a file, or the name of a bundled one: figures, references, glossary, receipts, cases.
     """
     from . import etl as etl_mod
+    from .web.jobs import BUNDLED_PIPELINES
     st = _store()
+    if not pipeline_file.exists():
+        cand = BUNDLED_PIPELINES / (pipeline_file.name if pipeline_file.suffix == ".yaml" else f"{pipeline_file.name}.yaml")
+        if cand.exists():
+            pipeline_file = cand
     try:
         pipe = etl_mod.Pipeline.load(pipeline_file)
-    except (ValueError, KeyError, yaml.YAMLError) as e:
+    except (ValueError, KeyError, yaml.YAMLError, OSError) as e:
         _fail(f"{pipeline_file}: {e}")
-    rows = etl_mod.page_rows(S, st, doc, list(status) or pipe.status or None, limit)
+    try:
+        rows = etl_mod.rows_for(S, st, doc, source or pipe.source, list(status) or pipe.status or None, limit)
+    except (FileNotFoundError, ValueError) as e:
+        _fail(str(e))
     if not rows:
-        _fail(f"{doc} has no pages with text to work on (has it been verified and built?)")
-    typer.echo(f"{pipe.name}: {len(rows)} page(s) -> {' -> '.join(pipe.steps)}")
+        _fail(f"{doc} has no {source or pipe.source} with text to work on (has it been verified and built?)")
+    typer.echo(f"{pipe.name}: {len(rows)} {source or pipe.source} row(s) -> {' -> '.join(pipe.steps)}")
     if export_docetl:
         prov_model = S.xai_model if provider == "xai" else model
         etl_mod.export_docetl(pipe, rows, export_docetl, prov_model)
@@ -191,7 +206,8 @@ def etl(doc: str = typer.Option(..., help="document slug"),
     prov = _provider(no_llm or dry_run, provider, model)
     if prov is None and pipe.llm_steps and not dry_run and not no_llm:
         _fail(f"no credentials for {provider}; {len(pipe.llm_steps)} operator(s) need a model")
-    runner = etl_mod.Runner(S, st, doc, prov, use_cache=not no_cache, dry_run=dry_run)
+    runner = etl_mod.Runner(S, st, doc, prov, use_cache=not no_cache, dry_run=dry_run,
+                            provider_for=lambda m: _provider(False, provider, m))
     try:
         result = runner.run(pipe, rows)
     except (ValueError, KeyError) as e:
@@ -199,15 +215,36 @@ def etl(doc: str = typer.Option(..., help="document slug"),
     if dry_run:
         for name, prompt in runner.prompts[:3]:
             typer.echo(f"\n--- {name} ---\n{prompt[:1200]}")
+        if pipe.writes_back:
+            typer.echo(f"\nwould write {pipe.output.get('type')} fields {', '.join(pipe.output.get('fields', {}).values())}")
         typer.echo(f"\n{len(runner.prompts)} call(s) would be made ({runner.stats.cached} already cached); "
                    "nothing was sent")
         return
+    for err in runner.stats.errors[:5]:
+        emit(err, "error")
+    found, quoted = etl_mod.locality(result)
+    if quoted:
+        emit(f"locality: {found}/{quoted} quoted span(s) found on the page", "ok" if found == quoted else "warn")
+    if score is not None:
+        try:
+            truth = json.loads(score.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            _fail(f"{score}: {e}")
+        emit(etl_mod.score(result, truth, score_key).describe(), "info")
+    if pipe.writes_back and out is None:
+        counts = etl_mod.write_back(S, st, doc, pipe, result, pipe.steps[-1] if pipe.steps else None)
+        etl_mod.write(result, S.documents / doc / "extracted" / f"{pipe.name}.json", "json")
+        emit(f"wrote {counts['fields']} field(s) into {counts['pages']} page(s)"
+             + (f", {counts['blocks']} block(s)" if counts['blocks'] else "")
+             + (", document.yaml" if counts['document'] else "") + f"  [{runner.stats.describe()}]",
+             "warn" if runner.stats.errors else "ok")
+        return
     path, kind, fields = etl_mod.output_path(S, doc, pipe, out)
+    if kind in ("frontmatter", "layout", "document"):
+        kind = "json"
     etl_mod.write(result, path, kind, fields)
     emit(f"{len(result)} row(s) -> {path}  [{runner.stats.describe()}]",
          "warn" if runner.stats.errors else "ok")
-    for err in runner.stats.errors[:5]:
-        emit(err, "error")
 
 
 @app.command()
@@ -267,8 +304,7 @@ def reconstruct(doc: str = typer.Option(..., help="document slug"),
     to prose, a figure nobody mentioned — shows up as a difference between the rebuilt page and the
     photograph it came from. `fidelity` is that difference as one number, 0 to 1.
     """
-    from . import layout as layout_mod, reconstruct as rc_mod
-    from .ocr import OcrResult
+    from . import reconstruct as rc_mod
     st = _store()
     pages = [p for p in st.pages(doc) if page is None or p["sequence"] == page]
     if not pages:
@@ -282,14 +318,14 @@ def reconstruct(doc: str = typer.Option(..., help="document slug"),
     for p in pages:
         pid = p["id"]
         img = cv2.imread(str(S.processed / f"{pid}.png"))
-        ocr_path = S.ocr_dir / f"{pid}.json"
         md_path = render.page_path(S.documents / doc, p["sequence"])
-        if img is None or not ocr_path.exists() or not md_path.exists():
+        if img is None or not md_path.exists():
             typer.secho(f"  {p['sequence']:04d}: missing artifacts, skipped", fg="yellow"); continue
-        res = OcrResult.model_validate_json(ocr_path.read_text())
-        fm, body = render.read_page(md_path)
-        lay = layout_mod.build(res, body, (img.shape[1], img.shape[0]))
-        lay.figures = layout_mod.figures(img, res.blocks)
+        try:
+            lay = pipeline.page_layout(S, st, p)
+        except Exception as e:
+            typer.secho(f"  {p['sequence']:04d}: no layout ({e}), skipped", fg="yellow"); continue
+        fm, _body = render.read_page(md_path)
         r = rc_mod.rebuild(img, lay, title=(fm.get("context") or {}).get("chapter"))
         stem = out / f"{p['sequence']:04d}"
         stem.with_suffix(".svg").write_text(r.svg, encoding="utf-8")
@@ -328,19 +364,6 @@ def _review_rebuild(prov, original, rebuilt, seq: int) -> None:
         typer.secho(f"      review unavailable: {e}", fg="yellow")
 
 
-def _pdf_images(path: Path, dpi: int = 200):
-    try:
-        import fitz  # pymupdf
-    except ImportError:
-        _fail(f"{path.name}: PDF support needs pymupdf — pip install 'ocrmd[pdf]'")
-    import numpy as np
-    with fitz.open(path) as pdf:
-        for i, page in enumerate(pdf):
-            pix = page.get_pixmap(dpi=dpi, alpha=False)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            yield f"{path.name}#p{i + 1}", cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-
 def _input_files(paths: list[Path]) -> list[Path]:
     out = []
     for p in paths:
@@ -354,16 +377,22 @@ def _input_files(paths: list[Path]) -> list[Path]:
 
 
 def _ingest_file(st, f: Path, doc: str, prov, refresh: bool = False) -> None:
-    sources = _pdf_images(f) if f.suffix.lower() == ".pdf" else [(f.name, cv2.imread(str(f)))]
-    for name, img in sources:
-        if img is None:
-            typer.secho(f"  unreadable: {name}", fg="red"); continue
-        pids = pipeline.ingest_frame(S, st, img, doc, f"file:{name}").pages
-        if not pids:
-            typer.secho(f"  duplicate: {name}", fg="yellow"); continue
-        typer.echo(f"{name} -> {len(pids)} page(s)")
-        for pid in pids:
+    def landed(name: str, res: pipeline.Ingested) -> None:
+        if not res.pages:
+            typer.secho(f"  duplicate: {name}", fg="yellow"); return
+        typer.echo(f"{name} -> {len(res.pages)} page(s)")
+        for pid in res.pages:
             _process(st, pid, prov, doc, refresh=refresh)
+    if f.suffix.lower() == ".pdf":
+        try:
+            pipeline.ingest_pdf(S, st, f, doc, on_page=landed)
+        except RuntimeError as e:
+            _fail(str(e))
+        return
+    img = cv2.imread(str(f))
+    if img is None:
+        typer.secho(f"  unreadable: {f.name}", fg="red"); return
+    landed(f.name, pipeline.ingest_frame(S, st, img, doc, f"file:{f.name}"))
 
 
 @app.command()

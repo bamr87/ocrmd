@@ -19,8 +19,13 @@ DIALECT = """You transcribe scanned pages into a strict Markdown dialect:
 - ATX headings (#, ##, ...) reflecting the document hierarchy, not font size.
 - Rejoin paragraphs across line breaks; de-hyphenate words broken at line ends.
 - Numbered and bulleted lists stay lists; boxed tips, sidebars and callouts become blockquotes.
-- GFM pipe tables for tabular content. Receipts: | Item | Qty | Unit | Total | then a totals block.
-- Source footnotes as [^n]. No inline HTML, no images; figures become "> **Figure:** caption".
+- GFM pipe tables for anything tabular — a table is never flattened into prose. Receipts: | Item | Qty | Unit | Total | then a totals block.
+- Mathematics as LaTeX: inline `$...$`, displayed `$$...$$` on its own lines. Never spell a formula out in words.
+- Source footnotes as [^n]. No inline HTML.
+- A figure, photograph, diagram or chart is a placeholder line `![figure n](figure-n)` at the place it sits in the
+  reading order, followed by its printed caption as a paragraph if it has one; describe each in `figures`.
+  Never describe a picture's contents in the body — only the caption that is printed.
+- Report the column count of the body text in `columns` and whether the page carries equations in `has_math`.
 - Transcribe exactly what is printed; never summarise, never add content that is not on the page.
 - Running heads, running feet and the printed page number go in the structured fields, not the body.
 - If a word is unreadable, transcribe your best guess and list it in `uncertain`."""
@@ -66,6 +71,13 @@ class PageContext(BaseModel):
     figures: list[str] = []
 
 
+class FigureNote(BaseModel):
+    """One picture on the page: which placeholder it is, what it is, what the page calls it."""
+    n: int = Field(description="the placeholder number, 1-based, in reading order")
+    kind: str = Field("figure", description="photo | diagram | chart | table_image | equation | figure")
+    caption: str = Field("", description="the printed caption, exactly; empty when there is none")
+
+
 class Transcription(BaseModel):
     kind: str = Field(description="book_page | receipt | letter | note | other")
     markdown: str
@@ -76,6 +88,10 @@ class Transcription(BaseModel):
     illegible_reason: str | None = Field(None, description="why, when legible is false (blurry, too small, rotated, covered...)")
     uncertain: list[Span] = []
     context: PageContext = PageContext()
+    figures: list[FigureNote] = []
+    columns: int = Field(1, description="columns of body text on the page, 1 for ordinary prose")
+    has_math: bool = Field(False, description="the page carries equations or mathematical notation")
+    tables: int = Field(0, description="how many tables the page carries")
     notes: str | None = None
 
 
@@ -178,6 +194,10 @@ class Provider(Protocol):
     model: str
     def transcribe(self, image_bgr: np.ndarray, ocr_hint: str, hint: PageHint | None = None,
                    focus: FocusViews | None = None) -> LLMResult: ...
+
+
+def _image_block(bgr: np.ndarray) -> dict:
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _jpeg_b64(bgr)}}
 
 
 def _jpeg_b64(bgr: np.ndarray, max_side: int = 1568) -> str:
@@ -334,20 +354,24 @@ class AnthropicProvider:
             return ""
         return "".join(b.text for b in msg.content if b.type == "text").strip()
 
-    def complete_json(self, system: str, user: str, schema: dict, max_tokens: int = 4000) -> JsonResult:
-        """One structured answer to one text question. No image, no page, no transcription schema.
+    def complete_json(self, system: str, user: str, schema: dict, max_tokens: int = 4000,
+                      image_bgr: np.ndarray | None = None) -> JsonResult:
+        """One structured answer to one question. No page, no transcription schema.
 
         This is what `etl` is built on: the operators ask about text that has *already* been read twice
-        and reconciled, so there is nothing to cross-check here and no reason to send a picture.
+        and reconciled, so there is nothing to cross-check here and usually no reason to send a
+        picture. `image_bgr` is the exception — a figure crop, when the question is about the picture
+        itself (what kind of chart, what the axes say) and no transcription can answer it.
         """
         import anthropic
         t0 = time.monotonic()
+        content: list | str = user if image_bgr is None else [_image_block(image_bgr), {"type": "text", "text": user}]
         try:
             msg = self.client.messages.create(
                 model=self.model, max_tokens=max_tokens,
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 output_config={"format": {"type": "json_schema", "schema": schema}},
-                messages=[{"role": "user", "content": user}])
+                messages=[{"role": "user", "content": content}])
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
             raise LLMUnavailable(f"anthropic credentials rejected: {e.message}") from e
         except anthropic.APIConnectionError as e:
@@ -516,9 +540,15 @@ class XAIProvider:
                                     "json_schema": {"name": "result", "schema": schema, "strict": True}},
                 "max_tokens": max_tokens}
 
-    def complete_json(self, system: str, user: str, schema: dict, max_tokens: int = 4000) -> JsonResult:
+    def complete_json(self, system: str, user: str, schema: dict, max_tokens: int = 4000,
+                      image_bgr: np.ndarray | None = None) -> JsonResult:
         t0 = time.monotonic()
-        data = self._post(self.json_body(system, user, schema, max_tokens))
+        body = self.json_body(system, user, schema, max_tokens)
+        if image_bgr is not None:
+            body["messages"][1]["content"] = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_jpeg_b64(image_bgr)}", "detail": "high"}},
+                {"type": "text", "text": user}]
+        data = self._post(body)
         choice = (data.get("choices") or [{}])[0]
         if choice.get("finish_reason") == "content_filter":
             raise LLMPageError("xAI content filter")

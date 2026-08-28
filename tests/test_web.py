@@ -238,3 +238,35 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
     assert client.get("/api/documents/del-book").status_code == 404
     assert client.delete("/api/documents/del-book?confirm=del-book").status_code == 404
     assert pipeline.orphan_artifacts(root, store) == []
+
+
+# --- the page model ---------------------------------------------------------------------------------
+@needs_ocr
+def test_the_page_model_is_served_drawn_and_editable(client, root, store):
+    pid, _ = _seed(root, store)
+    p = client.get("/api/documents/web-book/pages/1").json()
+    assert p["layout"] == "/api/documents/web-book/pages/1/layout" and isinstance(p["figures"], list)
+    lay = client.get(p["layout"]).json()
+    assert lay["page_id"] == pid and lay["blocks"] and lay["version"].startswith("layout@")
+    boxes = client.get("/api/documents/web-book/pages/1/boxes").json()
+    assert boxes["lines"] and boxes["blocks"] and boxes["flags"]
+    assert boxes["flags"][0]["bbox"] is not None                    # the flag is placed on the image
+    # a human edit: one block's role corrected, sent back whole
+    lay["blocks"][0]["role"] = "heading"
+    r = client.put("/api/documents/web-book/pages/1/layout", json={"blocks": lay["blocks"]})
+    assert r.status_code == 200 and r.json()["blocks"][0]["source"] == "human"
+    assert pipeline.load_layout(root, pid).blocks[0].role == "heading"
+    assert client.put("/api/documents/web-book/pages/1/layout", json={"blocks": [{"bbox": "no"}]}).status_code == 400
+
+
+@needs_ocr
+def test_the_document_exports_as_one_json_object(client, root, store):
+    pid, _ = _seed(root, store)
+    (root.documents / "web-book" / "extracted").mkdir(exist_ok=True)
+    (root.documents / "web-book" / "extracted" / "cases.json").write_text('[{"_page": 1, "name": "x"}]')
+    d = client.get("/api/documents/web-book/export.json").json()
+    assert d["document"] == "web-book" and d["meta"]["title"] == "Web Book"
+    assert d["pages"][0]["id"] == pid and d["pages"][0]["layout"]["blocks"]
+    assert d["pages"][0]["body"] and d["pages"][0]["frontmatter"]["ocrmd"] == 1
+    assert d["extractions"] == {"cases": [{"_page": 1, "name": "x"}]}
+    assert client.get("/api/documents/nope/export.json").status_code == 404

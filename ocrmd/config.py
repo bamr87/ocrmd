@@ -112,7 +112,7 @@ class Settings(BaseModel):
     provider: str = "anthropic"
     model: str = "claude-opus-5"
     xai_model: str = "grok-4"
-    prompt_version: str = "transcribe@4"
+    prompt_version: str = "transcribe@5"
     llm_workers: int = 2              # concurrent LLM calls during a scan (OCR stays serial)
     llm_timeout: float = 180.0        # seconds per request
     llm_max_retries: int = 3          # SDK-level retries on 429/5xx/connection errors
@@ -164,6 +164,10 @@ class Settings(BaseModel):
     @property
     def llm_dir(self) -> Path: return self.root / "llm"
     @property
+    def layout_dir(self) -> Path: return self.root / "layout"
+    @property
+    def export_dir(self) -> Path: return self.root / "export"
+    @property
     def documents(self) -> Path: return self.root / "documents"
     @property
     def db_path(self) -> Path: return self.root / "ocrmd.db"
@@ -171,7 +175,7 @@ class Settings(BaseModel):
     def log_path(self) -> Path | None: return (self.root / self.log_file) if self.log_file else None
 
     def ensure_dirs(self) -> None:
-        for d in (self.raw, self.processed, self.ocr_dir, self.llm_dir, self.documents):
+        for d in (self.raw, self.processed, self.ocr_dir, self.llm_dir, self.layout_dir, self.documents):
             d.mkdir(parents=True, exist_ok=True)
 
 

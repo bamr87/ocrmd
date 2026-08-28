@@ -1,0 +1,26 @@
+# What each page cites and what it is about, written into the page's frontmatter (`references.cites`,
+# `references.tags`), where the exporters pick them up as a bibliography and as metadata.
+name: references
+
+operations:
+  - name: cites_and_tags
+    type: map
+    prompt: |
+      Below is page {{ input.page_label }} of "{{ input.document_title }}" (chapter: {{ input.chapter }}).
+
+      List every work, case, statute, standard or source this page cites, exactly as the page names it
+      (author and title, or case name and citation). A reference to "the previous chapter" is not a
+      citation. Then give up to five short topic tags for what the page is about, taken from its own
+      vocabulary. If the page cites nothing, `cites` is an empty list.
+
+      {{ input.text }}
+    output:
+      schema:
+        cites: "list[string]"
+        tags: "list[string]"
+
+pipeline:
+  operations: [cites_and_tags]
+  output:
+    type: frontmatter
+    fields: {cites: references.cites, tags: references.tags}

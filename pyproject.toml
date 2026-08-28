@@ -37,6 +37,7 @@ include = ["ocrmd*"]
 
 [tool.setuptools.package-data]
 "ocrmd.web" = ["static/*"]
+"ocrmd" = ["pipelines/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
