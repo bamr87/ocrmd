@@ -1,0 +1,65 @@
+# An example ocrmd extraction pipeline: every case a law textbook cites, one row per case, with the
+# page it was read from — then folded into one row per chapter.
+#
+#   ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --dry-run   # see the prompts, spend nothing
+#   ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --limit 5   # try it on five pages
+#   ocrmd etl --doc lsat -p examples/cases.pipeline.yaml             # the whole document
+#
+# The operator model is DocETL's (github.com/ucbepic/docetl); `--export-docetl out/` writes this same
+# pipeline in the form their runner takes, so it can be handed to their optimizer.
+name: cases
+
+operations:
+  - name: find_cases
+    type: map
+    prompt: |
+      Below is one page of "{{ input.document_title }}" (printed page {{ input.page_label }}).
+
+      List every court case named on this page. A case is named only if the page actually names it —
+      a reference to "the previous case" is not a name, and a citation you half-recognise is not a
+      reason to complete it. If the page names none, return an empty list.
+
+      {{ input.text }}
+    output:
+      schema:
+        cases: "list[{name: string, year: integer, holding: string}]"
+
+  - name: one_row_per_case
+    type: unnest
+    unnest_key: cases
+
+  - name: same_case
+    type: resolve
+    resolve_key: name
+    blocking_threshold: 0.7
+    comparison_prompt: |
+      Are these two strings the same court case, written differently (abbreviation, missing party,
+      spelling, an OCR slip)? Two different cases with a party in common are NOT the same case.
+
+      A: {{ input.a }}
+      B: {{ input.b }}
+    output:
+      schema:
+        same: boolean
+
+  - name: by_chapter
+    type: reduce
+    reduce_key: chapter
+    prompt: |
+      These cases were all read from one chapter of a textbook. Summarise what the chapter uses them
+      for, in three sentences, and name the two most important. Use only what is here.
+
+      {{ inputs }}
+    output:
+      schema:
+        summary: string
+        key_cases: "list[string]"
+
+pipeline:
+  operations: [find_cases, one_row_per_case, same_case]
+  output:
+    type: csv
+    path: cases.csv
+    # the page text rides along in every row; keep it out of the spreadsheet (the provenance columns
+    # are always written, whatever this says)
+    fields: [name, year, holding, name_as_written, chapter, page_label]

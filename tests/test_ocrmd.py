@@ -143,10 +143,18 @@ def _spread() -> np.ndarray:
 
 
 def test_spread_is_split_at_the_gutter():
+    """The invariant is that the cut falls in blank space, not that the halves come out the same
+    width: the binding plus its two inner margins is rarely symmetric, and a split anywhere inside
+    that band keeps both pages whole. Equal widths was the old assertion and it was the wrong one."""
     parts = preprocess.process(_spread())
     assert len(parts) == 2
-    widths = [m["page_width_px"] for _, _, m in parts]
-    assert abs(widths[0] - widths[1]) <= 0.08 * max(widths), widths
+    assert all(m["page_width_px"] > 400 for _, _, m in parts)     # neither half is an offcut
+    crop = _spread()
+    x, depth = preprocess.find_gutter(crop)
+    prof = preprocess.ink_columns(crop)
+    body = float(np.median(prof[int(0.05 * len(prof)):int(0.95 * len(prof))]))
+    assert depth >= preprocess.GUTTER_DEPTH
+    assert prof[x] <= body * (1 - preprocess.GUTTER_DEPTH)        # the cut runs through no text
 
 
 def test_estimated_page_width_matches_what_the_pipeline_produces():
@@ -220,3 +228,88 @@ if __name__ == "__main__":
     for fn in fns:
         fn(); print(f"  ok  {fn.__name__}")
     print(f"{len(fns)} checks passed")
+
+
+# --- spread splitting ----------------------------------------------------------------------------
+def _binding(gap_px: int = 60, lamp: bool = False):
+    """Two pages of text with a blank binding between them, optionally lit from one side."""
+    import numpy as np
+    from conftest import text_page
+    page = text_page(["the quick brown fox jumps over the lazy dog"] * 14, size=(700, 900))
+    gutter = np.full((page.shape[0], gap_px, 3), 245, np.uint8)
+    img = np.hstack([page, gutter, page])
+    if lamp:                                    # a smooth brightness ramp across the sheet
+        ramp = np.linspace(0.45, 1.0, img.shape[1], dtype=np.float32)[None, :, None]
+        img = np.clip(img * ramp, 0, 255).astype(np.uint8)
+    return img
+
+
+def test_a_real_spread_splits_at_its_binding():
+    from ocrmd import preprocess
+    img = _binding()
+    x, depth = preprocess.find_gutter(img)
+    assert depth >= preprocess.GUTTER_DEPTH
+    assert abs(x - img.shape[1] // 2) < 0.08 * img.shape[1]     # in the blank band around the middle
+    halves = preprocess.split_spread(img)
+    assert len(halves) == 2
+    assert min(h.shape[1] for h in halves) > 0.3 * img.shape[1]   # two pages, not a page and an offcut
+
+
+def test_a_lamp_to_one_side_does_not_move_the_gutter():
+    """The bug this replaced: on a global threshold the brightness ramp is the strongest signal in
+    the frame, so the darkest column is the far edge of the search band, not the binding."""
+    from ocrmd import preprocess
+    lit = _binding(lamp=True)
+    x, depth = preprocess.find_gutter(lit)
+    assert depth >= preprocess.GUTTER_DEPTH
+    assert abs(x - lit.shape[1] // 2) < 0.08 * lit.shape[1]
+
+    # what the old rule would have chosen: the darkest column in the band, which the ramp decides
+    import cv2, numpy as np
+    gray = cv2.cvtColor(lit, cv2.COLOR_BGR2GRAY)
+    col = cv2.GaussianBlur(gray, (1, 51), 0).mean(axis=0)
+    w = lit.shape[1]
+    old_x = w // 3 + int(np.argmin(col[w // 3:2 * w // 3]))
+    assert abs(old_x - w // 2) > abs(x - w // 2)                # the old choice is further off
+
+
+def test_a_single_page_with_a_blank_stripe_is_not_cut_in_two():
+    """A wide crop is not a spread, and an empty column is not a binding. Measured on the real store,
+    splitting these produced a page and a 440-px offcut, and the unsplit sheet reads longer and more
+    confidently. A ragged right margin or a figure leaves a stripe just as empty as a gutter — what
+    tells them apart is whether there is text on both sides of it."""
+    import numpy as np
+    from ocrmd import preprocess
+    from conftest import text_page
+    page = text_page(["the quick brown fox jumps over the lazy dog"] * 14, size=(700, 900))
+    blank = np.full((page.shape[0], 560, 3), 245, np.uint8)     # a wide empty right-hand region
+    wide = np.hstack([page, blank])
+    assert wide.shape[1] / wide.shape[0] >= preprocess.SPREAD_RATIO
+    _x, depth = preprocess.find_gutter(wide)
+    assert depth < preprocess.GUTTER_DEPTH                      # empty, but text on only one side
+    assert len(preprocess.split_spread(wide)) == 1
+
+
+def test_a_narrow_crop_is_never_considered():
+    from ocrmd import preprocess
+    from conftest import text_page
+    assert len(preprocess.split_spread(text_page(size=(700, 900)))) == 1
+
+
+def test_the_live_page_width_estimate_agrees_with_the_split():
+    """The HUD must not promise 900px a page on a sheet the pipeline is about to keep whole."""
+    from ocrmd import preprocess
+    from conftest import on_desk
+    import numpy as np
+    from conftest import text_page
+    page = text_page(["the quick brown fox jumps over the lazy dog"] * 14, size=(700, 900))
+    lone = np.hstack([page, np.full((page.shape[0], 560, 3), 245, np.uint8)])
+    for img, spread in ((_binding(), True), (lone, False)):
+        frame = on_desk(img, margin=100)
+        rect = preprocess.find_page_rect(frame)
+        assert rect is not None
+        est = preprocess.estimated_page_width(frame, rect)
+        parts = preprocess.process(frame)
+        assert (len(parts) == 2) == spread
+        widest = max(p[0].shape[1] for p in parts)
+        assert est <= widest * 1.15                  # the estimate tracks the crops actually made

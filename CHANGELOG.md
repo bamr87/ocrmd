@@ -1,5 +1,319 @@
 # Changelog
 
+## 0.8.0 — 2026-08-28
+
+### A view of the page that is meant to be read
+
+`processed/<id>.flat.png`, the **flat** view in the web UI and the default one on the page screen. The
+crop with the illumination divided out, an unsharp mask, and a tone curve that puts the ink on black
+and the paper on white — the page as a flatbed scanner would have delivered it, instead of as a
+webcam saw it under a desk lamp.
+
+Scored on the 40 pages of this store that carry a model transcription, the way `ocrmd ocr-bench`
+scores an engine: **F1 0.741 for the flat view against 0.246 for `bin`**, with the untouched colour
+crop the engines actually read at 0.744. The view meant for reading now reads as well as the crop
+itself, where the one it replaces was throwing two thirds of the words away.
+
+Three things that measurement decided, each having looked right first:
+
+- **no denoising** — a bilateral filter makes it look cleaner and costs 0.144 F1; at these x-heights
+  the "noise" is the thin strokes;
+- **Otsu classes rather than a fixed percentile** — ink coverage runs 1–15 % of a page, so a fixed
+  percentile lands on the paper of a sparse page, which is the page that needed it most;
+- **not the class medians** — mapping median-ink to black flattens half of every stroke: 0.693.
+
+Nothing else changed: the engines and the model still read the colour crop, `bin` is still written, and
+neither of those two is read by the pipeline at all.
+
+It is **derived, not staged**: a pure function of `<id>.png`, with no version string, no place in the
+page id, and no reprocess. Pages scanned long before it existed get one the first time anything asks
+(`pipeline.ensure_flat`); delete the file and the next request rebuilds it.
+
+### Select a region of the page and read it harder
+
+Drag a box on the page image in the web UI. The rectangle is cut out of the flat rendering, enlarged
+on its own terms and re-read by the local engines; **Ask the model** sends that one crop to the
+provider for the words they still cannot get. The result comes back beside the crop it was read from,
+with *Copy* and *Insert into body*. Also `ocrmd read --doc X --page N --region x,y,w,h [--llm]` and
+`POST /api/documents/{slug}/pages/{seq}/region`.
+
+Measured, on the 38 pages of this store with a model transcription, by cutting each into four bands
+and reading each band as a region: F1 is unchanged (0.740 whole page, 0.738 by region), **recall rises
+2–3 points and precision falls by about as much**. That is the shape of the feature — reading a piece
+of a page on its own finds more words and is less choosy about them, which is the right trade when a
+person is looking at the same crop and the wrong one for the unattended page pass. A read costs ~0.9 s
+for a line, ~1.3 s for a paragraph.
+
+**Nothing is written.** No stage is marked, no artifact is rewritten, and the model's answer is
+returned *beside* the OCR one rather than replacing it — everywhere else in ocrmd two readings are
+reconciled and their disagreements marked, and this path has no second reading, so the operator is the
+reconciler. *Insert into body* puts the text at the cursor in the editor; only Save writes.
+
+### Extraction: DocETL's operators over the finished pages
+
+`ocrmd etl --doc X -p pipeline.yaml`, and an **Extract** panel on the document page in the web UI. A
+transcribed book is a corpus; this answers what is in it. `map`, `filter`, `extract`, `reduce` and
+`resolve`, plus `split`, `unnest` and `sample` that cost nothing — each an LLM prompt and an output
+schema, chained in a YAML spec. The operator model, the type notation and the spec shape are
+[DocETL](https://github.com/ucbepic/docetl)'s (UC Berkeley EPIC lab, MIT).
+
+The implementation is ocrmd's: six operators over the existing `Provider`, no new dependencies.
+DocETL brings its own LLM stack and about thirty runtime packages, all of which ocrmd already has an
+answer for — a provider layer, credentials, `llm_calls` accounting, and versioned artifacts that make
+re-running free. What it has that is worth reaching for is its optimizer, so `--export-docetl out/`
+writes the same pipeline plus the rows as a dataset in the form `docetl run` takes, and
+`pip install 'ocrmd[docetl]'` gets you the runner.
+
+Three things are ocrmd's rather than the operator model's:
+
+- **every row names its page** (`_page`, `_page_id`, `_document`, `_pages` after a reduce), because an
+  extraction you cannot take back to the photograph is a rumour;
+- **nothing is inferred** — the operators run under the same refusal as the transcription stage, and
+  blank and illegible pages are never offered to one;
+- **answers are cached per operator and versioned by the prompt**, so editing one operator re-runs one
+  operator; `--dry-run` shows the prompts and the call count and sends nothing.
+
+[examples/cases.pipeline.yaml](examples/cases.pipeline.yaml) is a worked example: every case a
+textbook cites, one row per case, the same case spelled three ways resolved into one.
+
+### Also
+
+- `Provider.complete_json` — one structured answer to one text question, on both providers; xAI's
+  retry/backoff loop is now shared by its two calls rather than inlined in `transcribe`.
+- The page image column keeps its selection in page fractions, so it survives zooming, switching
+  between the flat/processed/bin/raw views, and the re-render after each read.
+- `ocr.upscale_for_ocr` takes a `max_scale`; pages keep the measured cap of 3, regions get 6.
+- `driver.py api` now asserts the flat view and the region read, so the run skill covers both.
+- ARCHITECTURE gained §11c and the flat-rendering section, and records what the opencv `<4.12` pin
+  actually is (KleidiCV ships in 4.12+; 4.11.0.86 is the last release without it).
+
+## 0.7.0 — 2026-08-27
+
+### The spread split was cutting through text
+
+Reading the pages captured since 0.6 showed halves like 865/444 and 870/443 px — a page and an
+offcut. Measured across all 60 split captures in the store:
+
+- The gutter was found as **the darkest column** in the middle third. Under a desk lamp the darkest
+  column in that band is simply the far edge of the band, so 18 of the 60 split at almost exactly 1/3
+  or 2/3 of the sheet. The split line sat on ink 0.109 where the page body measures 0.117: it was
+  cutting straight through text, and 40 of the 60 would have been split somewhere else.
+- A binding is not dark, it is **empty**. `preprocess.ink_columns` now measures per-column fine detail
+  as high-pass energy, which ignores exposure and survives blur. Both matter: against a page softened
+  until OCR reads a third of it, an adaptive threshold keeps 13 % of the signal and a Sobel magnitude
+  16 %, against 39 % for the high pass — under a threshold, a spread with one page out of focus stops
+  looking like a spread at all.
+- **The split is now conditional.** Each of the 60 captures was read whole and split and scored on
+  expected correctly-read words; splitting genuinely helps 36 and hurts 24. Trough depth separates
+  those at AUC 0.797 (medians 0.527 against 0.225) and `GUTTER_DEPTH = 0.30` maximises the net gain:
+  +2652 words against +2161 for splitting everything and +0 for splitting nothing. A wide crop with no
+  binding — a single page photographed at an angle — is now kept whole.
+- Two guards found by their own tests: a gutter needs **text on both sides** (`GUTTER_BALANCE`, kept
+  loose at 0.25 because uneven light can leave the far page with a quarter of the near page's ink), or
+  a ragged right margin reads as a binding; and the cut is placed at the **middle of the blank band**
+  rather than its lowest point, since the band is the binding plus two unequal inner margins.
+- `estimated_page_width` runs the same test, or the HUD promises 900 px a page on a sheet the pipeline
+  is about to keep whole.
+- `preprocess@3` → **`preprocess@4`**. Page ids derive from the crop, so `ocrmd reprocess` re-derives.
+
+### Fixes
+
+- **The opencv pin did not cover the bug it was written for.** `cv2.resize` was segfaulting inside
+  KleidiCV — the same HAL that caused the `<5` pin — because KleidiCV also ships in opencv 4.12+, and
+  4.14 hits it on the wider crops the new spread logic produces. It is a hard process crash, not an
+  exception: no traceback, no partial result, in the middle of a scan. Pinned to `<4.12`; 4.11.0.86
+  is the last release whose `getBuildInformation()` lists no KleidiCV at all.
+  Three other explanations were tried and measured false first — RapidOCR thread-safety, image size,
+  and OpenCV/ONNX thread pools — and each of those changes was reverted rather than left in.
+
+### Orientation is measurably broken, and the fix is opt-in
+
+Reading the newest pages turned up crops containing the whole spread, the desk and a hand, rotated
+90°, made from a raw frame that was perfectly good. 10 % of the crops in the store have their text
+running vertically. Scored against 68 captures labelled by what OCR can actually read from them:
+
+    projection profile picks the right axis    57 %   (chance 50 %)
+    ink asymmetry, all four rotations          25 %   (chance 25 %)
+    ink asymmetry, given the right axis        53 %   (chance 50 %)
+
+Every stage but the OCR probe is a coin toss, and the cascade multiplies them — about 30 % end to
+end. The projection profile is near-tied on 46 % of pages, so its narrowing to two candidates was
+frequently arbitrary *and* binding, locking the one test that works out of the answer. Its margin
+carries no information either: accuracy by margin band runs 71/50/65/47/50 %.
+
+`orientation_probe = true` replaces it with an OCR probe over all four rotations at both recogniser
+levels — fast first, because it does not auto-orient and separates cleanly on a readable page;
+accurate second, because it reads the marginal captures the fast level returns nothing at all from.
+On the pages the old cascade got wrong it agrees with the label 3 times in 4.
+
+It ships **off**. It costs four to eight Vision passes a page, it doubles the test suite's runtime,
+and one focus-bracket test does not yet pass with it on. The measurement is the deliverable here; the
+switch is for anyone who wants to re-derive a book with `ocrmd reprocess` and pay for it.
+
+### Reconstruction: image → Markdown/LaTeX → image, and a number for how close
+
+`ocrmd reconstruct --doc X` (and a **Rebuild** job in the web UI) rebuilds each page from its Markdown
+and scores it against the photograph it came from. A page that rebuilds badly is a page the
+transcription lost something on.
+
+- **`layout.py`** joins what the two halves of the pipeline each know: OCR has the line boxes, the LLM
+  pass has the corrected text and no geometry. Lines carry reconciled words at measured positions,
+  with a match floor so an unrelated document's words are never stamped onto this page's boxes, and
+  duplicate lines from the cross-engine merge collapsed — invisible in a reflow, drawn on top of each
+  other in a facsimile.
+- **`reconstruct.py`** emits LaTeX (absolutely positioned via `textpos`: the portable master), SVG
+  (the same layout with no TeX install needed) and a PNG of the rendering, through Inkscape,
+  `rsvg-convert` or headless Chrome. `--pdf` compiles the LaTeX when a TeX engine exists.
+- **Figures are vectorised only where it measurably worked**: a line drawing is traced with
+  `cv2.findContours`, the trace is rasterised and compared with the crop it came from, and anything
+  below `VECTOR_FIDELITY` falls back to the embedded image. Photographs are never traced.
+- Figure detection rejects candidates that lie inside the text rows. Without that, erasing line boxes
+  leaves the gaps between them, closing joins the whole column into one blob, and the reconstruction
+  gets a photograph of the page pasted over it — which is what the first run did.
+- **Fidelity** correlates the two pages as *ink* (high-passed and normalised), because the rebuild is
+  black on white and the original is a photograph under a lamp. `--review` asks the model what the
+  rebuild got wrong, since a pixel score says how much differs, not what.
+
+### Annotation sync: the paper stays the document of record
+
+`ocrmd annotate --doc X` puts the camera back on already-scanned pages. Underline, highlight, strike
+through or write a margin note, and the page file follows — `==highlight==`, `**underline**`,
+`~~strike~~`, and handwriting as a bullet under `## Notes`.
+
+- **OCR and the LLM run only when something changed.** The page has been read once and every line's
+  position is on disk, so an underline or a highlight is resolved by geometry alone and costs nothing
+  at all. Only handwriting reaches a model (`Provider.read_handwriting`), because it is the one thing
+  on the page never transcribed; local OCR is not asked, being trained on print. A page nobody wrote
+  on costs one image subtraction.
+- Two channels, because pens and highlighters do opposite things: a pen darkens paper, a highlighter
+  colours it while leaving it bright and is found as a rise in saturation.
+- Alignment is ECC on **plain greyscale**. High-passing first was tried and is measurably wrong — ECC
+  is already invariant to brightness and contrast, and removing the low frequencies takes away what it
+  converges on: on a page nudged 5 px and 0.6°, greyscale registers at cc 0.99 and high-passed input
+  at 0.38, recovering the shift as 21 px instead of 3.
+- Marks already in the file are left alone, so a camera resting on a page does not wrap it repeatedly;
+  a diff covering more than `MAX_CHANGE` is refused as a misalignment rather than applied; blobs at
+  the page edge are warp artifacts, not annotations; and the page is written without refreshing the
+  fingerprint, so what you wrote on the paper survives the next `verify`.
+- `--dry-run` reports what it would change and writes nothing.
+
+## 0.6.0 — 2026-08-27
+
+### The auto-shutter, rebuilt
+
+Captures were firing during page turns, and captures nothing could read were becoming pages. Both were
+measured on this repository's own store before anything was changed.
+
+- **The page outline is now a gate** (`scene.py`). The old chain was memoryless and every one of its
+  tests can be true *in the middle of a page turn*: the hand lets go, the page is mid-fall, the pixels
+  go quiet for a moment, the lens has not moved and the frame is certainly novel. In one real
+  two-minute session 21 captures were taken and 16 of the 20 consecutive pairs disagree about where
+  the page is by more than 0.03 of the frame (drifts of 0.08-0.16) — the book was still moving, and
+  all 21 became pages. The shutter now also requires the detected sheet to hold its position across
+  `geometry_frames` (3) detections within `geometry_tolerance` (0.03).
+  The tolerance is measured, not guessed: re-detecting 30 real captures under sensor noise (450 draws)
+  moved the outline under 0.001 of the frame 95 % of the time and past 0.03 in 0.89 % of draws, and
+  *every* unstable draw came from one frame of the thirty — particular scenes are genuinely ambiguous
+  about where the sheet is, and holding the shutter there is right. So the window test is strict, with
+  no outlier tolerance.
+- **The scene remembers what disturbed it.** A desk that twitches only has to go quiet again;
+  a desk where a hand just moved a page must prove it has finished. `settle_frames` (20) is required
+  after a hand or a moved page, `stable_frames` (8) after ordinary noise, and the worst disturbance in
+  a run is the one that counts — a page turn ending in a moment of jitter is still a page turn. A
+  capture also spends the scene's quiet, so one settled period yields one capture.
+- Two deliberate non-behaviours, both found by the new tests: an outline the detector *never* finds is
+  a stable observation rather than a blocker (a page filling the frame edge to edge is never a bright
+  blob, and blocking there would deadlock that rig entirely), and `Outline` scales both sides of the
+  sheet by the same number and holds them unordered, because `minAreaRect` names one sheet either
+  `(w, h, -90)` or `(h, w, 0)` and normalising by width and height separately made a still page look
+  like a 0.37 drift whenever the naming flipped.
+- The HUD and the web scan view now name what they are waiting for — `PAGE MOVING`, `SETTLING AFTER
+  HAND 7/20` — and the meter is drawn against the target this scene actually needs.
+
+### Captures that cannot be read are refused, not made into pages
+
+- **Admission test** (`legibility.py`), run after local OCR and before any page exists. Scoring the
+  image was tried first and measurably does not work: against the model's own `legible` verdict on the
+  real crops, page width scores AUC 0.63, x-height 0.46, edge sharpness 0.58, ink/paper contrast 0.57,
+  Laplacian variance 0.62, line-spacing gradient 0.64 — nothing above 0.64. Asking the OCR engines
+  does: `words < 60` refuses 21 of 120 scored pages, 20 of them (95 %) independently called illegible,
+  losing one legible page, against a 73 % base rate. Defaults `admit_min_words = 60`,
+  `admit_min_confidence = 0.5`.
+- Replayed over the whole store it refuses 23 of 139 pages, 91 % of the judged ones illegible, and
+  saves those 23 LLM calls. **It is not a fix for a badly set up rig**: the illegible share among pages
+  still made falls only from 73 % to 69 %, because most bad pages here have plenty of readable words
+  and fail on framing and focus. Said plainly in the README next to the framing advice.
+- **Nothing is deleted.** The raw frame stays, the `captures` row records the reason and the document
+  (two new columns), no page, page file or LLM call is created, and `ocrmd status` lists what was
+  refused with the command to force one in. Re-ingesting a refused frame clears the refusal
+  (`store.clear_rejection`) — without that the refusal row read as an exact duplicate and the
+  documented override silently did nothing.
+- The test applies only to *automatic* captures. `ocrmd ingest` and forced (space-bar) captures are
+  decisions, not guesses the shutter made, and are never subject to it. `--no-admit` /
+  `admit_captures = false` restores the old behaviour.
+- Half a spread can be kept when the other half is unreadable, rather than losing a good page with it.
+
+### Fixes
+- `store.add_capture` bound its columns positionally, so the first migration to add a `captures`
+  column would have written values into the wrong ones. Named columns now.
+
+## 0.5.0 — 2026-08-27
+
+### Focus bracketing
+
+A page that does not lie flat is not uniformly in focus, and autofocus optimises one number over the
+whole frame — usually dominated by a page edge, a gutter shadow, or the flatter of two leaves. The
+frame that wins on average sharpness can be the worse frame for the top third of the page, and no
+preprocessing recovers what the optics missed there. So the shutter now takes more than one frame,
+and OCR reads more than one of them.
+
+- **`capture.focus_bracket`**: when the gates open, the page is re-shot at several lens positions
+  (`AVCaptureDevice.setFocusModeLockedWithLensPosition`, new in `camctl.set_lens_position`). Default
+  `focus_bracket = "auto"` — 3 shots at ±0.05 — brackets only when the capture is below 90 % of the
+  best sharpness the scene has shown, since a bracket on an already-sharp frame costs ~0.5 s of frozen
+  preview for nothing. `always` and `off` are the other settings; `--focus-bracket` overrides per scan.
+  The lens is always restored: continuous autofocus re-enabled, a deliberately locked lens put back
+  where it was.
+- **Many webcams cannot vary focus at all** — `isLockingFocusWithCustomLensPositionSupported` is
+  false on both cameras of the development rig, including the C525, which offers `locked` and
+  `continuous` modes but no lens position. `ocrmd doctor` now reports this per camera. There the
+  bracket reads no extra frames and the shutter instead keeps the **burst's runners-up** as variants
+  rather than discarding them — frames it already read, differing only by sensor noise and the lens's
+  own micro-adjustment. Everything downstream is identical, but they are a much weaker second opinion
+  and **the measurements below do not transfer to that fallback**, which is unmeasured on real
+  hardware. `focus_keep = 0` disables it.
+- The losing exposures ride with the capture as **variants** — `raw/<sha>.v<n>.jpg`, cropped to
+  `processed/<pid>.v<n>.png` with the page's own orientation forced and scaled onto its exact
+  dimensions. **Page identity, dedup and every stage still derive from the primary frame alone.** A
+  variant whose own page detection landed elsewhere (different aspect ratio by > 4 %) is dropped
+  rather than stretched: a mis-cropped variant aligns its text against the wrong lines.
+- **`multifocus.resolve`** votes across exposures the way `ocr.merge` votes across engines. Below
+  `ocr_trust`, the most confident variant reading of a line replaces it if it wins by
+  `focus_swap_margin` (0.10); a line only a variant saw is filled in at ≥ 0.9; one variant line can
+  be spent on only one of the page's lines. New rule `merge` does not have: a *substantially longer*
+  reading may replace a short one when it is certain — measured, an out-of-focus band yields a
+  fragment (`"milies"` for `"is so well fixed in the minds of the surrounding families"`), not a
+  word-for-word misreading, and a symmetric length window rejected every capture the bracket exists
+  to rescue. Shorter readings are still refused: that is text being dropped.
+- Measured on a 520-px page with its top half blurred, correct words (page alone → bracketed):
+  165→165 at 5 px blur (no false positives), 117→138 at 7 px, 101→146 at 9 px, 64→165 at 11 px,
+  55→165 at 13 px. **Every variant is read, including for pages whose own lines are all confident** —
+  gating on confidence was tried first and is wrong: the two biggest recoveries were on captures the
+  primary read at ≥ 0.98 mean confidence, having simply not emitted the unreadable lines. Cost is one
+  OCR pass per variant (~1.2 s with two engines) on the worker thread.
+- **What no focus could read goes to the model, not to a coin flip.** Lines still under `ocr_trust`
+  after the bracket are recorded in `ocr/<id>.focus.json` with every candidate reading and which
+  exposure produced it; the LLM request then carries the `focus_llm_images` (2) variants holding the
+  best candidates plus that region list. Each extra image is introduced by its own text block saying
+  it is another view of the *same* page — unlabelled, a second image reads as the next page and the
+  model merges two readings into one, which is exactly the fabrication this pipeline exists to catch.
+  Candidates are labelled as low-confidence machine guesses, with the instruction to transcribe what
+  is visible or report it in `uncertain`. Pages with nothing unresolved send what they always did.
+- Page frontmatter gains `ocr.focus` (variants, improved, filled, unresolved) on bracketed pages,
+  shown in the web UI's page detail; the scan reports variants captured and lines recovered.
+- Stage versions: `ocr@2` → **`ocr@3`** (`verify` re-reads pages locally, free) and
+  `transcribe@3` → **`transcribe@4`** (only `verify --refresh` acts on it, as always).
+
 ## 0.4.0 — 2026-08-26
 
 ### OCR

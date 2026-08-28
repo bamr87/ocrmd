@@ -15,7 +15,10 @@ llm_effort = "medium"          # transcription is perception, not reasoning
 camera_index = 0
 focus = "settle"               # continuous | locked | settle (continuous until the first capture, then lock) | off
 settle_after = 1
-stable_frames = 8              # ~0.8 s of stillness before the shutter can fire
+stable_frames = 8              # undisturbed frames before the shutter can fire, after ordinary noise
+settle_frames = 20             # ...and after a hand or a moved page: a page turn must prove it has finished
+geometry_frames = 3            # page-outline detections that must agree before the page counts as still
+geometry_tolerance = 0.03      # how far it may move between them, as a fraction of the frame
 motion_threshold = 4.0
 novelty_threshold = 12
 blur_threshold = 60.0
@@ -23,13 +26,39 @@ occlusion_cover = 0.05         # fraction of the page a hand must cover to hold 
 occlusion_rebaseline = 30      # frames a persistent non-hand intrusion is tolerated before re-baselining
 burst_frames = 3               # frames read at the shutter; the sharpest is kept (1 = off)
 capture_cooldown = 1.0
+
+# Focus bracket: re-shoot the page at several lens positions and keep the extra exposures, so text no
+# single focus resolves is re-read from another one. Varying focus needs a camera that supports
+# locking to a custom lens position (`ocrmd doctor` says whether yours does — many webcams do not);
+# without one the shutter keeps the burst's runners-up instead, which is a much weaker second opinion.
+focus_bracket = "auto"         # auto (only when the frame is not the sharpest the scene has shown) | always | off
+focus_bracket_shots = 3        # lens positions per bracket, including the one the lens is already at
+focus_bracket_step = 0.05      # offset between them, on AVFoundation's 0-1 lens scale
+focus_bracket_settle = 0.25    # seconds for the lens to travel (also flushes the frames buffered before it moved)
+focus_bracket_ratio = 0.9      # auto: bracket when sharpness is below this share of the scene's best
+focus_keep = 2                 # exposures kept per capture (costs one OCR pass each when the page is read)
 # resolution = "1280x960"      # default: the camera's largest mode
+
+# --- admission: should a capture become a page at all? ------------------------------------------
+# Judged on what local OCR made of the crop; image-quality signals measurably do not separate legible
+# from illegible pages. A refused frame is kept in raw/ and makes no page and no LLM call; `ocrmd
+# status` lists them. Never applies to `ocrmd ingest` or to a forced (space-bar) capture.
+admit_captures = true
+admit_min_words = 60           # measured: refuses 21 of 120 scored pages, 20 of them truly illegible
+admit_min_confidence = 0.5
+
+# Decide which way up a page is by asking OCR at all four rotations. Off by default: it is the only
+# orientation test that works (every cheaper one measures at or near chance on real captures) but it
+# costs 4-8 Vision passes a page. Turn it on and re-run `ocrmd reprocess` to re-derive a book.
+orientation_probe = false
 
 # --- OCR ---------------------------------------------------------------------------------------
 # ocr_engines = ["apple_vision", "rapidocr"]   # default []: the best installed engine, plus a second one when ocr_ensemble
 ocr_ensemble = true            # two engines vote per line: agreed words trusted, disagreements flagged (~+1.5 s/page)
 ocr_languages = ["en-US"]      # Vision recognition languages; [] = automatic
 ocr_min_side = 1400            # crops are upscaled (<= 3x) until the short side reaches this
+focus_swap_margin = 0.10       # a bracketed exposure must beat the page's line confidence by this to replace it
+focus_llm_images = 2           # exposures attached to the LLM request when regions stay unreadable (~1.5k tokens each)
 
 # --- quality / reconcile -----------------------------------------------------------------------
 min_page_width = 900           # px across one page; below it OCR is unreliable and the HUD says "move closer"

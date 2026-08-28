@@ -10,13 +10,13 @@ import pytest
 from conftest import FakeProvider, on_desk, text_page
 from ocrmd import llm as llm_mod, pipeline, render, review
 from ocrmd.llm import LLMPageError, LLMUnavailable
-from ocrmd.ocr import available_engine
+from ocrmd.ocr import OcrResult, available_engine
 
 needs_ocr = pytest.mark.skipif(available_engine() is None, reason="no local OCR engine")
 
 
 def _ingest(root, store, slug="book", lines=None, source="webcam:HD Webcam C525"):
-    ids = pipeline.ingest_frame(root, store, on_desk(text_page(lines)), slug, source)
+    ids = pipeline.ingest_frame(root, store, on_desk(text_page(lines)), slug, source).pages
     assert len(ids) == 1
     return ids[0]
 
@@ -128,23 +128,23 @@ def test_illegible_and_suspect_statuses(root, store):
 
 def test_duplicates_are_scoped_and_recorded(root, store):
     img = on_desk(text_page())
-    a = pipeline.ingest_frame(root, store, img, "book", "file:a.jpg")
-    assert pipeline.ingest_frame(root, store, img, "book", "file:a-again.jpg") == []      # exact
+    a = pipeline.ingest_frame(root, store, img, "book", "file:a.jpg").pages
+    assert pipeline.ingest_frame(root, store, img, "book", "file:a-again.jpg").pages == []      # exact
     noisy = np.clip(img.astype(np.int16) + np.random.default_rng(0).normal(0, 4, img.shape), 0, 255).astype(np.uint8)
-    assert pipeline.ingest_frame(root, store, noisy, "book", "file:b.jpg") == []          # near: sensor noise
+    assert pipeline.ingest_frame(root, store, noisy, "book", "file:b.jpg").pages == []          # near: sensor noise
     assert len(store.duplicates("book")) == 1
     noisy2 = np.clip(img.astype(np.int16) + np.random.default_rng(1).normal(0, 4, img.shape), 0, 255).astype(np.uint8)
-    assert pipeline.ingest_frame(root, store, noisy2, "other-book", "file:c.jpg")         # other document: a new page
+    assert pipeline.ingest_frame(root, store, noisy2, "other-book", "file:c.jpg").pages         # other document: a new page
     # same layout, different text: a page of the same book, not a duplicate
     other = on_desk(text_page(["a different line of text on the next page"] * 9))
-    assert pipeline.ingest_frame(root, store, other, "book", "file:d.jpg")
+    assert pipeline.ingest_frame(root, store, other, "book", "file:d.jpg").pages
     assert len(a) == 1
 
 
 def test_spread_becomes_two_pages_with_hints(root, store):
     page = text_page()
     spread = on_desk(np.hstack([page, np.full((page.shape[0], 26, 3), 90, np.uint8), page]))
-    ids = pipeline.ingest_frame(root, store, spread, "book", "webcam:cam")
+    ids = pipeline.ingest_frame(root, store, spread, "book", "webcam:cam").pages
     assert [store.page(i)["part"] for i in ids] == ["left", "right"]
     hint = pipeline.page_hint(root, store, store.page(ids[1]), "book")
     assert hint.part == "right"
@@ -161,7 +161,7 @@ def test_batch_round_trip(root, store):
             return "ended", {"succeeded": len(self.items)}
 
         def batch_collect(self, batch_id):
-            return {pid: self.transcribe(img, hint_text, hint) for pid, img, hint_text, hint in self.items}
+            return {pid: self.transcribe(img, hint_text, hint, focus) for pid, img, hint_text, hint, focus in self.items}
 
     a = _ingest(root, store, lines=["alpha beta gamma delta"] * 5)
     b = _ingest(root, store, lines=["epsilon zeta eta theta iota kappa lambda"] * 15)
@@ -277,3 +277,227 @@ def test_schema_mismatch_is_a_page_error():
     with pytest.raises(LLMPageError):
         llm_mod.parse_transcription('{"kind": "book_page"}')
     assert llm_mod.parse_transcription(json.dumps({"kind": "book_page", "markdown": "x"})).markdown == "x"
+
+
+# --- focus bracket ------------------------------------------------------------------------------
+def _blur(img, k=9):
+    import cv2
+    return cv2.GaussianBlur(img, (k, k), 0)
+
+
+@needs_ocr
+def test_a_bracketed_capture_carries_its_variants_through_every_stage(root, store):
+    """A soft capture with a sharp second exposure: both are stored, both are cropped the same way,
+    and the page's OCR is resolved across them."""
+    sharp = on_desk(text_page())
+    pid = pipeline.ingest_frame(root, store, _blur(sharp), "book", "webcam:test", [sharp]).pages[0]
+    page = store.page(pid)
+    raw_sha = page["raw_sha256"]
+    assert [f.name for f in pipeline.variant_raws(root, raw_sha)] == [f"{raw_sha}.v1.jpg"]
+    crops = pipeline.variant_crops(root, pid)
+    assert [f.name for f in crops] == [f"{pid}.v1.png"]
+
+    import cv2
+    primary = cv2.imread(str(root.processed / f"{pid}.png"))
+    # the variant is cropped onto the page's own geometry, or normalised boxes could not be compared
+    assert cv2.imread(str(crops[0])).shape == primary.shape
+
+    r = pipeline.run_page(root, store, page, None, "book")
+    mf = pipeline.focus_analysis(root, pid)
+    assert mf is not None and [v.label for v in mf.variants] == ["v1"]
+    fm, _body = render.read_page(r.path)
+    assert fm["ocr"]["focus"]["variants"] == 1 and fm["ocr"]["focus"]["artifact"] == f"ocr/{pid}.focus.json"
+    # resolving only ever adds or replaces doubtful lines, so the sharp exposure cannot lose text
+    res = pipeline.run_ocr(root, store, page)
+    assert len(res.words) >= sum(len(b.text.split()) for b in res.blocks if not b.focus)
+
+
+@needs_ocr
+def test_a_bracket_recovers_text_the_capture_could_not_read(root, store):
+    """The point of the feature, end to end: a page whose top half is out of focus, bracketed with an
+    exposure focused on that half, comes out with more of the page correctly read."""
+    import cv2
+    from ocrmd import ocr as ocr_mod
+    lines = ["it is a truth universally acknowledged that a single man",
+             "in possession of a good fortune must be in want of a wife",
+             "however little known the feelings or views of such a man",
+             "may be on his first entering a neighbourhood this truth",
+             "is so well fixed in the minds of the surrounding families"] * 3
+    truth = set(" ".join(lines).split())
+    page = text_page(lines)
+    small = cv2.resize(page, (520, int(page.shape[0] * 520 / page.shape[1])), interpolation=cv2.INTER_AREA)
+
+    def half_blur(img, top):                       # one half in focus, the other not: a curled leaf
+        out = img.copy()
+        h = out.shape[0] // 2
+        sl = slice(0, h) if top else slice(h, out.shape[0])
+        out[sl] = cv2.GaussianBlur(out[sl], (11, 11), 0)
+        return out
+
+    root.min_page_width = 300
+    pid = pipeline.ingest_frame(root, store, on_desk(half_blur(small, True), 30), "book", "file:t",
+                                [on_desk(half_blur(small, False), 30)]).pages[0]
+    correct = lambda res: sum(1 for w, _ in res.words if w.lower().strip(",.") in truth)
+    alone = ocr_mod.recognizer(root).run(cv2.imread(str(root.processed / f"{pid}.png")))
+    both = pipeline.run_ocr(root, store, store.page(pid))
+    mf = pipeline.focus_analysis(root, pid)
+    assert correct(both) > correct(alone), (correct(alone), correct(both), mf.summary())
+    assert mf.improved + mf.filled > 0
+    assert all(w.lower().strip(",.") in truth for w, _ in both.words)      # and nothing invented
+
+
+@needs_ocr
+def test_an_unbracketed_capture_is_untouched(root, store):
+    pid = _ingest(root, store)
+    assert pipeline.variant_crops(root, pid) == [] and pipeline.focus_analysis(root, pid) is None
+    r = pipeline.run_page(root, store, store.page(pid), FakeProvider(markdown="hello"), "book")
+    fm, _ = render.read_page(r.path)
+    assert "focus" not in fm["ocr"]
+
+
+@needs_ocr
+def test_deleting_a_page_purges_the_whole_bracket(root, store):
+    sharp = on_desk(text_page())
+    pid = pipeline.ingest_frame(root, store, _blur(sharp), "book", "webcam:test", [sharp]).pages[0]
+    sha = store.page(pid)["raw_sha256"]
+    pipeline.run_page(root, store, store.page(pid), None, "book")
+    out = pipeline.delete_pages(root, store, "book", [pid])
+    assert out.raws == 2 and not list(root.raw.glob("*.jpg"))
+    assert pipeline.variant_crops(root, pid) == [] and not pipeline.focus_path(root, pid).exists()
+    assert not (root.raw / f"{sha}.v1.jpg").exists()
+
+
+@needs_ocr
+def test_a_variant_that_crops_to_a_different_shape_is_dropped(root, store):
+    """A variant whose own page detection landed elsewhere would align its text against the wrong
+    lines; a wrong reading is worse than no second reading."""
+    import cv2
+    page = on_desk(text_page())
+    squashed = cv2.resize(page, (page.shape[1], int(page.shape[0] * 0.6)))
+    pid = pipeline.ingest_frame(root, store, page, "book", "webcam:test", [squashed]).pages[0]
+    assert pipeline.variant_crops(root, pid) == []
+
+
+def test_unresolved_regions_send_the_images_and_the_analysis_to_the_model(root, store):
+    """The end of the line: no focus could read a region, so the exposures and what each of them made
+    of it go to the LLM rather than the pipeline picking the highest number."""
+    import cv2
+    from ocrmd import multifocus
+    from ocrmd.multifocus import Candidate, FocusReading, MultiFocus, Unresolved
+    page = text_page()
+    pid = "abc123abc123abc1"
+    store.ensure_document("book")
+    store.add_page(pid, "book", "sha", "phash", None, page.shape[1], None)
+    cv2.imwrite(str(root.processed / f"{pid}.png"), page)
+    cv2.imwrite(str(root.processed / f"{pid}.v1.png"), page)
+    cv2.imwrite(str(root.processed / f"{pid}.v2.png"), page)
+    mf = MultiFocus(variants=[FocusReading(label="v1"), FocusReading(label="v2")],
+                    unresolved=[Unresolved(bbox=[0.1, 0.3, 0.5, 0.03], candidates=[
+                        Candidate(source="focus", text="recerved", confidence=0.3),
+                        Candidate(source="v2", text="reserved", confidence=0.61)])])
+    pipeline.focus_path(root, pid).write_text(mf.model_dump_json())
+
+    root.focus_llm_images = 1
+    views = pipeline.focus_views(root, pid)
+    assert views is not None and len(views.images) == 1        # only the one that read it best
+    assert "v2" in views.note and "reserved" in views.note
+
+    prov = FakeProvider(markdown="reserved for the author")
+    pipeline.run_llm(root, store, store.page(pid), prov,
+                     OcrResult(text="recerved", blocks=[], mean_confidence=0.3, engine="test"))
+    assert prov.focus[0] is not None and len(prov.focus[0].images) == 1
+
+    # a page whose regions all resolved locally pays nothing
+    pipeline.focus_path(root, pid).write_text(MultiFocus(variants=[FocusReading(label="v1")], improved=2).model_dump_json())
+    assert pipeline.focus_views(root, pid) is None
+    assert multifocus.variant_ranking(MultiFocus(variants=[FocusReading(label="v1")])) == ["v1"]
+
+
+def test_extra_exposures_are_labelled_in_the_request():
+    """Every extra image is introduced as another view of the same page: an unlabelled second image
+    reads as the next page, and a model that believes that merges two readings into one."""
+    from ocrmd.llm import FocusViews, content_blocks
+    img = np.zeros((20, 20, 3), np.uint8)
+    focus = FocusViews(images=[img, img], note="Attached after the page image: 2 more exposure(s).")
+    blocks = content_blocks(img, "draft", None, focus)
+    assert [b["type"] for b in blocks] == ["image", "text", "image", "text", "image", "text"]
+    assert blocks[1]["text"].startswith("Alternative exposure 1 of the SAME page")
+    assert blocks[3]["text"].startswith("Alternative exposure 2 of the SAME page")
+    assert "2 more exposure(s)" in blocks[-1]["text"] and "Local OCR draft" in blocks[-1]["text"]
+    # unbracketed pages send exactly what they always did
+    assert [b["type"] for b in content_blocks(img, "draft", None, None)] == ["image", "text"]
+
+
+def _unreadable(page):
+    """Present and inked, but too few pixels on the type to read — the real rig's failure mode."""
+    import cv2
+    h, w = page.shape[:2]
+    return cv2.resize(cv2.resize(page, (int(w * 0.08), int(h * 0.08))), (w, h))
+
+
+# --- admission: which captures become pages ------------------------------------------------------
+@needs_ocr
+def test_an_unreadable_capture_is_refused_instead_of_becoming_a_page(root, store):
+    """The complaint this answers: captures that were never going to be legible became pages, and
+    each one cost an LLM call to find that out."""
+    import cv2
+    page = on_desk(text_page())
+    mush = cv2.GaussianBlur(page, (0, 0), 9)          # nothing survives this
+    got = pipeline.ingest_frame(root, store, mush, "book", "webcam:cam", admit=True)
+    assert got.pages == [] and got.duplicate_of is None
+    assert got.rejected and "word(s) legible" in got.rejected[0]
+    assert store.pages("book") == []                  # no page, no page file, no LLM call
+
+    # nothing was deleted: the frame is on disk and the store says why it produced nothing
+    rej = store.rejected_captures("book")
+    assert len(rej) == 1 and rej[0]["document"] == "book"
+    assert (root.raw / f"{rej[0]['sha256']}.jpg").exists()
+
+    # ...and the operator's override works, because file ingest never applies the test
+    again = pipeline.ingest_frame(root, store, mush, "book", "file:forced.jpg")
+    assert len(again.pages) == 1 and not again.rejected
+
+
+@needs_ocr
+def test_a_readable_capture_is_admitted_and_pays_no_extra_ocr(root, store):
+    got = pipeline.ingest_frame(root, store, on_desk(text_page()), "book", "webcam:cam", admit=True)
+    assert len(got.pages) == 1 and not got.rejected
+    pid = got.pages[0]
+    # the admission pass is kept as the page's OCR stage: an admitted crop is read exactly once
+    assert (root.ocr_dir / f"{pid}.json").exists()
+    mtime = (root.ocr_dir / f"{pid}.json").stat().st_mtime
+    pipeline.run_page(root, store, store.page(pid), None, "book")
+    assert (root.ocr_dir / f"{pid}.json").stat().st_mtime == mtime
+
+
+@needs_ocr
+def test_admission_is_off_unless_asked_for(root, store):
+    """`ingest` and forced captures create the page whatever the shutter thinks of it."""
+    import cv2
+    mush = cv2.GaussianBlur(on_desk(text_page()), (0, 0), 9)
+    got = pipeline.ingest_frame(root, store, mush, "book", "webcam:cam")
+    assert len(got.pages) == 1 and not got.rejected
+
+
+@needs_ocr
+def test_half_a_spread_can_be_kept_when_the_other_half_is_not(root, store):
+    """Refusing the whole frame because one page of a spread is unreadable would lose a good page."""
+    import numpy as np
+    good = text_page(["the quick brown fox jumps over the lazy dog"] * 12)
+    gutter = np.full((good.shape[0], 60, 3), 240, np.uint8)
+    spread = on_desk(np.hstack([good, gutter, _unreadable(good)]), margin=120)
+    got = pipeline.ingest_frame(root, store, spread, "book", "webcam:cam", admit=True)
+    assert len(got.pages) == 1 and len(got.rejected) == 1
+    assert store.page(got.pages[0])["part"] == "left"
+
+
+@needs_ocr
+def test_a_partly_refused_spread_is_not_listed_as_needing_a_re_shoot(root, store):
+    """It produced a page. Only captures that came to nothing are the operator's problem."""
+    import numpy as np
+    good = text_page(["the quick brown fox jumps over the lazy dog"] * 12)
+    gutter = np.full((good.shape[0], 60, 3), 240, np.uint8)
+    spread = on_desk(np.hstack([good, gutter, _unreadable(good)]), margin=120)
+    got = pipeline.ingest_frame(root, store, spread, "book", "webcam:cam", admit=True)
+    assert got.pages and got.rejected
+    assert store.rejected_captures("book") == []      # nothing here needs shooting again

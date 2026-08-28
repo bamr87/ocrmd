@@ -1,13 +1,16 @@
 [project]
 name = "ocrmd"
-version = "0.4.0"
+version = "0.8.0"
 description = "Incremental webcam/image scanning to cross-checked Markdown"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
-  # opencv 5.0.0.93's KleidiCV HAL segfaults in cv2.resize on some page crops (arm64 macOS, measured); stay on 4.x
-  "opencv-python>=4.9,<5", "numpy>=1.26", "anthropic>=1.0", "pydantic>=2", "rapidfuzz", "pyyaml", "typer>=0.12",
+  # The KleidiCV HAL segfaults in cv2.resize on some page crops (arm64 macOS, measured). It was first
+  # hit on opencv 5.0.0.93 and pinned out with `<5` — but KleidiCV ships in 4.12+ as well, and 4.14
+  # crashes the same way on the wider crops this pipeline now produces. 4.11.0.86 is the last release
+  # with no KleidiCV at all (`getBuildInformation()` lists the custom HALs); keep below 4.12.
+  "opencv-python>=4.9,<4.12", "numpy>=1.26", "anthropic>=1.0", "pydantic>=2", "rapidfuzz", "pyyaml", "typer>=0.12",
   "python-dotenv", "pillow", "fastapi>=0.110", "uvicorn>=0.27", "python-multipart",
   "pyobjc-framework-Vision; sys_platform == 'darwin'", "pyobjc-framework-AVFoundation; sys_platform == 'darwin'",
 ]
@@ -16,6 +19,10 @@ dependencies = [
 rapidocr = ["rapidocr>=3.0", "onnxruntime>=1.20"]   # PP-OCR on ONNX Runtime: second engine on macOS, the primary elsewhere
 tesseract = ["pytesseract"]     # last-resort engine (needs the tesseract binary); weak on camera images
 pdf = ["pymupdf"]               # `ocrmd ingest file.pdf`
+# `ocrmd etl` needs nothing extra — the operators run on ocrmd's own provider. This installs DocETL
+# itself, for running an exported pipeline (`ocrmd etl --export-docetl out/ && docetl run out/pipeline.yaml`)
+# through their optimizer. It is a large install (litellm, modal, pandas, scikit-learn, ...).
+docetl = ["docetl>=0.3"]
 dev = ["pytest>=8", "ruff>=0.5", "httpx"]   # httpx: FastAPI's TestClient
 
 [project.scripts]

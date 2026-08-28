@@ -12,9 +12,9 @@ import cv2, numpy as np
 from .config import Settings
 from .store import Store
 from .fingerprint import sha256_bytes, dhash, similarity, detail_similarity
-from . import preprocess, ocr, reconcile as rc, render, review
+from . import preprocess, ocr, reconcile as rc, render, review, multifocus, legibility, annotate
 from .reconcile import token_overlap, _content_tokens
-from .llm import Provider, LLMResult, LLMError, PageHint, Transcription
+from .llm import Provider, LLMResult, LLMError, PageHint, Transcription, FocusViews
 
 log = logging.getLogger("ocrmd.pipeline")
 PRE_VER = preprocess.PIPELINE_VERSION
@@ -30,35 +30,103 @@ class PageResult:
     continuity: str | None = None
     illegible_reason: str | None = None
     preserved: list[str] = field(default_factory=list)
+    focus: str | None = None
 
     def detail(self) -> str:
         d = f" agreement={self.agreement:.2f} overlap={self.overlap or 0:.2f}" if self.agreement is not None else ""
+        if self.focus:
+            d += f"  {self.focus}"
         if self.illegible_reason:
             d += f"  ({self.illegible_reason[:50]})"
         return d
 
 
 # --- ingest ------------------------------------------------------------------------------------
-def ingest_frame(s: Settings, st: Store, img: np.ndarray, slug: str, source: str) -> list[str]:
-    """Store raw frame, dedup, preprocess into 1..2 pages, register them. Returns page ids ([] if duplicate)."""
+@dataclass
+class Ingested:
+    """What became of one frame: the pages it produced, and — when it produced none — why not.
+
+    A frame can now come to nothing for two different reasons, and the operator needs to be told
+    which: a duplicate is a page already scanned, a rejection is a page that still needs shooting.
+    """
+    pages: list[str] = field(default_factory=list)
+    duplicate_of: str | None = None
+    rejected: list[str] = field(default_factory=list)     # reasons, one per crop refused as unreadable
+
+
+def ingest_frame(s: Settings, st: Store, img: np.ndarray, slug: str, source: str,
+                 variants: list[np.ndarray] | None = None, admit: bool | None = None) -> Ingested:
+    """Store raw frame, dedup, preprocess into 1..2 pages, register them.
+
+    `variants` are the focus bracket's other exposures of the same frame. They are stored beside the
+    capture as `raw/<sha>.v<n>.jpg` and are as immutable as it is — the page identity, the dedup
+    decision and every downstream stage still come from the primary frame alone; the variants only
+    ever add evidence about text the primary could not resolve.
+
+    `admit` runs the legibility test (`legibility.assess`) over each crop and declines to create a
+    page for one no OCR engine could read. It defaults off, and the *scan* path turns it on for
+    automatic captures: a file the operator handed over, or a frame they forced with the space bar,
+    is a decision, not a guess the shutter made. Nothing is deleted either way — the raw frame stays
+    and the capture row records why it produced no page.
+    """
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     raw = buf.tobytes()
     sha = sha256_bytes(raw)
     ph = dhash(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-    if st.find_capture(sha):
-        return []
-    parts = preprocess.process(img, s.min_page_width)
+    admitting = bool(admit)
+    prior = st.find_capture(sha)
+    if prior is not None:
+        if prior["rejected"] and prior["page_id"] is None and not admitting:
+            # a deliberate re-ingest of a frame the shutter refused: the operator overrules it
+            st.clear_rejection(sha)
+            log.info("re-admitting previously refused capture %s", sha[:8])
+        else:
+            return Ingested(duplicate_of=prior["duplicate_of"] or prior["page_id"])
+    parts = preprocess.process(img, s.min_page_width, probe=s.orientation_probe)
     ocr_results: list[ocr.OcrResult | None] = [None] * len(parts)
     dup = find_duplicate(s, st, img, ph, slug, parts, ocr_results)
     if dup:
-        st.add_capture(sha, ph, None, dup, source)
+        st.add_capture(sha, ph, None, dup, source, document=slug)
         log.info("duplicate capture %s of page %s", sha[:8], dup)
-        return []
+        return Ingested(duplicate_of=dup)
+    rejects = admission(s, parts, ocr_results) if admitting else []
+    if rejects and all(rejects):
+        # nothing on this frame is readable: keep the raw capture, create no page, spend no tokens
+        (s.raw / f"{sha}.jpg").write_bytes(raw)
+        st.ensure_document(slug)
+        st.add_capture(sha, ph, None, None, source, rejected="; ".join(rejects), document=slug)
+        log.info("rejected capture %s: %s", sha[:8], "; ".join(rejects))
+        return Ingested(rejected=list(rejects))
     (s.raw / f"{sha}.jpg").write_bytes(raw)
+    for i, v in enumerate(variants or [], 1):
+        ok_v, vbuf = cv2.imencode(".jpg", v, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if ok_v:
+            (s.raw / f"{sha}.v{i}.jpg").write_bytes(vbuf.tobytes())
     st.ensure_document(slug)
-    ids = derive_pages(s, st, img, slug, sha, ph, parts, ocr_results)
-    st.add_capture(sha, ph, ids[0] if ids else None, None, source)
-    return ids
+    keep = [i for i in range(len(parts)) if not (rejects[i] if rejects else None)]
+    ids = derive_pages(s, st, img, slug, sha, ph, parts, ocr_results, keep=keep)
+    st.add_capture(sha, ph, ids[0] if ids else None, None, source,
+                   rejected="; ".join(r for r in rejects if r) or None, document=slug)
+    return Ingested(pages=ids, rejected=[r for r in rejects if r])
+
+
+def admission(s: Settings, parts, ocr_results) -> list[str]:
+    """Read each crop and judge whether it is worth a page. Returns one reason per crop, "" to admit.
+
+    The OCR pass is not extra work: `derive_pages` keeps the result as the page's OCR stage, so an
+    admitted crop is read exactly once either way. A refused one costs that pass and saves an LLM
+    call — the reason the test lives here rather than after the model has already been paid.
+    """
+    if not ocr.available_engines():
+        return []
+    rec = ocr.recognizer(s)
+    out = []
+    for i, (color, _binar, _meta) in enumerate(parts):
+        if ocr_results[i] is None:
+            ocr_results[i] = rec.run(color)
+        v = legibility.assess(ocr_results[i], s.admit_min_words, s.admit_min_confidence)
+        out.append("" if v.admit else v.reason)
+    return out
 
 
 def text_duplicate(a: str, b: str, threshold: float) -> bool | None:
@@ -112,13 +180,90 @@ def find_duplicate(s: Settings, st: Store, img: np.ndarray, ph: str, slug: str, 
     return None
 
 
+def variant_raws(s: Settings, sha: str) -> list[Path]:
+    """The focus bracket's other exposures of one capture, in bracket order."""
+    return sorted(s.raw.glob(f"{sha}.v*.jpg"), key=lambda f: f.name)
+
+
+def variant_crops(s: Settings, pid: str) -> list[Path]:
+    return sorted(s.processed.glob(f"{pid}.v*.png"), key=lambda f: f.name)
+
+
+def flat_path(s: Settings, pid: str) -> Path:
+    return s.processed / f"{pid}.flat.png"
+
+
+def ensure_flat(s: Settings, pid: str) -> Path | None:
+    """The page's legible rendering (`preprocess.legible`), made on first use and kept beside the crop.
+
+    Derived, not decided: it is a pure function of `<pid>.png`, so it carries no stage version, does not
+    enter the page id, and can be regenerated for a page scanned long before this existed simply by
+    asking for it. Delete the file and the next request rebuilds it.
+    """
+    out = flat_path(s, pid)
+    if out.exists():
+        return out
+    img = cv2.imread(str(s.processed / f"{pid}.png"))
+    if img is None:
+        return None
+    cv2.imwrite(str(out), preprocess.legible(img))
+    return out
+
+
+ASPECT_TOLERANCE = 0.04    # how far a variant crop may differ in shape from the page's own crop
+
+
+def derive_variant_crops(s: Settings, pid: str, primary: np.ndarray, sha: str, part: str | None,
+                         orientation: int | None) -> int:
+    """Crop each raw focus variant the way this page was cropped, and write `processed/<pid>.v<n>.png`.
+
+    The crops are made independently — page detection, spread split and deskew all run again — but
+    with the *page's* orientation forced, and the result is then scaled onto the page crop's exact
+    pixel dimensions so that normalised boxes from the two are directly comparable. A variant whose
+    own detection landed somewhere materially different (a hand at the edge of that one exposure, a
+    shadow that moved the sheet outline) has a different aspect ratio, and is dropped rather than
+    stretched into place: a mis-cropped variant would line its text up against the wrong primary
+    lines, which is worse than having no variant at all.
+    """
+    n = 0
+    h0, w0 = primary.shape[:2]
+    for i, raw in enumerate(variant_raws(s, sha), 1):
+        img = cv2.imread(str(raw))
+        if img is None:
+            continue
+        try:
+            parts = preprocess.process(img, s.min_page_width, orientation=orientation)
+        except Exception as e:                       # a variant is optional; never fail the page for one
+            log.warning("focus variant %s could not be preprocessed (%s); skipped", raw.name, e)
+            continue
+        match = next((p for p in parts if p[2].get("part") == part), None)
+        if match is None:
+            log.debug("focus variant %s has no %s part; skipped", raw.name, part)
+            continue
+        crop = match[0]
+        h, w = crop.shape[:2]
+        if abs(w / max(h, 1) - w0 / max(h0, 1)) / max(w0 / max(h0, 1), 1e-6) > ASPECT_TOLERANCE:
+            log.info("focus variant %s cropped to a different shape (%dx%d vs %dx%d); skipped", raw.name, w, h, w0, h0)
+            continue
+        if (h, w) != (h0, w0):
+            crop = cv2.resize(crop, (w0, h0), interpolation=cv2.INTER_AREA if w > w0 else cv2.INTER_CUBIC)
+        cv2.imwrite(str(s.processed / f"{pid}.v{i}.png"), crop)
+        n += 1
+    return n
+
+
 def derive_pages(s: Settings, st: Store, img: np.ndarray, slug: str, sha: str, ph: str,
-                 parts=None, ocr_results=None) -> list[str]:
+                 parts=None, ocr_results=None, keep: list[int] | None = None) -> list[str]:
     """Preprocess one capture into 1..2 pages. The page id is the hash of the *processed* image,
-    so changing the preprocess pipeline necessarily changes page identity (see `ocrmd reprocess`)."""
+    so changing the preprocess pipeline necessarily changes page identity (see `ocrmd reprocess`).
+
+    `keep` limits which crops become pages — half of a spread can be readable while the other half is
+    not, and refusing the whole frame for that would lose a good page."""
     ids = []
-    parts = parts if parts is not None else preprocess.process(img, s.min_page_width)
+    parts = parts if parts is not None else preprocess.process(img, s.min_page_width, probe=s.orientation_probe)
     for i, (color, binar, meta) in enumerate(parts):
+        if keep is not None and i not in keep:
+            continue
         ok, pbuf = cv2.imencode(".png", color)
         pid = sha256_bytes(pbuf.tobytes())[:16]
         if st.page(pid):
@@ -126,11 +271,15 @@ def derive_pages(s: Settings, st: Store, img: np.ndarray, slug: str, sha: str, p
             continue
         (s.processed / f"{pid}.png").write_bytes(pbuf.tobytes())
         cv2.imwrite(str(s.processed / f"{pid}.bin.png"), binar)
+        cv2.imwrite(str(flat_path(s, pid)), preprocess.legible(color))
         (s.processed / f"{pid}.json").write_text(json.dumps(meta))
         st.add_page(pid, slug, sha, ph, meta.get("part"), meta.get("page_width_px"), meta.get("advice"))
         st.mark_stage(pid, "preprocess", PRE_VER)
+        variants = derive_variant_crops(s, pid, color, sha, meta.get("part"), meta.get("orientation"))
         res = ocr_results[i] if ocr_results else None
-        if res is not None:                                  # OCR already done for dedup: keep it
+        # OCR already done for dedup: keep it — unless this page has focus variants, whose whole
+        # purpose is to be read alongside the primary crop. That has to happen in `run_ocr`.
+        if res is not None and not variants:
             (s.ocr_dir / f"{pid}.json").write_text(res.model_dump_json(indent=1))
             st.mark_stage(pid, "ocr", ocr.recognizer(s).version)
         ids.append(pid)
@@ -140,7 +289,7 @@ def derive_pages(s: Settings, st: Store, img: np.ndarray, slug: str, sha: str, p
 def _drop_page_artifacts(s: Settings, pid: str) -> int:
     n = 0
     for f in (list(s.processed.glob(f"{pid}.*")) + list(s.ocr_dir.glob(f"{pid}.json"))
-              + list(s.llm_dir.glob(f"{pid}.*.json"))):
+              + list(s.ocr_dir.glob(f"{pid}.focus.json")) + list(s.llm_dir.glob(f"{pid}.*.json"))):
         f.unlink(); n += 1
     return n
 
@@ -183,13 +332,15 @@ def run_preprocess(s: Settings, st: Store, page) -> dict:
     raw = s.raw / f"{page['raw_sha256']}.jpg"
     if not raw.exists():
         raise FileNotFoundError(f"raw capture missing for page {pid}: {raw}")
-    parts = preprocess.process(cv2.imread(str(raw)), s.min_page_width)
+    parts = preprocess.process(cv2.imread(str(raw)), s.min_page_width, probe=s.orientation_probe)
     want = page["part"]
     match = next((p for p in parts if p[2].get("part") == want), parts[0])
     color, binar, meta = match
     cv2.imwrite(str(s.processed / f"{pid}.png"), color)
     cv2.imwrite(str(s.processed / f"{pid}.bin.png"), binar)
+    cv2.imwrite(str(flat_path(s, pid)), preprocess.legible(color))
     meta_p.write_text(json.dumps(meta))
+    derive_variant_crops(s, pid, color, page["raw_sha256"], want, meta.get("orientation"))
     st.mark_stage(pid, "preprocess", PRE_VER)
     return meta
 
@@ -208,6 +359,57 @@ def ocr_stale(s: Settings, st: Store, page, version: str | None = None) -> bool:
     return version is not None and not st.stage_done(page["id"], "ocr", version)
 
 
+def focus_path(s: Settings, pid: str) -> Path:
+    return s.ocr_dir / f"{pid}.focus.json"
+
+
+def focus_analysis(s: Settings, pid: str) -> multifocus.MultiFocus | None:
+    """What the focus bracket found for this page, written by the OCR stage. None: no bracket."""
+    f = focus_path(s, pid)
+    if not f.exists():
+        return None
+    try:
+        return multifocus.MultiFocus.model_validate_json(f.read_text())
+    except ValueError as e:                     # an artifact from an older/partial run must not block the page
+        log.warning("focus analysis for %s unreadable (%s); ignored", pid, e)
+        return None
+
+
+def run_multifocus(s: Settings, pid: str, rec: ocr.Recognizer, res: ocr.OcrResult) -> ocr.OcrResult:
+    """Read the page again at each bracketed focus and let the variants answer for what it read badly.
+
+    The variants are read with the *same* recogniser as the page — every configured engine, the same
+    preparation, the same merge — because `resolve` compares their confidences with the page's own,
+    and two numbers produced by different procedures are not comparable.
+
+    Every variant is read, including when the page's own lines are all confident. Skipping those was
+    tried first and is wrong: measured on a page whose top half is out of focus (520 px wide, five
+    blur radii), the two captures that gained the most were both read *confidently* by the primary —
+    it had simply not emitted the unreadable lines at all, and confidence says nothing about a line an
+    engine never produced. Correct words recovered, primary vs bracket: 55 -> 165 and 101 -> 146 on
+    those two; 117 -> 138 and 64 -> 165 on the two that were visibly doubtful; and on the sharp
+    capture, where there was nothing to gain, the bracket changed nothing. The bill is one OCR pass per
+    variant (~1.2 s here with two engines), on the worker thread, for pages the shutter was already
+    unhappy enough about to bracket.
+    """
+    crops = variant_crops(s, pid)
+    if not crops:
+        focus_path(s, pid).unlink(missing_ok=True)
+        return res
+    pairs = []
+    for f in crops:
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        v = rec.run(img)
+        pairs.append((multifocus.FocusReading(label=f.name.split(".")[-2], lines=len(v.blocks),
+                                              mean_confidence=round(v.mean_confidence, 3)), v))
+    res, mf = multifocus.resolve(res, pairs, s.ocr_trust, s.focus_swap_margin)
+    focus_path(s, pid).write_text(mf.model_dump_json(indent=1))
+    log.info("focus %s: %s", pid, mf.summary())
+    return res
+
+
 def run_ocr(s: Settings, st: Store, page) -> ocr.OcrResult:
     """Cached per (page, engine set, OCR version): a new engine or a merge change re-reads the page the
     next time it is processed — local and free, unlike the LLM stage."""
@@ -220,10 +422,27 @@ def run_ocr(s: Settings, st: Store, page) -> ocr.OcrResult:
     if img is None:
         raise FileNotFoundError(f"processed image missing for page {pid}")
     res = rec.run(img)
+    res = run_multifocus(s, pid, rec, res)
     out.write_text(res.model_dump_json(indent=1))
     st.mark_stage(pid, "ocr", rec.version)
     log.debug("ocr %s: %s %.2fs agreement=%s", pid, res.engine, sum(res.timings.values()), res.agreement)
     return res
+
+
+def focus_views(s: Settings, pid: str) -> FocusViews | None:
+    """The extra exposures and the analysis to send with the LLM request, or None when the page needs
+    neither: no bracket, or every region resolved locally. Images cost tokens; regions cost nothing."""
+    mf = focus_analysis(s, pid)
+    if mf is None or not mf.unresolved:
+        return None
+    wanted = multifocus.variant_ranking(mf)[:max(0, s.focus_llm_images)]
+    images, labels = [], []
+    for label in wanted:
+        img = cv2.imread(str(s.processed / f"{pid}.{label}.png"))
+        if img is not None:
+            images.append(img); labels.append(label)
+    note = multifocus.describe(mf, labels)
+    return FocusViews(images=images, note=note) if note else None
 
 
 def page_hint(s: Settings, st: Store, page, slug: str) -> PageHint:
@@ -276,8 +495,11 @@ def run_llm(s: Settings, st: Store, page, provider: Provider, ocr_res: ocr.OcrRe
     if cached is not None:
         return cached
     img = cv2.imread(str(s.processed / f"{pid}.png"))
+    focus = focus_views(s, pid)
+    if focus is not None:
+        log.info("page %s: sending %d focus variant(s) to the model", pid, len(focus.images))
     try:
-        res = provider.transcribe(img, ocr_res.text, hint)
+        res = provider.transcribe(img, ocr_res.text, hint, focus)
     except LLMError as e:  # recorded, page stays unverified
         st.mark_stage(pid, "llm", llm_version(s, provider.model), error=str(e)[:500])
         raise
@@ -371,6 +593,12 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
     }
     result = PageResult(path=render.page_path(doc_dir, page["sequence"]), status="unverified",
                         advice=meta.get("advice"))
+    mf = focus_analysis(s, pid)
+    if mf is not None and mf.variants:
+        fm["ocr"]["focus"] = {"variants": len(mf.variants), "improved": mf.improved, "filled": mf.filled,
+                              "unresolved": len(mf.unresolved), "artifact": f"ocr/{pid}.focus.json"}
+        if mf.useful:
+            result.focus = f"focus: {mf.improved}+{mf.filled} lines, {len(mf.unresolved)} unresolved"
     if llm_res is None:
         body = _ocr_only_markdown(ocr_res)
         status = "unverified"
@@ -439,6 +667,164 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
     return result
 
 
+# --- annotation sync ------------------------------------------------------------------------------
+def identify_page(s: Settings, st: Store, img: np.ndarray, slug: str) -> dict | None:
+    """Which already-scanned page is this a fresh view of? None when it is a page we have not seen.
+
+    The same two-step the deduplicator uses — dHash prefilter, then correlation against the stored raw
+    capture — because it is the same question asked for the opposite purpose: dedup wants to *drop* a
+    re-capture, annotation sync wants to *find* it.
+    """
+    ph = dhash(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    best, best_sim = None, 0.0
+    for cand in st.near_duplicates(ph, slug, s.near_duplicate_distance):
+        raw = s.raw / f"{cand['raw_sha256']}.jpg"
+        other = cv2.imread(str(raw)) if raw.exists() else None
+        if other is None or other.shape[:2] != img.shape[:2]:
+            continue
+        sim = similarity(img, other)
+        if sim > best_sim:
+            best, best_sim = cand, sim
+    if best is None or best_sim < s.annotate_match:
+        return None
+    return st.page(best["id"])
+
+
+def sync_annotations(s: Settings, st: Store, page, frame: np.ndarray, provider=None,
+                     apply: bool = True) -> annotate.Sync:
+    """Diff a fresh view of a scanned page against the stored crop and fold the marks into the page.
+
+    Nothing here re-reads the printed text. The line boxes are already on disk, so an underline or a
+    highlight is resolved by geometry alone and costs nothing; only handwriting reaches a model, and
+    only when there is some.
+    """
+    pid = page["id"]
+    out = annotate.Sync(page_id=pid, sequence=page["sequence"])
+    ref = cv2.imread(str(s.processed / f"{pid}.png"))
+    if ref is None:
+        out.reason = "processed crop missing"; return out
+    parts = preprocess.process(frame, s.min_page_width, probe=s.orientation_probe)
+    want = page["part"]
+    match = next((p for p in parts if p[2].get("part") == want), parts[0] if parts else None)
+    if match is None:
+        out.reason = "no page found in the frame"; return out
+    try:
+        res = run_ocr(s, st, page)                     # cached: this does not re-read anything
+        blocks = [b for b in res.blocks if b.text.strip()]
+    except Exception as e:
+        out.reason = f"no stored OCR for this page ({e})"; return out
+    d = annotate.compare(ref, match[0], blocks)
+    out.diff = d
+    if not d.usable:
+        out.reason = d.reason or "alignment failed"; return out
+    if not d.marks:
+        return out
+    for m in d.needs_llm():
+        if provider is None or not hasattr(provider, "read_handwriting"):
+            continue
+        try:
+            m.text = provider.read_handwriting(annotate.crop_mark(ref, m.bbox))
+            out.llm_calls += 1
+        except LLMError as e:
+            log.warning("handwriting note not read: %s", e)
+    if not apply:
+        out.changes = [m.describe() for m in d.marks]
+        return out
+    path = render.page_path(s.documents / page["document"], page["sequence"])
+    if not path.exists():
+        out.reason = "page file missing"; return out
+    fm, body = render.read_page(path)
+    new_body, changes = annotate.apply_marks(body, d.marks)
+    if changes:
+        # written *without* refreshing the fingerprint, exactly like a browser edit: what someone
+        # wrote on the paper is a human edit and must survive the next `verify`
+        render.write_page(s.documents / page["document"], page["sequence"], fm, new_body)
+        st.set_status(pid, fm.get("verification", {}).get("status", page["status"]), fm.get("page_label"))
+    out.changes = changes
+    return out
+
+
+REGION_PAD = 0.006       # of the page, grown around a hand-drawn selection so nothing is clipped
+MIN_REGION = 0.0004      # a selection this small is a stray click, not a request
+REGION_MAX_SCALE = 6     # a region is a fraction of a page: it can take more enlargement than one
+
+
+@dataclass
+class RegionRead:
+    """What one hand-selected region of a page says."""
+    page_id: str
+    sequence: int
+    bbox: list[float]
+    text: str = ""                      # local OCR, read at region scale
+    confidence: float = 0.0
+    engine: str = ""
+    scale: float = 1.0                  # how much the crop was enlarged before it was read
+    size: tuple[int, int] = (0, 0)      # the crop's own pixels, before enlarging
+    llm: str | None = None              # the model's reading, when one was asked for
+    llm_error: str | None = None
+
+    def describe(self) -> str:
+        out = f"{self.text.strip() or '(nothing read)'}"
+        if self.llm:
+            out += f"\n\nmodel: {self.llm}"
+        return out
+
+
+def region_crop(s: Settings, pid: str, bbox: list[float], flat: bool = False) -> np.ndarray | None:
+    """The page crop inside `bbox` (x, y, w, h as fractions), padded, optionally as the flat rendering."""
+    src = ensure_flat(s, pid) if flat else (s.processed / f"{pid}.png")
+    img = cv2.imread(str(src)) if src is not None else None
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    x, y, bw, bh = bbox
+    x0, y0 = int(max(0.0, x - REGION_PAD) * w), int(max(0.0, y - REGION_PAD) * h)
+    x1, y1 = int(min(1.0, x + bw + REGION_PAD) * w), int(min(1.0, y + bh + REGION_PAD) * h)
+    return img[y0:max(y0 + 1, y1), x0:max(x0 + 1, x1)]
+
+
+def read_region(s: Settings, st: Store, page, bbox: list[float], provider: Provider | None = None,
+                question: str | None = None) -> RegionRead:
+    """Read one region of a page harder than the page itself was read.
+
+    Nothing about the page changes and no stage is marked — the only file this can create is the flat
+    rendering it reads from, which is a cache of the crop. This is a person pointing at a word the
+    pipeline got wrong and asking what it says. Two things make the second look better. The crop is
+    enlarged on its own terms — a region is a fraction of a page, so the same pixel budget buys several
+    times the glyph height, which is exactly what Vision is short of on webcam pages (`ocr.MIN_SIDE`) —
+    and it is read as the flat rendering rather than the raw crop, which is what `preprocess.legible`
+    was measured for.
+
+    The model, when asked, sees the same crop and the OCR draft as a hint, and answers about the region
+    alone. Its answer is returned beside the OCR one rather than replacing it: this path has no second
+    reading to reconcile against, so the operator is the reconciler.
+    """
+    pid = page["id"]
+    x, y, w, h = [float(v) for v in bbox]
+    if w * h < MIN_REGION:
+        raise ValueError(f"selection is too small to read ({w * h:.5f} of the page)")
+    out = RegionRead(page_id=pid, sequence=page["sequence"], bbox=[x, y, w, h])
+    crop = region_crop(s, pid, out.bbox, flat=True)
+    if crop is None:
+        raise FileNotFoundError(f"processed image missing for page {pid}")
+    out.size = (crop.shape[1], crop.shape[0])
+    big = ocr.upscale_for_ocr(crop, s.ocr_min_side, max_scale=REGION_MAX_SCALE)
+    out.scale = round(big.shape[1] / max(1, crop.shape[1]), 2)
+    try:
+        res = ocr.recognizer(s).run(big)
+        out.text, out.confidence, out.engine = res.text, res.mean_confidence, res.engine
+    except RuntimeError as e:                      # no engine installed: the model can still answer
+        log.info("region OCR unavailable (%s)", e)
+    if provider is not None and hasattr(provider, "read_region"):
+        try:
+            # the enlarged crop, not the original: the provider resizes to its own long-side budget
+            # (`llm._jpeg_b64`), so sending the big one is what makes a small selection fill it
+            out.llm = provider.read_region(big, out.text, question)
+        except LLMError as e:
+            out.llm_error = str(e)[:300]
+    return out
+
+
 # --- batches -----------------------------------------------------------------------------------
 def submit_batch(s: Settings, st: Store, pages, provider, slug_of) -> tuple[str | None, list[str]]:
     """Queue the LLM stage for `pages` through the provider's batch API. Returns (batch id, page ids)."""
@@ -448,7 +834,7 @@ def submit_batch(s: Settings, st: Store, pages, provider, slug_of) -> tuple[str 
         run_preprocess(s, st, page)
         ocr_res = run_ocr(s, st, page)
         img = cv2.imread(str(s.processed / f"{pid}.png"))
-        items.append((pid, img, ocr_res.text, page_hint(s, st, page, slug_of(page))))
+        items.append((pid, img, ocr_res.text, page_hint(s, st, page, slug_of(page)), focus_views(s, pid)))
     if not items:
         return None, []
     batch_id = provider.batch_submit(items)
@@ -530,9 +916,9 @@ def delete_pages(s: Settings, st: Store, slug: str, page_ids: list[str], purge_r
     if purge_raw:
         for sha in raws:
             if not st.pages_by_raw(sha) and not st.find_capture(sha):
-                raw = s.raw / f"{sha}.jpg"
-                if raw.exists():
-                    raw.unlink(); out.raws += 1
+                for raw in [s.raw / f"{sha}.jpg", *variant_raws(s, sha)]:
+                    if raw.exists():
+                        raw.unlink(); out.raws += 1
     return out
 
 

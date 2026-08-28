@@ -88,6 +88,29 @@ def set_exposure(mode: str, index: int | None = None, name: str | None = None) -
     return _configure(d, lambda dev: dev.setExposureMode_(_EXPOSURE[mode]))
 
 
+def set_lens_position(pos: float, index: int | None = None, name: str | None = None) -> float | None:
+    """Lock the lens at an explicit position (0.0 = nearest, 1.0 = infinity). Returns the position asked
+    for, or None when the device cannot be driven that way.
+
+    This is the only way to shoot the same scene at several focus distances: `auto` focus is one-shot
+    and lands wherever its own metric says, which is exactly the decision a focus bracket exists to
+    second-guess. The completion handler is not used — the caller waits (`focus_bracket_settle`),
+    because a handler would have to be pumped from a run loop the capture thread does not run.
+    """
+    d = _device(name, index)
+    if d is None or not d.isLockingFocusWithCustomLensPositionSupported():
+        return None
+    pos = max(0.0, min(1.0, float(pos)))
+    if not _configure(d, lambda dev: dev.setFocusModeLockedWithLensPosition_completionHandler_(pos, None)):
+        return None
+    return pos
+
+
+def supports_lens_position(index: int | None = None, name: str | None = None) -> bool:
+    d = _device(name, index)
+    return bool(d is not None and d.isLockingFocusWithCustomLensPositionSupported())
+
+
 def focus_state(index: int | None = None, name: str | None = None) -> dict:
     d = _device(name, index)
     if d is None:

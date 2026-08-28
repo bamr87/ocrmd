@@ -81,7 +81,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .video img { display: block; width: 100%; }
 .video .overlay { position: absolute; left: 0; right: 0; top: 0; display: flex; gap: 10px; align-items: center; padding: 10px 12px; background: linear-gradient(rgba(0,0,0,.55), transparent); pointer-events: none; }
 .gate { font-weight: 800; font-size: 20px; letter-spacing: .06em; padding: 4px 12px; border-radius: 6px; background: rgba(0,0,0,.5); }
-.gate.READY { color: var(--ok); } .gate.moving, .gate.focusing { color: var(--warn); } .gate.hand, .gate.blurry { color: var(--err); } .gate.same { color: var(--muted); }
+.gate.READY { color: var(--ok); } .gate.moving, .gate.focusing, .gate.pagemoved, .gate.settling { color: var(--warn); } .gate.hand, .gate.blurry { color: var(--err); } .gate.same { color: var(--muted); }
 .meters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
 .meter { background: var(--panel-2); border-radius: 6px; padding: 6px 8px; font-size: 12px; }
 .meter .bar { height: 6px; background: var(--bg); border-radius: 3px; margin-top: 4px; overflow: hidden; }
@@ -93,7 +93,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .pxpage.ok { color: var(--ok); } .pxpage.low { color: var(--err); }
 /* page view */
 .imgbox { background: #000; border: 1px solid var(--line); border-radius: 10px; overflow: auto; height: calc(100vh - 210px); position: relative; }
-.imgbox img { display: block; transform-origin: top left; }
+.imgbox img { display: block; width: 100%; transform-origin: top left; }
+.imgwrap { position: relative; display: block; }
+.imgwrap.selectable { cursor: crosshair; touch-action: none; }
+.selrect { position: absolute; border: 1px solid var(--accent); background: rgba(35,166,213,.18); pointer-events: none; }
+.selbar { margin-top: 6px; }
+.readout { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel-2); }
+.readout img { display: block; max-width: 100%; border-radius: 4px; background: #000; margin-bottom: 6px; }
+.readout pre { margin: 2px 0 8px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; white-space: pre-wrap; max-height: 220px; overflow: auto; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
 .tabs button { border: none; background: none; color: var(--muted); border-radius: 6px 6px 0 0; padding: 6px 12px; }
 .tabs button.on { color: var(--text); border-bottom: 2px solid var(--accent); }

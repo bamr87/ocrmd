@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging, os, time
 from pathlib import Path
-import typer, cv2
+import typer, cv2, yaml
 from .config import settings as S, setup_logging
 from .store import Store, DONE_STATUSES
 from . import ocr, pipeline, render, review as review_mod
@@ -62,6 +62,12 @@ def scan(doc: str = typer.Option(..., help="document slug"),
          rotate: int | None = typer.Option(None, help="initial rotation 0/90/180/270 (overrides saved view)"),
          zoom: float | None = typer.Option(None, help="initial digital zoom, e.g. 2.0 (overrides saved view)"),
          focus: str = typer.Option(S.focus, help="continuous | locked | settle (lock after the first capture) | off"),
+         admit: bool = typer.Option(S.admit_captures, "--admit/--no-admit",
+                                    help="refuse automatic captures no OCR engine can read, instead of making "
+                                         "a page of them (forced captures are always kept)"),
+         focus_bracket: str = typer.Option(S.focus_bracket, "--focus-bracket",
+                                           help="shoot each page at several lens positions: auto (only when the frame "
+                                                "is not the sharpest the scene has shown) | always | off"),
          resolution: str | None = typer.Option(None, help="WxH, e.g. 1280x960; default is the largest mode"),
          title: str | None = typer.Option(None, help="document title (stored in document.yaml)"),
          tag: list[str] = typer.Option([], "--tag", help="tag for document.yaml; repeatable"),
@@ -70,20 +76,256 @@ def scan(doc: str = typer.Option(..., help="document slug"),
          max_pages: int | None = typer.Option(None, help="stop after this many captures")):
     """Auto-capture pages from the webcam and process them incrementally.
 
-    The shutter fires when the scene is still, the lens has settled, no hand is over the page, the page
-    is new and it is sharp. Preview keys: r rotate, +/- zoom, wasd/arrows pan, f/F focus, 0 reset,
-    space force capture, q quit. The view is saved per camera.
+    The shutter fires when the *scene* has settled — still, focused, unobstructed, and with the page
+    outline holding its position — and the page is new and sharp. After a hand or a moved page it
+    waits longer, so a page turn is not captured halfway through. A capture no OCR engine can read is
+    refused rather than made into a page (--no-admit keeps the old behaviour; `ocrmd status` lists
+    what was refused). A soft capture is then re-shot at several lens positions (--focus-bracket)
+    and the extra exposures travel with the page, so text no single focus resolves is re-read from
+    another one instead of guessed at. Preview keys: r rotate, +/- zoom, wasd/arrows pan, f/F focus,
+    0 reset, space force capture, q quit. The view is saved per camera.
     """
+    if focus_bracket not in ("auto", "always", "off"):
+        _fail("--focus-bracket must be auto | always | off")
     st = _store()
     prov = _provider(no_llm, provider, model)
     res = tuple(int(x) for x in resolution.lower().split("x")) if resolution else S.resolution
+    S.admit_captures = admit
     opts = ScanOptions(doc=doc, camera=camera, focus=focus, resolution=res, rotate=rotate, zoom=zoom,
-                       duration=duration, max_pages=max_pages, title=title, tags=list(tag), project=project)
+                       duration=duration, max_pages=max_pages, bracket=focus_bracket, title=title,
+                       tags=list(tag), project=project)
     typer.echo("space=force capture, q=quit")
     session = ScanSession(S, st, opts, prov, preview=preview, emit=emit)
     session.run()                                   # in this thread: the preview window needs the main thread
     if session.error:
         raise typer.Exit(1)
+
+
+@app.command()
+def annotate(doc: str = typer.Option(..., help="document slug"),
+             camera: str = typer.Option(str(S.camera_index), help="index or device-name substring"),
+             no_llm: bool = typer.Option(False, "--no-llm", help="skip handwriting; marks still sync free"),
+             provider: str = S.provider, model: str = S.model,
+             dry_run: bool = typer.Option(False, "--dry-run", help="report what would change, write nothing"),
+             preview: bool = True, duration: float | None = typer.Option(None),
+             max_pages: int | None = typer.Option(None, help="stop after this many looks")):
+    """Watch already-scanned pages and fold what you write on the paper into the Markdown.
+
+    Hold a scanned page under the camera and underline, highlight, strike through or write a margin
+    note. The page is recognised, the new marks are diffed against the stored crop, and the page file
+    is updated. Underlines and highlights cost nothing — the word positions are already on disk — so
+    only handwriting reaches the model, and only when there is some.
+    """
+    from .capture import CameraLost, auto_shutter, camera_name, resolve_camera
+    st = _store()
+    prov = _provider(no_llm, provider, model)
+    try:
+        S.camera_index = resolve_camera(camera)
+    except RuntimeError as e:
+        _fail(str(e))
+    name = camera_name(S.camera_index)
+    typer.echo(f"watching {doc} on camera {S.camera_index} ({name}) — underline, highlight or write on "
+               "the page; q to quit")
+    seen: dict[str, int] = {}
+    try:
+        for fr in auto_shutter(S, preview=preview, on_status=lambda m: emit(m, "info"),
+                               duration=duration, max_captures=max_pages, require_new=False):
+            page = pipeline.identify_page(S, st, fr.image, doc)
+            if page is None:
+                emit("that page has not been scanned into this document yet", "warn")
+                continue
+            r = pipeline.sync_annotations(S, st, page, fr.image, prov, apply=not dry_run)
+            level = "ok" if r.changes else ("warn" if r.reason else "info")
+            emit(r.describe() + (f"  [{r.llm_calls} llm call(s)]" if r.llm_calls else ""), level)
+            if r.changes:
+                seen[r.page_id] = seen.get(r.page_id, 0) + len(r.changes)
+    except KeyboardInterrupt:
+        typer.echo("\nstopped")
+    except (CameraLost, RuntimeError) as e:
+        _fail(str(e))
+    if seen:
+        render.build_document(S.documents / doc, doc)
+    typer.echo(f"{sum(seen.values())} change(s) across {len(seen)} page(s)"
+               + ("  (dry run: nothing written)" if dry_run else ""))
+
+
+@app.command()
+def etl(doc: str = typer.Option(..., help="document slug"),
+        pipeline_file: Path = typer.Option(..., "--pipeline", "-p", help="the pipeline spec (YAML)"),
+        out: Path | None = typer.Option(None, help="write here instead of documents/<doc>/extracted/"),
+        limit: int | None = typer.Option(None, help="only the first N pages (try a pipeline cheaply)"),
+        status: list[str] = typer.Option([], help="only pages with this status; repeatable"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="show the prompts and the call count, spend nothing"),
+        no_cache: bool = typer.Option(False, "--no-cache", help="ignore cached answers and ask again"),
+        export_docetl: Path | None = typer.Option(None, help="write a DocETL pipeline + dataset here instead of running"),
+        no_llm: bool = typer.Option(False, "--no-llm", help="run only the operators that cost nothing"),
+        provider: str = S.provider, model: str = S.model):
+    """Extract structured data from a scanned document with a declarative pipeline.
+
+    map / filter / extract / reduce / resolve / split / unnest / sample over the document's pages, each
+    an LLM prompt and an output schema (DocETL's operator model — see ocrmd/etl.py). Every output row
+    carries the page it came from, and every operator's answers are cached and versioned by its prompt,
+    so changing one operator re-runs one operator.
+    """
+    from . import etl as etl_mod
+    st = _store()
+    try:
+        pipe = etl_mod.Pipeline.load(pipeline_file)
+    except (ValueError, KeyError, yaml.YAMLError) as e:
+        _fail(f"{pipeline_file}: {e}")
+    rows = etl_mod.page_rows(S, st, doc, list(status) or pipe.status or None, limit)
+    if not rows:
+        _fail(f"{doc} has no pages with text to work on (has it been verified and built?)")
+    typer.echo(f"{pipe.name}: {len(rows)} page(s) -> {' -> '.join(pipe.steps)}")
+    if export_docetl:
+        prov_model = S.xai_model if provider == "xai" else model
+        etl_mod.export_docetl(pipe, rows, export_docetl, prov_model)
+        try:
+            import docetl                                       # noqa: F401
+            typer.echo(f"wrote {export_docetl}/pipeline.yaml and pages.json — run it with "
+                       f"`docetl run {export_docetl}/pipeline.yaml`")
+        except ImportError:
+            typer.echo(f"wrote {export_docetl}/pipeline.yaml and pages.json — `pip install 'ocrmd[docetl]'`, "
+                       f"then `docetl run {export_docetl}/pipeline.yaml`")
+        return
+    prov = _provider(no_llm or dry_run, provider, model)
+    if prov is None and pipe.llm_steps and not dry_run and not no_llm:
+        _fail(f"no credentials for {provider}; {len(pipe.llm_steps)} operator(s) need a model")
+    runner = etl_mod.Runner(S, st, doc, prov, use_cache=not no_cache, dry_run=dry_run)
+    try:
+        result = runner.run(pipe, rows)
+    except (ValueError, KeyError) as e:
+        _fail(str(e))
+    if dry_run:
+        for name, prompt in runner.prompts[:3]:
+            typer.echo(f"\n--- {name} ---\n{prompt[:1200]}")
+        typer.echo(f"\n{len(runner.prompts)} call(s) would be made ({runner.stats.cached} already cached); "
+                   "nothing was sent")
+        return
+    path, kind, fields = etl_mod.output_path(S, doc, pipe, out)
+    etl_mod.write(result, path, kind, fields)
+    emit(f"{len(result)} row(s) -> {path}  [{runner.stats.describe()}]",
+         "warn" if runner.stats.errors else "ok")
+    for err in runner.stats.errors[:5]:
+        emit(err, "error")
+
+
+@app.command()
+def read(doc: str = typer.Option(..., help="document slug"),
+         page: int = typer.Option(..., help="page sequence"),
+         region: str = typer.Option("0,0,1,1", help="x,y,w,h as fractions of the page (0-1)"),
+         llm: bool = typer.Option(False, "--llm", help="also ask the model about this region (costs tokens)"),
+         ask: str | None = typer.Option(None, help="what to ask about the region, instead of 'transcribe it'"),
+         save: Path | None = typer.Option(None, help="write the enlarged crop here, as it was read"),
+         provider: str = S.provider, model: str = S.model):
+    """Read one region of a page harder than the page itself was read.
+
+    The same thing the web UI does when you drag a box on a page image: the rectangle is cut out of the
+    flat rendering, enlarged on its own terms and re-read. Nothing is stored — this answers "what does
+    that word say", and the answer goes to you, not into the page file.
+    """
+    st = _store()
+    row = st.page_by_sequence(doc, page)
+    if row is None:
+        _fail(f"{doc} has no page {page}")
+    try:
+        bbox = [float(v) for v in region.split(",")]
+        if len(bbox) != 4:
+            raise ValueError
+    except ValueError:
+        _fail(f"--region wants four numbers 'x,y,w,h' as fractions of the page, not {region!r}")
+    prov = _provider(not llm, provider, model) if llm else None
+    if llm and prov is None:
+        _fail(f"no credentials for {provider}; nothing was sent to a model")
+    try:
+        out = pipeline.read_region(S, st, row, bbox, prov, ask)
+    except (ValueError, FileNotFoundError) as e:
+        _fail(str(e))
+    if save:
+        import cv2
+        from .ocr import upscale_for_ocr
+        crop = pipeline.region_crop(S, row["id"], out.bbox, flat=True)
+        cv2.imwrite(str(save), upscale_for_ocr(crop, S.ocr_min_side, max_scale=pipeline.REGION_MAX_SCALE))
+        typer.echo(f"crop written to {save}")
+    typer.echo(f"{out.size[0]}x{out.size[1]}px enlarged {out.scale}x · {out.engine or 'no OCR engine'}"
+               + (f" conf {out.confidence:.2f}" if out.text else ""))
+    typer.echo(out.describe())
+    if out.llm_error:
+        emit(out.llm_error, "error")
+
+
+@app.command()
+def reconstruct(doc: str = typer.Option(..., help="document slug"),
+                page: int | None = typer.Option(None, help="one page sequence; default every page"),
+                out: Path = typer.Option(Path("reconstructed"), help="directory for the .svg/.tex/.png"),
+                pdf: bool = typer.Option(False, "--pdf", help="also compile the LaTeX (needs a TeX engine)"),
+                review: bool = typer.Option(False, "--review", help="ask the model what the rebuild lost (costs tokens)"),
+                provider: str = S.provider, model: str = S.model):
+    """Rebuild pages from their Markdown as SVG + LaTeX, and score them against the original crop.
+
+    The round trip is the check: anything the transcription lost — a heading flattened, a table turned
+    to prose, a figure nobody mentioned — shows up as a difference between the rebuilt page and the
+    photograph it came from. `fidelity` is that difference as one number, 0 to 1.
+    """
+    from . import layout as layout_mod, reconstruct as rc_mod
+    from .ocr import OcrResult
+    st = _store()
+    pages = [p for p in st.pages(doc) if page is None or p["sequence"] == page]
+    if not pages:
+        _fail(f"no pages in {doc}" + (f" at sequence {page}" if page else ""))
+    if not rc_mod.backends():
+        typer.secho("no SVG rasteriser found (inkscape, rsvg-convert or Chrome) — writing files, "
+                    "but fidelity cannot be scored", fg="yellow")
+    out.mkdir(parents=True, exist_ok=True)
+    prov = _provider(not review, provider, model) if review else None
+    scores = []
+    for p in pages:
+        pid = p["id"]
+        img = cv2.imread(str(S.processed / f"{pid}.png"))
+        ocr_path = S.ocr_dir / f"{pid}.json"
+        md_path = render.page_path(S.documents / doc, p["sequence"])
+        if img is None or not ocr_path.exists() or not md_path.exists():
+            typer.secho(f"  {p['sequence']:04d}: missing artifacts, skipped", fg="yellow"); continue
+        res = OcrResult.model_validate_json(ocr_path.read_text())
+        fm, body = render.read_page(md_path)
+        lay = layout_mod.build(res, body, (img.shape[1], img.shape[0]))
+        lay.figures = layout_mod.figures(img, res.blocks)
+        r = rc_mod.rebuild(img, lay, title=(fm.get("context") or {}).get("chapter"))
+        stem = out / f"{p['sequence']:04d}"
+        stem.with_suffix(".svg").write_text(r.svg, encoding="utf-8")
+        stem.with_suffix(".tex").write_text(r.latex, encoding="utf-8")
+        if r.png is not None:
+            cv2.imwrite(str(stem.with_suffix(".png")), r.png)
+        if pdf:
+            made = rc_mod.compile_pdf(r.latex, stem.with_suffix(".pdf"))
+            if made is None:
+                typer.secho("    no TeX engine; .tex written but not compiled", fg="yellow")
+        if r.fidelity is not None:
+            scores.append(r.fidelity)
+        colour = ("green" if (r.fidelity or 0) >= 0.8 else "yellow" if (r.fidelity or 0) >= 0.6 else "red")
+        typer.secho(f"  {p['sequence']:04d}: {r.describe()}", fg=colour if r.fidelity is not None else None)
+        if review and prov is not None and r.png is not None:
+            _review_rebuild(prov, img, r.png, p["sequence"])
+    if scores:
+        typer.echo(f"{len(scores)} page(s) rebuilt into {out}; mean fidelity "
+                   f"{sum(scores) / len(scores):.2f}")
+
+
+def _review_rebuild(prov, original, rebuilt, seq: int) -> None:
+    """Ask the model what the rebuild lost. A pixel score says *how much* differs, not *what*."""
+    from .llm import FocusViews
+    note = ("The first image is a photograph of a book page. The second is a reconstruction of it "
+            "built from the transcription this tool produced. List, briefly, what the reconstruction "
+            "got WRONG about the page — text that is missing, headings flattened into body text, "
+            "tables turned into prose, figures absent. Do not list styling or font differences; only "
+            "content and structure. If it is faithful, say so in one line.")
+    try:
+        res = prov.transcribe(original, "", None, FocusViews(images=[rebuilt], note=note))
+        msg = (res.transcription.notes or res.transcription.markdown or "").strip()
+        if msg:
+            typer.secho(f"      review: {msg[:300]}", fg="magenta")
+    except Exception as e:
+        typer.secho(f"      review unavailable: {e}", fg="yellow")
 
 
 def _pdf_images(path: Path, dpi: int = 200):
@@ -116,7 +358,7 @@ def _ingest_file(st, f: Path, doc: str, prov, refresh: bool = False) -> None:
     for name, img in sources:
         if img is None:
             typer.secho(f"  unreadable: {name}", fg="red"); continue
-        pids = pipeline.ingest_frame(S, st, img, doc, f"file:{name}")
+        pids = pipeline.ingest_frame(S, st, img, doc, f"file:{name}").pages
         if not pids:
             typer.secho(f"  duplicate: {name}", fg="yellow"); continue
         typer.echo(f"{name} -> {len(pids)} page(s)")
@@ -366,6 +608,15 @@ def status(doc: str | None = None, all_pages: bool = typer.Option(False, "--all"
         dups = st.duplicates(slug)
         if dups:
             typer.echo(f"  {len(dups)} duplicate capture(s) were skipped")
+        rejected = st.rejected_captures(slug)
+        if rejected:
+            typer.secho(f"  {len(rejected)} capture(s) refused as unreadable — the frames are kept, "
+                        "no pages were made:", fg="yellow")
+            for r in rejected[:10]:
+                typer.echo(f"    raw/{r['sha256'][:12]}…jpg  {r['captured_at'][11:19]}  {r['rejected'][:60]}")
+            if len(rejected) > 10:
+                typer.echo(f"    ... and {len(rejected) - 10} more")
+            typer.echo(f"    force one in with: ocrmd ingest raw/<sha>.jpg --doc {slug}")
 
 
 @app.command()
@@ -478,7 +729,7 @@ def doctor(costs: bool = False):
     typer.echo(f"root:        {rep['root']}")
     c = rep["config"]
     typer.echo(f"config:      model={c['model']} provider={c['provider']} prompt={c['prompt_version']} focus={c['focus']} "
-               f"llm_workers={c['llm_workers']} log={c['log'] or 'off'}")
+               f"bracket={c['focus_bracket']} llm_workers={c['llm_workers']} log={c['log'] or 'off'}")
     typer.echo(f"ocr:         {rep['ocr_engine'] or 'NONE (macOS: pyobjc-framework-Vision; elsewhere pip install ocrmd[rapidocr])'}"
                f"   installed: {', '.join(rep['ocr_engines_installed']) or 'none'}")
     typer.echo(f"anthropic:   {'credentials found' if rep['credentials']['anthropic'] else 'no credentials (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in .env)'}")
@@ -488,7 +739,8 @@ def doctor(costs: bool = False):
     for cam in rep["cameras"]:
         typer.echo(f"camera {cam['index']}:    {cam['name']}")
         if cam.get("format"):
-            typer.echo(f"             ocrmd will use {cam['format'][0]}x{cam['format'][1]}; focus modes: {', '.join(cam['focus_modes']) or 'none (fixed focus)'}")
+            typer.echo(f"             ocrmd will use {cam['format'][0]}x{cam['format'][1]}; focus modes: {', '.join(cam['focus_modes']) or 'none (fixed focus)'}"
+                       + ("; focus bracket available" if cam.get("lens_position") else "; no custom lens position (focus bracket unavailable)"))
             line = f"             now: focus={cam['focus']} exposure={cam['exposure']}"
             if cam.get("warning"):
                 typer.secho(line + f"  <- {cam['warning']}", fg="yellow")

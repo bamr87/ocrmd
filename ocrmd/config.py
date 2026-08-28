@@ -36,7 +36,13 @@ class Settings(BaseModel):
     camera_index: int = 0
     analysis_width: int = 320
     motion_threshold: float = 4.0     # mean abs diff (0-255) below which frame is "still"; C525 sensor noise ~2.7
-    stable_frames: int = 8            # consecutive still frames before capture
+    stable_frames: int = 8            # undisturbed frames before capture, after ordinary noise
+    # ...and after the scene was *handled* — a hand, or the page outline moving. A page turn has to
+    # prove it has finished: the old gate fired during flips because every per-frame test can be true
+    # halfway through one (see scene.py).
+    settle_frames: int = 20
+    geometry_frames: int = 3          # page-outline detections that must agree before the page counts as still
+    geometry_tolerance: float = 0.03  # how far it may move between them, as a fraction of the frame
     novelty_threshold: int = 12       # dHash hamming distance vs last capture
     blur_threshold: float = 60.0      # absolute floor for page sharpness (Laplacian variance)
     sharp_ratio: float = 0.55         # ...and at least this fraction of the best this scene has shown
@@ -49,8 +55,25 @@ class Settings(BaseModel):
     occlusion_cover: float = 0.05
     occlusion_rebaseline: int = 30
     burst_frames: int = 3                       # frames read at the shutter; the sharpest is kept (1 = off)
+    # focus bracket: shoot the same still page at several lens positions and keep the extra frames as
+    # variants, so a region the sharpest frame cannot resolve can be re-read from a different focus.
+    # Needs a camera that supports locking focus at a custom lens position (`ocrmd doctor` reports it).
+    focus_bracket: str = "auto"        # auto (bracket only when the frame is not the scene's best) | always | off
+    focus_bracket_shots: int = 3       # lens positions in the bracket, including the one the lens is at
+    focus_bracket_step: float = 0.05   # lens-position offset between shots, on AVFoundation's 0-1 scale
+    focus_bracket_settle: float = 0.25  # seconds to let the lens travel before the frame is read
+    focus_bracket_ratio: float = 0.9   # auto: bracket when sharpness is below this share of the scene's best
+    focus_keep: int = 2                # variant images kept per capture (0 = capture the bracket, keep none)
     capture_cooldown: float = 1.0               # seconds between auto captures
     camera_reopen_after: int = 40               # consecutive failed reads before the camera is reopened
+
+    # --- admission (should a capture become a page at all?) ---------------------------------
+    # Judged on what local OCR made of the crop, because image-quality signals measurably do not
+    # separate legible from illegible pages (see legibility.py). Rejection keeps the raw frame and
+    # creates nothing; it never applies to file ingest or to a forced (space-bar) capture.
+    admit_captures: bool = True       # false: every auto capture becomes a page, as before 0.6
+    admit_min_words: int = 60         # rejects 21 of the 120 scored pages, 20 of them truly illegible
+    admit_min_confidence: float = 0.5
 
     # --- dedup ------------------------------------------------------------------------------
     near_duplicate_distance: int = 10       # dHash prefilter (bits), within the same document only...
@@ -58,14 +81,26 @@ class Settings(BaseModel):
     near_duplicate_text: float = 0.85         # ...and by OCR token overlap, so two near-blank pages stay distinct...
     near_duplicate_detail: float = 0.5        # ...falling back to high-pass image correlation when there is no OCR text
 
+    # --- annotation sync (camera on already-scanned pages) ----------------------------------
+    annotate_match: float = 0.985   # correlation against a stored capture before it counts as the same page
+
     # --- preprocess -------------------------------------------------------------------------
     min_page_width: int = 900         # px across one page below which body text is unreliable
+    # Decide which way up a page is by asking OCR at all four rotations. It is the only test that
+    # works — every cheaper one measures at or near chance on real captures (see
+    # preprocess.orientation_probe) — but it is OFF by default because on this machine the extra
+    # Apple Vision traffic reliably segfaults the process inside RapidOCR's ONNX detector. That is a
+    # third-party interaction, not an ocrmd bug: the same run with `ocr_engines = ["apple_vision"]`
+    # is clean. Turn it on if you do not use rapidocr, or if your platform does not show the crash.
+    orientation_probe: bool = False
 
     # --- ocr --------------------------------------------------------------------------------
     ocr_engines: list[str] = []       # [] = auto: the best installed engine (+ a second one when ocr_ensemble)
     ocr_ensemble: bool = True         # run two engines when installed and vote (see ocr.merge)
     ocr_languages: list[str] = ["en-US"]   # Vision recognition languages; [] = automatic
     ocr_min_side: int = 1400          # crops are upscaled (<=3x) until the short side reaches this
+    focus_swap_margin: float = 0.10   # a variant focus must beat the primary's line confidence by this to replace it
+    focus_llm_images: int = 2         # variant images attached to the LLM request when regions stay unresolved
 
     # --- reconcile --------------------------------------------------------------------------
     flag_threshold: float = 0.95
@@ -77,7 +112,7 @@ class Settings(BaseModel):
     provider: str = "anthropic"
     model: str = "claude-opus-5"
     xai_model: str = "grok-4"
-    prompt_version: str = "transcribe@3"
+    prompt_version: str = "transcribe@4"
     llm_workers: int = 2              # concurrent LLM calls during a scan (OCR stays serial)
     llm_timeout: float = 180.0        # seconds per request
     llm_max_retries: int = 3          # SDK-level retries on 429/5xx/connection errors
@@ -111,6 +146,13 @@ class Settings(BaseModel):
     def _check_focus(cls, v: str) -> str:
         if v not in ("continuous", "locked", "settle", "off"):
             raise ValueError("focus must be continuous | locked | settle | off")
+        return v
+
+    @field_validator("focus_bracket")
+    @classmethod
+    def _check_bracket(cls, v: str) -> str:
+        if v not in ("auto", "always", "off"):
+            raise ValueError("focus_bracket must be auto | always | off")
         return v
 
     @property

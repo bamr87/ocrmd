@@ -17,7 +17,7 @@ import cv2
 
 from .config import Settings
 from .store import Store
-from . import pipeline, render
+from . import legibility, pipeline, render
 from .hud import ScanState
 from .llm import LLMUnavailable, LLMError
 
@@ -133,6 +133,7 @@ class ScanOptions:
     zoom: float | None = None
     duration: float | None = None
     max_pages: int | None = None
+    bracket: str | None = None            # focus bracket: auto | always | off (None: the configured default)
     title: str | None = None
     tags: list[str] = field(default_factory=list)
     project: str | None = None
@@ -219,12 +220,15 @@ class ScanSession:
         except RuntimeError as e:
             self.error = str(e); self.emit(str(e), "error"); self.ended_at = time.time()
             return
+        if o.bracket is not None:
+            s.focus_bracket = o.bracket
         view = load_view(s.root, self.camera_name)
         if o.rotate is not None: view.rotation = o.rotate % 360
         if o.zoom is not None: view.zoom = max(1.0, o.zoom)
         st.ensure_document(o.doc)
         render.ensure_document_meta(s.documents / o.doc, o.doc, title=o.title, tags=o.tags, project=o.project)
         prov, state, health = self.provider, self.state, self.health
+        rejected: list[str] = []
         self.emit(f"scanning into {s.documents / o.doc}  (camera {self.camera_index}: {self.camera_name})"
                   + (f"; llm={prov.name}/{prov.model} x{s.llm_workers}" if prov else "; OCR only"), "info")
 
@@ -257,13 +261,23 @@ class ScanSession:
                     if fr is None:
                         return
                     state.set_active("capture", "preprocess")
-                    pids = pipeline.ingest_frame(s, st, fr.image, o.doc, f"webcam:{self.camera_name}")
+                    # `admit` only for automatic captures: a frame the operator forced with the space
+                    # bar is a decision, and the shutter's opinion of it is not the deciding one.
+                    got = pipeline.ingest_frame(s, st, fr.image, o.doc, f"webcam:{self.camera_name}",
+                                                [v.image for v in fr.variants],
+                                                admit=s.admit_captures and fr.reason == "auto")
                     state.set_active("capture", None)
-                    if not pids:
+                    for why in got.rejected:
+                        rejected.append(why)
+                        self.emit(f"capture refused: {why} — no page made, the frame is kept; re-shoot it", "warn")
+                        state.note("refused", "illegible")
+                    if got.duplicate_of:
                         self.emit("duplicate page, skipped", "warn")
                         state.note("dup", "blank")
                         continue
-                    for pid in pids:
+                    if not got.pages:
+                        continue
+                    for pid in got.pages:
                         process_page(s, st, pid, None, o.doc, state=state, emit=self.emit)      # OCR-only, right now
                         if pool is not None and not health.degraded:
                             futures.append(pool.submit(llm_job, pid))                            # LLM upgrade later
@@ -291,7 +305,9 @@ class ScanSession:
                                    resolution=o.resolution, focus=o.focus, state=state, duration=o.duration,
                                    max_captures=o.max_pages, on_frame=None if self.preview else on_frame,
                                    commands=self.commands):
-                self.emit(f"captured ({fr.reason}; sharpness {fr.meta.get('sharpness')}, {fr.meta.get('page_px')}px/page)", "ok")
+                bracket = f", {len(fr.variants)} focus variant(s)" if fr.variants else ""
+                self.emit(f"captured ({fr.reason}; sharpness {fr.meta.get('sharpness')}, "
+                          f"{fr.meta.get('page_px')}px/page{bracket})", "ok")
                 work.put(fr)
                 state.queued = pending()
         except KeyboardInterrupt:
@@ -313,6 +329,8 @@ class ScanSession:
                 if pool is not None:
                     pool.shutdown(wait=False, cancel_futures=True)
             render.build_document(s.documents / o.doc, o.doc)
+            if rejected:
+                self.emit(legibility.advice(rejected), "advice")
             summary(st, o.doc, self.emit)
             self.ended_at = time.time()
             with self._frame_cond:

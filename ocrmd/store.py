@@ -47,6 +47,9 @@ COLUMNS: dict[str, dict[str, str]] = {
         "reviewed_at": "TEXT",
     },
     "documents": {"title": "TEXT"},
+    # A rejected capture has no page, so without its own `document` column there is nothing tying it
+    # to the scan it came from — `source` records the camera, not the book.
+    "captures": {"rejected": "TEXT", "document": "TEXT"},
 }
 
 STATUSES = ("verified", "flagged", "suspect", "illegible", "blank", "unverified", "reviewed", "error")
@@ -129,10 +132,36 @@ class Store:
         return [r for d, r in sorted(rows, key=lambda x: x[0]) if d <= max_dist]
 
     @_locked
-    def add_capture(self, sha256, phash, page_id, duplicate_of, source) -> None:
-        self.db.execute("INSERT OR IGNORE INTO captures VALUES(?,?,?,?,?,?)",
-                        (sha256, phash, page_id, duplicate_of, now(), source))
+    def add_capture(self, sha256, phash, page_id, duplicate_of, source, rejected: str | None = None,
+                    document: str | None = None) -> None:
+        # Named columns, not positional: `captures` gains columns by migration, and `VALUES(?,?,?...)`
+        # silently binds to the wrong ones the first time it does.
+        self.db.execute("INSERT OR IGNORE INTO captures(sha256, phash, page_id, duplicate_of, captured_at, "
+                        "source, rejected, document) VALUES(?,?,?,?,?,?,?,?)",
+                        (sha256, phash, page_id, duplicate_of, now(), source, rejected, document))
         self.db.commit()
+
+    @_locked
+    def clear_rejection(self, sha256: str) -> None:
+        """Forget that a frame was refused, so a deliberate re-ingest of it can make a page. Without
+        this the refusal row itself reads as an exact duplicate and the override silently does nothing."""
+        self.db.execute("DELETE FROM captures WHERE sha256=? AND rejected IS NOT NULL AND page_id IS NULL",
+                        (sha256,))
+        self.db.commit()
+
+    @_locked
+    def rejected_captures(self, slug: str | None = None) -> list[sqlite3.Row]:
+        """Frames refused as unreadable: kept on disk, never made into pages.
+
+        `page_id IS NULL` matters — half of a spread can be refused while the other half becomes a
+        page, and that capture is not one the operator has to re-shoot.
+        """
+        q = ("SELECT sha256, captured_at, source, rejected, document FROM captures "
+             "WHERE rejected IS NOT NULL AND page_id IS NULL")
+        args: tuple = ()
+        if slug:
+            q, args = q + " AND document=?", (slug,)
+        return self.db.execute(q + " ORDER BY captured_at", args).fetchall()
 
     @_locked
     def capture_source(self, sha256: str) -> str | None:

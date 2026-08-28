@@ -115,4 +115,5 @@ def test_invalid_config_is_a_clear_error(tmp_path: Path):
 
 def test_defaults_are_sane():
     s = Settings()
-    assert s.prompt_version == "transcribe@3" and s.llm_failure_limit >= 1 and s.occlusion_cover < 0.2
+    assert s.prompt_version == "transcribe@4" and s.llm_failure_limit >= 1 and s.occlusion_cover < 0.2
+    assert s.focus_bracket in ("auto", "always", "off") and s.focus_bracket_shots >= 2

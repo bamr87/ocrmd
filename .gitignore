@@ -11,6 +11,8 @@ processed/
 ocr/
 llm/
 documents/
+etl/
+reconstructed/
 ocrmd.db
 
 # 0.2 runtime files
