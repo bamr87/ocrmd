@@ -127,11 +127,13 @@ turns green (≥900 px across one page). A C525 framing a whole two-page spread 
 2. **Dark, matte surface** under the book. Page detection keys on paper being brighter than what
    surrounds it. A pale wooden desk works but a black mat works better.
 3. **Even light from the side**, no lamp in the frame. Glare and a bright-lit hand both look like paper.
-4. **Run with `--focus settle`** (or `focus = "settle"` in `ocrmd.toml`): continuous autofocus until
+4. **Watch the focus line in the HUD.** ocrmd judges focus from the picture, not from the camera:
+webcams routinely report `continuous` while the lens sits somewhere useless (measured on the C525 this was built on: the same book at sharpness 18 and then 1030 minutes apart, with the driver claiming continuous autofocus throughout). It remembers what your rig has actually managed, warns when a page is far below that, and refocuses the camera itself. If it says it has given up, the lens is not the problem — check the distance, the light, and whether something is between the camera and the page.
+5. **Run with `--focus settle`** (or `focus = "settle"` in `ocrmd.toml`): continuous autofocus until
    the first capture, then locked, so the lens stops hunting every time a hand comes in.
-5. **Start the scan with your hands out of the frame, then turn pages and get your hand out.** The
+6. **Start the scan with your hands out of the frame, then turn pages and get your hand out.** The
 hand gate learns what "paper" looks like from the first frames it sees; a hand that is already there at start is part of the baseline and the first capture will include it (the gate corrects itself as soon as the hand leaves). After that the shutter waits while a hand covers the page (`HAND IN FRAME` in the window). A paperback that will not stay open wants a sheet of glass or a couple of weights on the margins — a hand holding it open blocks the shutter by design.
-6. Watch the **advice line**: `page runs past the top edge — text is being cut off` and
+7. Watch the **advice line**: `page runs past the top edge — text is being cut off` and
    `printed page jumped 37 → 41` are both things to fix *now*, not at review time.
 
 ## The scan window
@@ -143,7 +145,7 @@ hand gate learns what "paper" looks like from the first frames it sees; a hand t
   | State | Meaning |
   |---|---|
   | `MOVING` | frame-to-frame motion above threshold (a page turning, a hand moving) |
-  | `FOCUSING` | the lens is hunting |
+  | `FOCUSING` | page sharpness is still moving: the lens has not settled |
   | `HAND IN FRAME` | paper that was visible a moment ago is covered (hand, pen, curled page) |
   | `SAME PAGE` | looks like the last capture — turn the page |
   | `BLURRY` | sharpness below the floor (absolute, and relative to the best this rig has produced) |
@@ -151,8 +153,8 @@ hand gate learns what "paper" looks like from the first frames it sees; a hand t
 
 - **The detected page outline** drawn on the frame, and **px/page** in green once it clears the threshold.
   Frame edges that cut through text are marked in red.
-- **Camera state**: resolution, focus mode, `*` while the lens is hunting, and the hand gate's
-  numbers (`cover=` how much reference paper is hidden, `skin=` how skin-toned the hidden part is).
+- **Camera state**: resolution, focus mode, `*` while page sharpness is still moving, a warning when
+the page is soft for this rig, and the hand gate's numbers (`cover=` how much reference paper is hidden, `skin=` how skin-toned the hidden part is).
 - **A work panel**: what is being processed right now (`page 0003: llm`), how many captures are
 queued, `LLM OFF` if the service has been given up on for this session, and the status of recent pages colour-coded by verification result.
 - **Advice and errors** along the bottom. A white flash confirms each capture.

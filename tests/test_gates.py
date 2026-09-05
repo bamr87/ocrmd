@@ -5,6 +5,7 @@ import numpy as np
 
 from conftest import on_desk, text_page, with_hand
 from ocrmd import occlusion
+from ocrmd import focus
 from ocrmd.capture import Gate
 from ocrmd.config import Settings
 
@@ -100,8 +101,37 @@ def test_gate_reports_focusing_and_blur():
         g.evaluate(clean, None, adjusting=False)
     assert g.evaluate(clean, None, adjusting=True)["gate"] == "focusing"
     soft = cv2.GaussianBlur(clean, (0, 0), 6)
-    states = _run(g, soft, 8)
+    # sharpness stepping down is itself a reason to wait: while the window straddles the step the gate
+    # says "focusing" (something just changed), and it only calls it blurry once the trace is flat again
+    states = _run(g, soft, 2 * focus.WINDOW)
+    assert "focusing" in states, states
     assert states[-1] == "blurry", states
+
+
+def test_a_soft_camera_does_not_lower_its_own_bar():
+    """The failure this was built for: a session that starts out of focus. The floor is anchored to
+    what the rig has managed before, so the soft frames stay refused instead of becoming the new best."""
+    clean, s = _rig(), _settings()
+    sharp_value = Gate(s).evaluate(clean, None, adjusting=False)["sharp"]
+    g = Gate(s, rig_best=sharp_value)
+    soft = cv2.GaussianBlur(clean, (0, 0), 6)
+    states = _run(g, soft, 60)
+    assert states[-1] == "blurry", states
+    assert g.focus.soft_run > 0 and g.evaluate(soft, None, adjusting=False)["floor"] > 0
+
+
+def test_a_soft_rig_is_eventually_believed():
+    """...but not forever: a camera that has been moved further from the page really is less sharp,
+    and a memory that refuses to believe that would block every capture there is."""
+    w = focus.Watch(best=1000.0, soft_frames=2, recovery_gap=0.0)
+    actions, t = [], 0.0
+    for _ in range(40):
+        t += 1.0
+        v = w.observe(100.0, now=t)
+        if v.action:
+            actions.append(v.action)
+    assert actions == ["retrigger", "retrigger", "reopen", "reopen", "accept"], actions
+    assert w.accepted and w.best == 100.0
 
 
 def test_gate_reset_forgets_the_scene():

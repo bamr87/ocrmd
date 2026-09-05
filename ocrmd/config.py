@@ -50,6 +50,14 @@ class Settings(BaseModel):
     resolution: tuple[int, int] | None = None   # None = the camera's largest mode
     focus: str = "continuous"                   # continuous | locked | settle | off
     settle_after: int = 1                       # focus=settle: lock after this many captures
+    # Focus is watched in the image, because the driver's own signals are useless on real webcams:
+    # `isAdjustingFocus` was false on all 599 frames measured on the rig this was built for, and
+    # `lensPosition` never left 0.0. See ocrmd/focus.py for what each of these was measured against.
+    focus_recovery: bool = True        # refocus the camera when the page has gone soft and stayed soft
+    focus_hunt_band: float = 0.06      # relative sharpness spread over ~0.4s that means the lens is moving
+    focus_soft_ratio: float = 0.45     # of the best this rig has ever managed: below this it is out of focus
+    focus_soft_frames: int = 45        # ...for this many frames in a row before anything is done (~1.5s)
+    focus_recovery_gap: float = 6.0    # seconds between attempts, so a refocus gets time to work
     # hand gate: fraction of the reference paper area that must vanish before the frame is "covered",
     # and how many stuck frames before a persistent intrusion is accepted as part of the scene
     occlusion_cover: float = 0.05

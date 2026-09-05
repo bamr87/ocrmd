@@ -6,8 +6,8 @@ from ..store import Store
 from .. import ocr, pipeline, llm as llm_mod
 
 
-def cameras() -> list[dict]:
-    from .. import camctl
+def cameras(root: Path | None = None) -> list[dict]:
+    from .. import camctl, focus
     out = []
     try:
         mapping = camctl.map_cv2_indices()
@@ -26,6 +26,9 @@ def cameras() -> list[dict]:
             cam["focus"], cam["exposure"] = state.get("focus"), state.get("exposure")
             if state.get("focus") == "locked" and "continuous" in caps.focus_modes:
                 cam["warning"] = "locked focus blurs every frame; `scan` sets continuous"
+            # what this camera has managed before, remembered across sessions: the anchor the shutter's
+            # sharpness floor uses so a session that starts out of focus cannot lower its own bar
+            cam["best_sharpness"] = (focus.load_best(root, d) or None) if root else None
         out.append(cam)
     return out
 
@@ -43,7 +46,7 @@ def doctor_report(s: Settings, st: Store, probe_cameras: bool = True) -> dict:
         "ocr_engines_installed": ocr.available_engines(),
         "credentials": {"anthropic": llm_mod.credentials_available("anthropic"), "xai": llm_mod.credentials_available("xai")},
         "dictionary": Path("/usr/share/dict/words").exists(),
-        "cameras": cameras() if probe_cameras else [],
+        "cameras": cameras(s.root) if probe_cameras else [],
         "camera_authorized": camera_authorized(),
         "db_path": str(s.db_path), "db_integrity": st.integrity(),
         "documents": [{"slug": slug, "pages": sum(st.counts(slug).values()), "counts": st.counts(slug)} for slug in st.documents()],

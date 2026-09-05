@@ -13,6 +13,7 @@ from .config import Settings
 from .fingerprint import dhash, hamming
 from .camview import CameraView, handle_key, HELP, load_view, save_view
 from . import camctl, preprocess, occlusion, scene
+from . import focus as focus_mod   # `focus` is a parameter name in this module
 from .hud import ScanState, draw as draw_hud
 
 log = logging.getLogger("ocrmd.capture")
@@ -154,7 +155,7 @@ class Gate:
     while the detected page outline swung 100-700 px between consecutive shots.
     """
 
-    def __init__(self, s: Settings):
+    def __init__(self, s: Settings, rig_best: float = 0.0):
         self.s = s
         self.prev_small: np.ndarray | None = None
         self.last_hash: str | None = None
@@ -162,6 +163,11 @@ class Gate:
         self.tracker = occlusion.Tracker(cover_threshold=s.occlusion_cover, rebaseline_after=s.occlusion_rebaseline)
         self.scene = scene.Scene(stable_frames=s.stable_frames, settle_frames=s.settle_frames,
                                  window=s.geometry_frames, tolerance=s.geometry_tolerance)
+        # `rig_best` is what this camera has managed before, remembered across sessions. Without it a
+        # session that starts out of focus lowers its own bar to match (see focus.py).
+        self.focus = focus_mod.Watch(best=rig_best, soft_ratio=s.focus_soft_ratio,
+                                 soft_frames=s.focus_soft_frames, hunt_band=s.focus_hunt_band,
+                                 recovery_gap=s.focus_recovery_gap)
 
     @property
     def still(self) -> int:
@@ -191,7 +197,10 @@ class Gate:
         h = dhash(small)
         novelty = hamming(h, self.last_hash) if self.last_hash else 999
         occ = self.tracker.update(frame, s.analysis_width)
-        v = self.scene.observe(moving=motion >= s.motion_threshold, adjusting=adjusting,
+        # The lens is watched in the image, not in the driver: `adjusting` is false on every frame of
+        # every camera measured so far, and is kept only as an extra reason to wait (focus.py).
+        f = self.focus.observe(blur, occluded=occ.occluded, adjusting=adjusting)
+        v = self.scene.observe(moving=motion >= s.motion_threshold, adjusting=f.hunting,
                                occluded=occ.occluded)
         # Adaptive floor: what counts as sharp depends on the lens, the lighting and how far away
         # the page is, so a single absolute number is either too strict for one rig or too loose
@@ -199,7 +208,7 @@ class Gate:
         # A hand in frame is excluded from that tracking: skin is sharper than paper.
         if not occ.occluded:
             self.best_sharp = max(blur, self.best_sharp * s.sharp_decay)
-        floor = max(s.blur_threshold, self.best_sharp * s.sharp_ratio)
+        floor = self.focus.floor(s.blur_threshold, self.best_sharp, s.sharp_ratio)
         # `require_new` is off when watching a page for annotations: the point is to look at the same
         # page again and again, and "this is the page you just captured" is the answer, not a blocker.
         gate = (v.blocker or
@@ -207,7 +216,7 @@ class Gate:
                  "blurry" if blur < floor else "READY"))
         return {"gate": gate, "motion": motion, "novelty": novelty, "sharp": blur, "floor": floor,
                 "hash": h, "occlusion": occ, "scene": v, "still": v.quiet, "needed": v.needed,
-                "settling_from": v.disturbance, "drift": round(v.drift, 4)}
+                "settling_from": v.disturbance, "drift": round(v.drift, 4), "focus": f}
 
     def captured(self, h: str) -> None:
         self.last_hash = h
@@ -333,12 +342,22 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
     cap = open_camera(s.camera_index, resolution=resolution, focus=focus)
     name = camera_name(s.camera_index)
     view = view or load_view(s.root, name)
+    # The mode this session runs in, read after `open_camera` has applied it. Restored on the way out
+    # so that `focus=settle`'s lock does not outlive the scan: measured on this rig, a session that
+    # ends locked comes back up locked, and a lens parked somewhere useless is the failure focus.py
+    # exists to catch.
+    entry_focus = camctl.focus_state(name=name).get("focus")
+    rig_best = focus_mod.load_best(s.root, name or "")
     st = camctl.focus_state(name=name)
     on_status(f"camera '{name}' {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
               f"  focus={st.get('focus', 'n/a')} exposure={st.get('exposure', 'n/a')}  view: {view.describe()}")
     state = state or ScanState()
-    gate = Gate(s)
-    last_emit, last_status = 0.0, 0.0
+    gate = Gate(s, rig_best=rig_best)
+    if rig_best:
+        on_status(f"this rig has focused to {rig_best:.0f} before; anything under "
+                  f"{rig_best * s.sharp_ratio:.0f} will be treated as out of focus")
+    last_emit, last_status, last_fstate = 0.0, 0.0, 0.0
+    fstate: dict = camctl.focus_state(name=name)
     quad, quad_age, flash, page_px, clipped = None, 0, 0.0, None, []
     failed_reads, reopens, captures = 0, 0, 0
     settled = focus != "settle"
@@ -367,7 +386,8 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
                 time.sleep(0.05); continue
             failed_reads = 0
             frame = view.apply(frame)
-            fstate = camctl.focus_state(name=name)
+            if time.time() - last_fstate > 0.2:      # the driver's opinion changes slowly and is rarely useful
+                fstate, last_fstate = camctl.focus_state(name=name), time.time()
             quad_age -= 1
             if quad_age <= 0:                      # page outline is the main framing aid; ~3/s is plenty
                 rect = preprocess.find_page_rect(frame)
@@ -377,6 +397,19 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
                 page_px = preprocess.estimated_page_width(frame, rect) if rect is not None else None
                 clipped = preprocess.clipped_edges(quad, frame.shape, img=frame) if quad is not None else []
             g = gate.evaluate(frame, quad, adjusting=bool(fstate.get("adjusting")), require_new=require_new)
+            act = g["focus"].action
+            if act and s.focus_recovery:
+                on_status(g["focus"].note, "warn" if act != "accept" else "info")
+                log.warning("focus %s: %s", act, g["focus"].note)
+                if act == "retrigger":
+                    mode = camctl.retrigger_focus(name=name)
+                    if mode is None:
+                        on_status("this camera offers no focus control; check the lens and the distance", "warn")
+                elif act == "reopen":
+                    cap.release(); time.sleep(0.4)
+                    cap = open_camera(s.camera_index, resolution=resolution, focus=focus)
+                    gate.reset_scene()
+                gate.focus.acted()
             force = False
             keys: list[int] = []
             if preview or on_frame is not None:
@@ -384,7 +417,8 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
                                 settling_from=g["settling_from"], drift=g["drift"],
                                 novelty=g["novelty"], novelty_threshold=s.novelty_threshold, sharp=g["sharp"],
                                 blur_threshold=g["floor"], view_desc=view.describe(),
-                                focus=fstate.get("focus", "n/a"), adjusting=bool(fstate.get("adjusting")),
+                                focus=fstate.get("focus", "n/a"), adjusting=g["focus"].hunting,
+                                focus_note=g["focus"].describe(),
                                 resolution=(frame.shape[1], frame.shape[0]), page_quad=quad, state=state,
                                 help_text=HELP, flash=flash, page_px=page_px,
                                 min_page_px=s.min_page_width, clipped=clipped, occlusion=g["occlusion"].describe())
@@ -404,7 +438,9 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
                                     "novelty_threshold": s.novelty_threshold,
                                     "occlusion": g["occlusion"].describe(), "cover": g["occlusion"].missing,
                                     "page_px": page_px, "min_page_px": s.min_page_width, "clipped": list(clipped),
-                                    "focus": fstate.get("focus"), "adjusting": bool(fstate.get("adjusting")),
+                                    "focus": fstate.get("focus"), "adjusting": g["focus"].hunting,
+                                    "focus_note": g["focus"].describe(), "focus_ratio": round(g["focus"].ratio, 3),
+                                    "rig_best": round(gate.focus.best, 1),
                                     "resolution": [frame.shape[1], frame.shape[0]], "view": view.describe(),
                                     "captures": captures})
             if commands is not None:
@@ -468,6 +504,14 @@ def auto_shutter(s: Settings, preview: bool = True, on_status=print, view: Camer
                           f"sharpness={g['sharp']:.0f}/{g['floor']:.0f} {g['occlusion'].describe()}")
     finally:
         cap.release()
+        # A scan that ends with the lens locked leaves the next one starting from wherever it parked —
+        # measured: this rig comes back up `locked` after every session that locked it.
+        if entry_focus and camctl.focus_state(name=name).get("focus") != entry_focus:
+            camctl.set_focus(entry_focus, name=name)
+        if name and gate.focus.best > rig_best:
+            focus_mod.save_best(s.root, name, gate.focus.best)
+        elif name and gate.focus.accepted:
+            focus_mod.save_best(s.root, name, gate.focus.best)
         if preview:
             cv2.destroyAllWindows()
             for _ in range(4):      # macOS needs a few event-loop turns to actually close the window

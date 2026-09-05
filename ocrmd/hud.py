@@ -72,7 +72,7 @@ def draw(frame: np.ndarray, *, gate: str, motion: float, still: int, stable_fram
          page_quad: np.ndarray | None, state: ScanState, help_text: str,
          flash: float = 0.0, width: int = 1000, page_px: int | None = None,
          min_page_px: int = 900, clipped: list[str] | None = None,
-         occlusion: str | None = None) -> np.ndarray:
+         occlusion: str | None = None, focus_note: str = "") -> np.ndarray:
     """Return an annotated copy of `frame`, scaled to `width`."""
     scale = width / max(1, frame.shape[1])
     disp = cv2.resize(frame, (width, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
@@ -102,6 +102,9 @@ def draw(frame: np.ndarray, *, gate: str, motion: float, still: int, stable_fram
            GREEN if sharp >= blur_threshold else RED, "sharpness", f"{sharp:.0f}")
     _text(disp, f"{resolution[0]}x{resolution[1]}  focus={focus}{'*' if adjusting else ''}"
           + (f"  {occlusion}" if occlusion else ""), bar_x + bar_w + 40, 60, GREY, 0.44)
+    if focus_note and not focus_note.startswith("focus ok"):
+        # the lens is the one thing the operator cannot see going wrong until the pages come out soft
+        _text(disp, focus_note, bar_x + bar_w + 40, 76, AMBER if "soft" not in focus_note else RED, 0.44)
     _text(disp, view_desc, w - 8 * len(view_desc) - 14, 30, GREY, 0.44)
     _text(disp, f"captured {state.captured}", w - 130, 60, WHITE, 0.44)
 

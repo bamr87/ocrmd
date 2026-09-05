@@ -348,7 +348,7 @@ def test_an_operator_may_name_its_own_model(tmp_path, root, store):
 
 
 def test_the_docetl_export_speaks_litellm_and_completes_resolve(tmp_path):
-    s = SPEC + """  - name: same
+    s = SPEC.replace("pipeline:", """  - name: same
     type: resolve
     resolve_key: name
     comparison_prompt: "same? A: {{ input.a }} B: {{ input.b }}"
@@ -356,7 +356,7 @@ def test_the_docetl_export_speaks_litellm_and_completes_resolve(tmp_path):
   - name: q
     type: extract
     prompt: "quote"
-"""
+pipeline:""")
     s = s.replace("operations: [find, flatten]", "operations: [find, flatten, same, q]")
     pipe = etl.Pipeline.load(spec(tmp_path, s))
     out = etl.export_docetl(pipe, rows(), tmp_path / "out", "claude-haiku-4-5")

@@ -14,6 +14,14 @@ llm_effort = "medium"          # transcription is perception, not reasoning
 # --- camera / auto-shutter (fixed rig over a textbook) -----------------------------------------
 camera_index = 0
 focus = "settle"               # continuous | locked | settle (continuous until the first capture, then lock) | off
+
+# Focus is watched in the image, not in the driver: `isAdjustingFocus` was false on all 599 frames
+# measured on the rig this was built for, and `lensPosition` never left 0.0. See ocrmd/focus.py.
+focus_recovery = true       # refocus the camera when the page has gone soft and stayed soft
+focus_hunt_band = 0.06      # relative sharpness spread over ~0.4 s that means the lens is moving
+focus_soft_ratio = 0.45     # of the best this rig has ever managed: below this it is out of focus
+focus_soft_frames = 45      # ...for this many frames in a row before anything is done (~1.5 s)
+focus_recovery_gap = 6.0    # seconds between attempts, so a refocus gets time to work
 settle_after = 1
 stable_frames = 8              # undisturbed frames before the shutter can fire, after ordinary noise
 settle_frames = 20             # ...and after a hand or a moved page: a page turn must prove it has finished

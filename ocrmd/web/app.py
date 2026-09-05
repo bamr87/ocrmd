@@ -178,7 +178,7 @@ def create_app(s: Settings) -> FastAPI:
 
     @app.get("/api/cameras")
     def api_cameras():
-        return list_cameras()
+        return list_cameras(s.root)
 
     @app.get("/api/settings")
     def api_settings():

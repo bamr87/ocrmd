@@ -24,19 +24,35 @@ class Capabilities:
     custom_lens_position: bool
 
 
+_DEVICES: dict[tuple, object] = {}
+
+
 def _device(name_substr: str | None = None, index: int | None = None):
+    """The AVCaptureDevice, cached.
+
+    Building a discovery session costs 4-7 ms, the property reads off the device cost nothing, and
+    `auto_shutter` asks for the focus state once per frame — measured at 6.7 ms a call, a fifth of the
+    frame budget at 30 fps, spent rediscovering a camera that has not moved. Cached it is 0.03 ms.
+    A device that has been unplugged reports `isConnected` false, which is the invalidation.
+    """
     if not AVAILABLE:
         return None
+    key = (name_substr, index)
+    d = _DEVICES.get(key)
+    if d is not None and bool(d.isConnected()):
+        return d
+    _DEVICES.pop(key, None)
     sess = AV.AVCaptureDeviceDiscoverySession.discoverySessionWithDeviceTypes_mediaType_position_(
         [AV.AVCaptureDeviceTypeBuiltInWideAngleCamera, AV.AVCaptureDeviceTypeExternal], AV.AVMediaTypeVideo, 0)
     devices = list(sess.devices())
+    found = None
     if index is not None and index < len(devices):
-        return devices[index]
-    if name_substr:
-        for d in devices:
-            if name_substr.lower() in str(d.localizedName()).lower():
-                return d
-    return None
+        found = devices[index]
+    elif name_substr:
+        found = next((d for d in devices if name_substr.lower() in str(d.localizedName()).lower()), None)
+    if found is not None:
+        _DEVICES[key] = found
+    return found
 
 
 _FOCUS = {"locked": 0, "auto": 1, "continuous": 2}          # AVCaptureFocusMode values
@@ -104,6 +120,26 @@ def set_lens_position(pos: float, index: int | None = None, name: str | None = N
     if not _configure(d, lambda dev: dev.setFocusModeLockedWithLensPosition_completionHandler_(pos, None)):
         return None
     return pos
+
+
+def retrigger_focus(index: int | None = None, name: str | None = None) -> str | None:
+    """Make the camera hunt again, and return the mode it was left in (None if it could not be done).
+
+    The only focus control a camera without custom lens positions offers: drop the mode and put it
+    back. On the rig this was written for, `continuous` alone did not recover a lens that had parked
+    somewhere useless — see `focus.py` for the measurement — so this is a best-effort nudge, and
+    `focus.Watch` escalates to restarting the stream when it does not take.
+    """
+    d = _device(name, index)
+    if d is None:
+        return None
+    mode = {v: k for k, v in _FOCUS.items()}.get(int(d.focusMode()), "continuous")
+    other = "locked" if mode == "continuous" else "continuous"
+    if not d.isFocusModeSupported_(_FOCUS.get(other, -1)):
+        return None
+    set_focus(other, index, name)
+    set_focus("continuous" if d.isFocusModeSupported_(_FOCUS["continuous"]) else mode, index, name)
+    return focus_state(index, name).get("focus")
 
 
 def supports_lens_position(index: int | None = None, name: str | None = None) -> bool:

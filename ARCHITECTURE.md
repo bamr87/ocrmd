@@ -150,6 +150,25 @@ When the gates open the shutter takes more than one frame.
 
 The variants ride with the capture into `ingest_frame` and are stored as `raw/<sha>.v<n>.jpg`, as immutable as the capture itself. **Page identity, dedup and every stage still derive from the primary frame alone**; variants only ever add evidence about text the primary could not resolve.
 
+### Focus, watched in the image (`focus.py`)
+
+Everything ocrmd knew about focus came from AVFoundation, and on the camera it was built for both signals are inert. Measured on a Logitech C525 over 599 frames including two forced mode changes: **`isAdjustingFocus` was false on every one**, and `lensPosition` reads 0.0 and never moves. The focus gate has therefore never fired on this rig, the HUD's `FOCUSING` state has never been shown, and the focus bracket reports itself unavailable.
+
+The failure that matters is real. The same book under the same lamp, minutes apart, measured page sharpness of **18 and then 1030** — and in the bad state the camera reported `focus=continuous` and stayed there for the twenty seconds it was watched, through a `locked`→`continuous` toggle. A scan started in that state photographs the whole book out of focus, because the shutter's floor was relative to the best *that session* had shown and decays (`sharp_decay`): a session that starts soft quietly lowers its own bar. In the store that shows up as crop blur of 149 median for pages that ended merely flagged, 101 for `suspect`, 66 for `illegible`.
+
+So the lens is judged from the sharpness trace, which every camera has:
+
+- **Moving or still**: the relative spread of page sharpness over a 12-frame window. On a still,
+in-focus scene that spread measured p50 0.012, p99 0.026, max 0.027 over 598 frames, so `HUNT_BAND = 0.06` is a little over twice the worst quiet frame. A step down in sharpness also lands inside the band for one window, which is correct — something just changed, wait for it.
+- **Sharp or soft**: sharpness against the best this *rig* has ever produced, remembered per camera in
+`.ocrmd-camera.json` beside its view. Over 20 s of a working rig the ratio never fell below 0.939; the broken state was 0.017. `SOFT_RATIO = 0.45` sits between them with room for a genuinely low-contrast page.
+- **Then something is done about it**: after `SOFT_FRAMES` (~1.5 s) the watch asks for a retrigger —
+dropping the focus mode and putting it back, which is all a camera without lens control offers — and escalates to restarting the stream. A retrigger is cheap and harmless, which is the point: a mostly blank page can trip the softness test and the worst that costs is one re-hunt.
+- **And the memory is allowed to fall.** A rig moved further from the page really is less sharp, and a
+memory that refused to believe that would block every capture forever. After four failed recoveries the watch accepts the new normal, says so on the status line, and carries on.
+
+Two smaller fixes came out of the same measurements. `camctl.focus_state` was called once per frame and cost **6.7 ms** — a fifth of the frame budget at 30 fps — because every call built an AVFoundation discovery session; the device is now cached and it costs 0.003 ms. And a scan that ended with the lens locked (`focus=settle`) left it locked: this rig comes back up `locked` after every such session, which is exactly how a lens ends up parked somewhere useless. The mode the session opened with is now restored on the way out.
+
 ### The hand gate (`occlusion.py`)
 
 The first real sessions produced a run of captures with a hand flat across the text. All three original gates passed: the hand stopped moving, it changed the hash, and it was in focus. Two approaches were measured against the 57 real captures on disk:
@@ -579,7 +598,7 @@ The web UI reads specs from `documents/<slug>/etl/*.yaml` and `<root>/etl/pipeli
   documents/<slug>/document.yaml, pages/*.md, <slug>.md
   documents/<slug>/etl/*.yaml, extracted/*   extraction pipelines and what they produced
   etl/<slug>/<operation>.json    per-operator answer cache, versioned by the prompt
-  .ocrmd-camera.json             per-camera view
+  .ocrmd-camera.json             per-camera view, and the best sharpness that camera has reached
 ```
 
 Tables: `documents`, `pages` (id, document, sequence, hashes, status, page_label, part, width_px, advice, written_fingerprint, reviewed_by/at), `captures` (every frame incl. duplicates and refusals: `duplicate_of`, `rejected`, `document`), `stages` (page_id, stage, version, completed_at, error), `llm_calls` (tokens, latency), `batches`. Indexes on (document, sequence), (document, status), captures.page_id, llm_calls.page_id.

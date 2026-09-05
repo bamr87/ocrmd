@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — autofocus
+
+### The camera was never telling us where the lens was
+
+Every focus decision ocrmd made came from AVFoundation. Measured on the Logitech C525 this tool was
+built on, over 599 frames including two forced mode changes: **`isAdjustingFocus` was false on every
+one**, and `lensPosition` reads 0.0 and never moves. The focus gate has never fired on this rig; the
+HUD's `FOCUSING` state has never been shown.
+
+And the failure it should have caught is real: the same book under the same lamp, minutes apart,
+measured page sharpness of **18 and then 1030**, with the camera reporting `focus=continuous`
+throughout and holding the bad state through a `locked`→`continuous` toggle. A scan started there
+photographs the whole book out of focus, because the sharpness floor was relative to the best *that
+session* had shown and decays — a session that starts soft lowers its own bar. In this store that
+shows up as crop blur of 149 median for pages that ended merely flagged, 101 for `suspect`, 66 for
+`illegible`.
+
+**[focus.py](ocrmd/focus.py) now watches the lens in the image**, which every camera allows:
+
+- **is it moving** — the relative spread of page sharpness over 12 frames. On a still, in-focus scene
+  that measured p50 0.012, p99 0.026, max 0.027 (598 frames), so the band is 0.06;
+- **is it soft** — sharpness against the best this *rig* has ever managed, remembered per camera in
+  `.ocrmd-camera.json`. A working rig never dropped below 0.939 of its own best over 20 s; the broken
+  state was 0.017, so the line is at 0.45;
+- **then do something** — retrigger the camera's focus, escalate to restarting the stream, and after
+  four failed attempts accept that the rig has changed and say so, rather than blocking every capture
+  forever.
+
+The shutter's floor is anchored to that memory, so a soft session can no longer talk itself down.
+`ocrmd doctor` prints what each camera has reached, and the HUD and web scan view show the ratio.
+
+### Fixes
+
+- **`camctl.focus_state` cost 6.7 ms and was called every frame** — a fifth of the frame budget at
+  30 fps, spent building an AVFoundation discovery session to read two booleans off a camera that had
+  not moved. The device is cached (invalidated when it disconnects): **0.003 ms**.
+- **A scan left the camera locked.** `focus=settle` locks the lens after the first capture and nothing
+  ever unlocked it; this rig comes back up `locked` after every such session, which is exactly how a
+  lens ends up parked somewhere useless. The mode the session opened with is restored on exit.
+- A malformed YAML string in `test_etl.py` (0.9.0 work in progress) made the suite red: the extra
+  operations were appended after the `pipeline:` block instead of before it.
+
 ## 0.8.0 — 2026-08-28
 
 ### A view of the page that is meant to be read

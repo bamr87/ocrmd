@@ -257,7 +257,10 @@ function renderScan(s) {
   if (kv) kv.innerHTML = `
     <dt>Document</dt><dd><a href="#/doc/${esc(s.doc)}">${esc(s.doc)}</a></dd>
     <dt>Camera</dt><dd>${esc(s.camera?.name || "")} ${g.resolution ? `${g.resolution[0]}×${g.resolution[1]}` : ""}</dd>
-    <dt>Focus</dt><dd>${esc(g.focus || "")}${g.adjusting ? " (adjusting)" : ""}</dd>
+    <dt>Focus</dt><dd>${esc(g.focus || "")}${g.adjusting ? " (moving)" : ""}${
+      g.focus_note && !g.focus_note.startsWith("focus ok")
+        ? ` <span class="${g.focus_note.includes("soft") ? "err" : "warn"}">${esc(g.focus_note)}</span>`
+        : g.rig_best ? ` <span class="muted small">${Math.round(100 * (g.focus_ratio ?? 1))}% of this rig's best (${Math.round(g.rig_best)})</span>` : ""}</dd>
     <dt>View</dt><dd class="mono small">${esc(g.view || "")}</dd>
     <dt>Captured</dt><dd>${s.captured}</dd>
     <dt>Queue</dt><dd>${s.queued} ${s.degraded ? '<span class="err">LLM OFF (degraded)</span>' : ""}</dd>

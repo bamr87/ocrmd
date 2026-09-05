@@ -770,6 +770,9 @@ def doctor(costs: bool = False):
         if cam.get("format"):
             typer.echo(f"             ocrmd will use {cam['format'][0]}x{cam['format'][1]}; focus modes: {', '.join(cam['focus_modes']) or 'none (fixed focus)'}"
                        + ("; focus bracket available" if cam.get("lens_position") else "; no custom lens position (focus bracket unavailable)"))
+            if cam.get("best_sharpness"):
+                typer.echo(f"             sharpest this rig has focused: {cam['best_sharpness']:.0f} "
+                           "— anything far below that during a scan is treated as out of focus")
             line = f"             now: focus={cam['focus']} exposure={cam['exposure']}"
             if cam.get("warning"):
                 typer.secho(line + f"  <- {cam['warning']}", fg="yellow")
