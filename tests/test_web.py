@@ -25,7 +25,7 @@ def client(root, store):
 
 
 def _seed(root, store, slug="web-book"):
-    pid = pipeline.ingest_frame(root, store, on_desk(text_page(LINES)), slug, "webcam:cam")[0]
+    pid = pipeline.ingest_frame(root, store, on_desk(text_page(LINES)), slug, "webcam:cam").pages[0]
     r = pipeline.run_page(root, store, store.page(pid), FakeProvider(markdown=FLAGGED_MD, page_number="3", chapter="One"), slug)
     render.ensure_document_meta(root.documents / slug, slug, title="Web Book")
     render.build_document(root.documents / slug, slug)
@@ -40,6 +40,63 @@ def _wait(client, job_id, timeout=60):
             return j
         time.sleep(0.2)
     raise AssertionError("job did not finish")
+
+
+@needs_ocr
+def test_the_flat_view_is_served_and_rendered_on_demand(client, root, store):
+    """A page scanned before this existed has no flat file; asking for it makes one, because it is a
+    pure function of the crop and needs no reprocess."""
+    pid, _ = _seed(root, store)
+    from ocrmd import pipeline as pl
+    pl.flat_path(root, pid).unlink()
+    r = client.get("/api/documents/web-book/pages/1/image/flat")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+    assert pl.flat_path(root, pid).exists()
+
+
+@needs_ocr
+def test_a_selected_region_is_read_and_handed_back_with_its_crop(client, root, store):
+    _seed(root, store)
+    r = client.post("/api/documents/web-book/pages/1/region",
+                    json={"x": 0.05, "y": 0.05, "w": 0.9, "h": 0.3}).json()
+    assert r["text"] and r["scale"] >= 1 and r["llm"] is None       # local OCR only unless asked
+    assert client.get(r["image"]).status_code == 200
+    tiny = client.post("/api/documents/web-book/pages/1/region",
+                       json={"x": 0.5, "y": 0.5, "w": 0.004, "h": 0.004})
+    assert tiny.status_code == 400 and "too small" in tiny.json()["detail"]
+
+
+@needs_ocr
+def test_extraction_pipelines_are_listed_and_run_as_a_job(client, root, store):
+    """The free operators need no provider, so the whole path — list, run, write, download — is
+    exercised without credentials."""
+    _seed(root, store)
+    d = root.documents / "web-book" / "etl"
+    d.mkdir(parents=True)
+    (d / "chunks.yaml").write_text(
+        "name: chunks\n"
+        "operations:\n"
+        "  - {name: chop, type: split, split_key: text, words: 5, overlap: 0}\n"
+        "  - {name: first, type: sample, n: 3}\n"
+        "pipeline:\n"
+        "  operations: [chop, first]\n"
+        "  output: {type: csv, path: chunks.csv}\n")
+    (d / "broken.yaml").write_text("name: broken\noperations: [{name: x, type: map, output: {schema: {y: nope}}}]\n")
+
+    listed = client.get("/api/documents/web-book/pipelines").json()
+    by_file = {p["file"]: p for p in listed}
+    assert by_file["chunks.yaml"]["steps"] == ["chop", "first"] and by_file["chunks.yaml"]["llm_steps"] == []
+    assert "error" in by_file["broken.yaml"]              # a broken spec does not hide the working one
+
+    job = _wait(client, client.post("/api/jobs", json={"kind": "etl", "doc": "web-book",
+                                                       "options": {"pipeline": "chunks.yaml"}}).json()["id"])
+    assert job["status"] == "done", job
+    out = root.documents / "web-book" / "extracted" / "chunks.csv"
+    assert out.exists() and len(out.read_text().splitlines()) == 4      # header + 3 sampled chunks
+    assert out.read_text().startswith("_document,_page")
+    assert client.get("/api/documents/web-book/extracted/chunks.csv").status_code == 200
+    assert client.get("/api/documents/web-book").json()["extracted"] == ["chunks.csv"]
+    assert client.get("/api/documents/web-book/extracted/../../ocrmd.db").status_code in (404, 400)
 
 
 def test_index_and_system_endpoints(client):
@@ -65,7 +122,7 @@ def test_document_page_flags_and_review_flow(client, root, store):
     assert client.get("/api/documents/web-book/document.md").status_code == 200
 
     page = client.get("/api/documents/web-book/pages/1").json()
-    assert page["unresolved"] >= 1 and page["flags"][0]["ocr"] and set(page["images"]) >= {"processed", "raw", "bin"}
+    assert page["unresolved"] >= 1 and page["flags"][0]["ocr"] and set(page["images"]) >= {"processed", "raw", "bin", "flat"}
     assert client.get(page["images"]["processed"]).status_code == 200
     assert client.get("/api/documents/web-book/pages/1/image/nope").status_code == 404
     assert client.post("/api/documents/web-book/pages/1/signoff", json={"who": "amr"}).status_code == 409   # unresolved
@@ -143,8 +200,8 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
     # a spread -> two pages sharing one raw capture, plus a single page
     page = text_page()
     spread = on_desk(np.hstack([page, np.full((page.shape[0], 26, 3), 90, np.uint8), page]))
-    a, b = pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam")
-    c = pipeline.ingest_frame(root, store, on_desk(text_page(["a different page entirely"] * 12)), "del-book", "file:x")[0]
+    a, b = pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam").pages
+    c = pipeline.ingest_frame(root, store, on_desk(text_page(["a different page entirely"] * 12)), "del-book", "file:x").pages[0]
     for pid in (a, b, c):
         pipeline.run_page(root, store, store.page(pid), None, "del-book")
     render.build_document(root.documents / "del-book", "del-book")
@@ -160,7 +217,7 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
     assert client.get("/api/documents/del-book").json()["pages"] == 2
 
     # the same frame is still a duplicate: its other half is still in the document
-    assert pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam") == []
+    assert pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam").pages == []
 
     # bulk delete of the whole capture: the remaining half, raw purged
     r = client.post("/api/documents/del-book/pages/delete", json={"sequences": [2], "whole_capture": True}).json()
@@ -170,7 +227,7 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
     assert [p["sequence"] for p in left["page_list"]] == [3]
     assert "page: 0003" in (root.documents / "del-book" / "del-book.md").read_text()   # rebuilt
     # ...and now the frame can be scanned again: nothing refers to it any more
-    assert len(pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam")) == 2
+    assert len(pipeline.ingest_frame(root, store, spread, "del-book", "webcam:cam").pages) == 2
     assert [p["sequence"] for p in client.get("/api/documents/del-book").json()["page_list"]] == [3, 4, 5]
 
     # whole document: confirmation must repeat the slug
@@ -181,3 +238,35 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
     assert client.get("/api/documents/del-book").status_code == 404
     assert client.delete("/api/documents/del-book?confirm=del-book").status_code == 404
     assert pipeline.orphan_artifacts(root, store) == []
+
+
+# --- the page model ---------------------------------------------------------------------------------
+@needs_ocr
+def test_the_page_model_is_served_drawn_and_editable(client, root, store):
+    pid, _ = _seed(root, store)
+    p = client.get("/api/documents/web-book/pages/1").json()
+    assert p["layout"] == "/api/documents/web-book/pages/1/layout" and isinstance(p["figures"], list)
+    lay = client.get(p["layout"]).json()
+    assert lay["page_id"] == pid and lay["blocks"] and lay["version"].startswith("layout@")
+    boxes = client.get("/api/documents/web-book/pages/1/boxes").json()
+    assert boxes["lines"] and boxes["blocks"] and boxes["flags"]
+    assert boxes["flags"][0]["bbox"] is not None                    # the flag is placed on the image
+    # a human edit: one block's role corrected, sent back whole
+    lay["blocks"][0]["role"] = "heading"
+    r = client.put("/api/documents/web-book/pages/1/layout", json={"blocks": lay["blocks"]})
+    assert r.status_code == 200 and r.json()["blocks"][0]["source"] == "human"
+    assert pipeline.load_layout(root, pid).blocks[0].role == "heading"
+    assert client.put("/api/documents/web-book/pages/1/layout", json={"blocks": [{"bbox": "no"}]}).status_code == 400
+
+
+@needs_ocr
+def test_the_document_exports_as_one_json_object(client, root, store):
+    pid, _ = _seed(root, store)
+    (root.documents / "web-book" / "extracted").mkdir(exist_ok=True)
+    (root.documents / "web-book" / "extracted" / "cases.json").write_text('[{"_page": 1, "name": "x"}]')
+    d = client.get("/api/documents/web-book/export.json").json()
+    assert d["document"] == "web-book" and d["meta"]["title"] == "Web Book"
+    assert d["pages"][0]["id"] == pid and d["pages"][0]["layout"]["blocks"]
+    assert d["pages"][0]["body"] and d["pages"][0]["frontmatter"]["ocrmd"] == 1
+    assert d["extractions"] == {"cases": [{"_page": 1, "name": "x"}]}
+    assert client.get("/api/documents/nope/export.json").status_code == 404

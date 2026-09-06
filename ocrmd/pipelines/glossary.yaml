@@ -1,0 +1,31 @@
+# Every term the document defines, one row per term with the page it was defined on, then the same
+# term defined twice resolved into one.
+name: glossary
+
+operations:
+  - name: find_terms
+    type: map
+    prompt: |
+      Below is page {{ input.page_label }} of "{{ input.document_title }}". List every term the page
+      *defines* — a word or phrase followed by an explanation of what it means, in a glossary entry,
+      a bold lead-in, or a sentence of the form "X is …". Give the definition in the page's own words.
+      A term merely used is not defined. If the page defines nothing, return an empty list.
+
+      {{ input.text }}
+    output:
+      schema:
+        terms: "list[{term: string, definition: string}]"
+  - name: one_per_term
+    type: unnest
+    unnest_key: terms
+  - name: same_term
+    type: resolve
+    resolve_key: term
+    blocking_threshold: 0.8
+
+pipeline:
+  operations: [find_terms, one_per_term, same_term]
+  output:
+    type: csv
+    path: glossary.csv
+    fields: [term, definition, page_label, chapter]

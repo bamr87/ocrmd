@@ -1,0 +1,33 @@
+# Receipts and invoices: typed line items, one row per item, with the printed total kept beside the
+# sum of the items so an OCR slip in a digit shows up as arithmetic that does not add up.
+name: receipts
+
+operations:
+  - name: line_items
+    type: map
+    prompt: |
+      Below is a transcribed receipt or invoice (page {{ input.page_label }}). List every line item
+      with its quantity, unit price and line total exactly as printed — keep a doubtful reading inside
+      its ==[...]== brackets rather than correcting it. Then the printed subtotal, tax and total, or
+      null where the receipt prints none. Do not compute anything; copy what is printed.
+
+      {{ input.text }}
+    output:
+      schema:
+        merchant: string
+        date: string
+        currency: string
+        items: "list[{description: string, quantity: number, unit_price: number, line_total: number}]"
+        subtotal: number
+        tax: number
+        total: number
+  - name: one_per_item
+    type: unnest
+    unnest_key: items
+
+pipeline:
+  operations: [line_items, one_per_item]
+  output:
+    type: csv
+    path: receipts.csv
+    fields: [merchant, date, currency, description, quantity, unit_price, line_total, subtotal, tax, total, page_label]

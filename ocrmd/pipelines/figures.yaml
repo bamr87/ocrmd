@@ -1,0 +1,32 @@
+# Name every figure on every page: what kind of picture it is and what the page calls it, written back
+# onto the figure block in the page model (`layout/<pid>.json`) so the exporters can caption it.
+#
+#   ocrmd etl --doc X -p figures --dry-run     # the prompts, nothing sent
+#   ocrmd etl --doc X -p figures               # one call per figure; the crop is sent with it
+name: figures
+source: figures            # one row per figure block, with its crop, its detected caption and the page text
+
+operations:
+  - name: name_figure
+    type: map
+    image: true            # the model sees the crop itself; a caption cannot say what kind of chart it is
+    prompt: |
+      This is one picture cut out of page {{ input.page_label }} of "{{ input.document_title }}".
+      The page's own text is below; the caption the transcription found next to the picture, if any,
+      is: "{{ input.caption }}".
+
+      Say what kind of picture it is, and give its caption exactly as printed on the page — from the
+      caption already found or from the page text. If the page prints no caption, leave `caption`
+      empty: do not write one.
+
+      {{ input.text }}
+    output:
+      schema:
+        kind: "enum[photo, diagram, chart, table_image, equation, map, handwriting, other]"
+        caption: string
+
+pipeline:
+  operations: [name_figure]
+  output:
+    type: layout           # written onto the figure block: kind and caption
+    fields: {kind: kind, caption: caption}

@@ -61,9 +61,11 @@ class FakeProvider:
         self.markdown, self.page_number, self.legible, self.chapter, self.raise_exc = markdown, page_number, legible, chapter, raise_exc
         self.model = model
         self.calls: list[tuple[str, object]] = []
+        self.focus: list[object] = []          # the FocusViews (or None) each call received
 
-    def transcribe(self, image_bgr, ocr_hint, hint=None) -> LLMResult:
+    def transcribe(self, image_bgr, ocr_hint, hint=None, focus=None) -> LLMResult:
         self.calls.append((ocr_hint, hint))
+        self.focus.append(focus)
         if self.raise_exc:
             raise self.raise_exc
         md = self.markdown if self.markdown is not None else ocr_hint

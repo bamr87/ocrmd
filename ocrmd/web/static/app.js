@@ -238,14 +238,18 @@ function renderScan(s) {
   if (!$("#gate")) return;
   const g = s.running ? (s.gate || {}) : {};
   const gateEl = $("#gate");
-  const label = { hand: "HAND IN FRAME", "same page": "SAME PAGE" }[g.gate] || (g.gate || (s.running ? "…" : "idle")).toUpperCase();
+  const label = { hand: "HAND IN FRAME", "same page": "SAME PAGE", "page moved": "PAGE MOVING" }[g.gate]
+    || (g.gate || (s.running ? "…" : "idle")).toUpperCase();
   gateEl.textContent = label;
-  gateEl.className = `gate ${(g.gate || "").replace(" page", "")}`;
+  gateEl.className = `gate ${(g.gate || "").replace(" page", "").replace(" moved", "moved")}`;
   const px = $("#pxpage");
   if (g.page_px) { px.textContent = `${g.page_px}px/page`; px.className = `pxpage ${g.page_px >= (g.min_page_px || 900) ? "ok" : "low"}`; } else px.textContent = "";
   $("#occ").textContent = g.occlusion ? `${g.occlusion}${g.clipped?.length ? "  CUT OFF: " + g.clipped.join("+") : ""}` : "";
   $("#meters").innerHTML = s.running ? [
-    ["still", Math.min(1, (g.still || 0) / (g.stable_frames || 8)), `motion ${fmtNum(g.motion, 1)}`],
+    // the settle target grows after a page turn, so the bar is drawn against what this scene needs
+    [g.settling_from ? `settling after ${g.settling_from}` : "still",
+     Math.min(1, (g.still || 0) / (g.stable_frames || 8)),
+     g.settling_from ? `${g.still || 0}/${g.stable_frames || 8}` : `motion ${fmtNum(g.motion, 1)}`],
     ["new page", Math.min(1, (g.novelty || 0) / (g.novelty_threshold || 12)), `${g.novelty ?? ""}`],
     ["sharpness", Math.min(1, (g.sharp || 0) / ((g.floor || 60) * 3)), `${fmtNum(g.sharp, 0)} / floor ${fmtNum(g.floor, 0)}`],
   ].map(([n, v, d]) => `<div class="meter"><div class="row"><span>${n}</span><span class="right muted">${d}</span></div><div class="bar"><i style="width:${v * 100}%"></i></div></div>`).join("") : "";
@@ -253,7 +257,10 @@ function renderScan(s) {
   if (kv) kv.innerHTML = `
     <dt>Document</dt><dd><a href="#/doc/${esc(s.doc)}">${esc(s.doc)}</a></dd>
     <dt>Camera</dt><dd>${esc(s.camera?.name || "")} ${g.resolution ? `${g.resolution[0]}×${g.resolution[1]}` : ""}</dd>
-    <dt>Focus</dt><dd>${esc(g.focus || "")}${g.adjusting ? " (adjusting)" : ""}</dd>
+    <dt>Focus</dt><dd>${esc(g.focus || "")}${g.adjusting ? " (moving)" : ""}${
+      g.focus_note && !g.focus_note.startsWith("focus ok")
+        ? ` <span class="${g.focus_note.includes("soft") ? "err" : "warn"}">${esc(g.focus_note)}</span>`
+        : g.rig_best ? ` <span class="muted small">${Math.round(100 * (g.focus_ratio ?? 1))}% of this rig's best (${Math.round(g.rig_best)})</span>` : ""}</dd>
     <dt>View</dt><dd class="mono small">${esc(g.view || "")}</dd>
     <dt>Captured</dt><dd>${s.captured}</dd>
     <dt>Queue</dt><dd>${s.queued} ${s.degraded ? '<span class="err">LLM OFF (degraded)</span>' : ""}</dd>
@@ -279,13 +286,13 @@ async function docView(slug) {
   view.innerHTML = `
   <div class="row"><h1>${esc(d.title || slug)}</h1><span class="muted">${esc(slug)} · ${d.pages} pages</span><span class="right"></span>
     ${d.flagged ? `<a class="btn" href="#/review/${esc(slug)}">Review ${d.flagged} flagged</a>` : ""}
-    <button id="j-verify">Verify</button><button id="j-build">Build</button><button id="j-reprocess" class="danger">Reprocess</button>
+    <button id="j-verify">Verify</button><button id="j-build">Build</button><button id="j-rebuild" title="Rebuild every page from its Markdown and score it against the photograph">Rebuild</button><button id="j-reprocess" class="danger">Reprocess</button>
     ${d.document_md ? `<a class="btn" href="${d.document_md}" download>document.md</a>` : ""}
     <a class="btn" href="#/settings/${esc(slug)}">Metadata</a>
     <button id="j-delete-doc" class="danger" title="delete the whole document">Delete…</button></div>
   ${statusBar(d.counts)}
   <div class="row">${countChips(d.counts, docFilter, "setDocFilter")} ${docFilter ? '<span class="chip on" onclick="setDocFilter(null)">× all</span>' : ""}
-    <span class="right muted small">${d.duplicates ? d.duplicates + " duplicate capture(s) skipped · " : ""}${d.needs_reshoot.length ? `<span class="err">${d.needs_reshoot.length} to re-shoot</span>` : ""}</span></div>
+    <span class="right muted small">${d.duplicates ? d.duplicates + " duplicate capture(s) skipped · " : ""}${d.refused ? `<span class="warn">${d.refused} capture(s) refused as unreadable</span> · ` : ""}${d.needs_reshoot.length ? `<span class="err">${d.needs_reshoot.length} to re-shoot</span>` : ""}</span></div>
   <div class="grid side" style="margin-top:12px">
     <div>
     <div class="row small" id="bulkbar" style="margin-bottom:6px">
@@ -305,12 +312,15 @@ async function docView(slug) {
     </div>
     <div>
       <div class="dropzone" id="drop">Drop page images here (or click) to ingest into <b>${esc(slug)}</b><input type="file" id="files" multiple accept="image/*" style="display:none"></div>
+      <div class="panel" id="etl-panel" style="margin-top:12px"><h3 style="margin-top:0">Extract</h3><div id="etl" class="small muted">…</div></div>
       <div id="job-out" style="margin-top:12px"></div>
     </div>
   </div>`;
+  renderPipelines(slug, d);
   const run = (kind, options = {}) => runJob(kind, slug, options, $("#job-out"));
   $("#j-verify").onclick = () => run("verify");
   $("#j-build").onclick = () => run("build");
+  $("#j-rebuild").onclick = () => run("reconstruct");
   $("#j-reprocess").onclick = () => confirm(`Reprocess '${slug}': every page is rebuilt from raw and cached OCR/LLM results are discarded (the LLM pass re-runs and costs tokens). Continue?`) && run("reprocess");
   const selected = () => [...view.querySelectorAll(".sel:checked")].map((c) => Number(c.value));
   const syncSel = () => { const n = selected().length; $("#del-sel").disabled = !n; $("#sel-count").textContent = n ? `${n} selected` : ""; };
@@ -326,6 +336,43 @@ async function docView(slug) {
   drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); upload(slug, e.dataTransfer.files, $("#job-out")); };
 }
 window.setDocFilter = (s) => { docFilter = s; route(); };
+/* ---------- extraction pipelines (see ocrmd/etl.py) ---------- */
+async function renderPipelines(slug, d) {
+  const box = $("#etl"); if (!box) return;
+  let list = [];
+  try { list = await api(`/api/documents/${encodeURIComponent(slug)}/pipelines`); } catch { /* offline */ }
+  const files = (d.extracted || []).map((f) =>
+    `<a href="/api/documents/${encodeURIComponent(slug)}/extracted/${encodeURIComponent(f)}" download>${esc(f)}</a>`).join(" · ");
+  if (!list.length) {
+    box.innerHTML = `<div class="muted small">No extraction pipelines. Put one in
+      <span class="mono">documents/${esc(slug)}/etl/*.yaml</span> (see <span class="mono">examples/cases.pipeline.yaml</span>).</div>
+      ${files ? `<div class="small" style="margin-top:6px">Extracted: ${files}</div>` : ""}`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="row small">
+      <select id="etl-pick">${list.map((p) => `<option value="${esc(p.file)}" ${p.error ? "disabled" : ""}>${esc(p.name)}${p.error ? " (broken)" : ""}</option>`).join("")}</select>
+      <button class="small" id="etl-dry" title="show what it would ask, spend nothing">Dry run</button>
+      <button class="small primary" id="etl-run">Extract</button>
+      <label class="muted" style="margin:0">first <input id="etl-limit" type="number" min="1" style="width:70px" placeholder="all"> page(s)</label>
+    </div>
+    <div class="muted small" id="etl-desc"></div>
+    ${files ? `<div class="small" style="margin-top:6px">Extracted: ${files}</div>` : ""}`;
+  const describe = () => {
+    const p = list.find((x) => x.file === $("#etl-pick").value) || {};
+    $("#etl-desc").innerHTML = p.error
+      ? `<span class="err">${esc(p.error)}</span>`
+      : `${(p.steps || []).map(esc).join(" → ")} · <span class="${(p.llm_steps || []).length ? "warn" : "muted"}">${(p.llm_steps || []).length} operator(s) cost tokens</span>`;
+  };
+  $("#etl-pick").onchange = describe; describe();
+  const go = (dry) => runJob("etl", slug, {
+    pipeline: $("#etl-pick").value, dry_run: dry,
+    limit: Number($("#etl-limit").value) || null,
+  }, $("#job-out"));
+  $("#etl-dry").onclick = () => go(true);
+  $("#etl-run").onclick = () => go(false);
+}
+
 async function upload(slug, fileList, out) {
   if (!fileList.length) return;
   const fd = new FormData();
@@ -382,7 +429,8 @@ async function deleteDocument(slug, pages) {
 }
 
 /* ---------- page ---------- */
-let pageTab = "edit", imgKind = "processed", imgZoom = 1, reviewMode = false;
+let pageTab = "edit", imgKind = "flat", imgZoom = 1, reviewMode = false;
+let sel = null, selPage = null, readout = null;   // the dragged rectangle, whose page, and what it read
 async function pageView(slug, seq) {
   const p = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`);
   const fm = p.frontmatter || {}, v = fm.verification || {}, ctx = fm.context || {}, proc = fm.processing || {};
@@ -404,10 +452,11 @@ async function pageView(slug, seq) {
   <div class="grid page">
     <div>
       <div class="row small" style="margin-bottom:6px">
-        ${kinds.map((k) => `<span class="chip ${k === imgKind ? "on" : ""}" onclick="setImg('${k}')">${k}</span>`).join("")}
-        <span class="right"></span><button class="small" onclick="zoomImg(-0.25)">−</button><span class="mono">${Math.round(imgZoom * 100)}%</span><button class="small" onclick="zoomImg(0.25)">+</button><button class="small" onclick="zoomImg(0)">fit</button>
+        ${kinds.map((k) => `<span class="chip ${k === imgKind ? "on" : ""}" onclick="setImg('${k}')" title="${IMG_HELP[k] || ""}">${k}</span>`).join("")}
+        <span class="right"></span><button class="small" onclick="zoomImg(-0.25)">−</button><span class="mono" id="zoomlbl">${Math.round(imgZoom * 100)}%</span><button class="small" onclick="zoomImg(0.25)">+</button><button class="small" onclick="zoomImg(0)">fit</button>
       </div>
-      <div class="imgbox"><img id="pimg" src="${p.images[imgKind] || ""}" style="width:${imgZoom * 100}%"></div>
+      <div class="imgbox" id="imgbox"><div class="imgwrap" id="imgwrap" style="width:${imgZoom * 100}%"><img id="pimg" src="${p.images[imgKind] || ""}"><div class="selrect" id="selrect" hidden></div></div></div>
+      <div id="selbar" class="selbar small"></div>
       ${p.advice ? `<div class="warn small" style="margin-top:6px">${esc(p.advice)}</div>` : ""}
       ${proc.continuity ? `<div class="warn small">${esc(proc.continuity)}</div>` : ""}
       ${p.llm_error ? `<div class="err small">LLM: ${esc(p.llm_error)}</div>` : ""}
@@ -418,6 +467,7 @@ async function pageView(slug, seq) {
       <div id="tab"></div>
     </div>
   </div>`;
+  attachSelect(slug, seq);
   const tab = $("#tab");
   if (pageTab === "edit") {
     tab.innerHTML = `
@@ -461,6 +511,7 @@ async function pageView(slug, seq) {
         <dt>captured</dt><dd>${esc(fm.captured_at || "")} via ${esc(fm.source?.type || "")} ${esc(fm.source?.device || "")}</dd>
         <dt>processing</dt><dd>${esc(proc.pipeline || "")} · orientation ${proc.orientation ?? ""}° · deskew ${proc.deskew ?? ""}° · blur ${proc.blur ?? ""} · ${proc.page_width_px ?? ""}px${proc.clipped_edges?.length ? " · clipped " + proc.clipped_edges.join("+") : ""}</dd>
         <dt>ocr</dt><dd>${esc(fm.ocr?.engine || "")} conf ${fmtNum(fm.ocr?.confidence)}${fm.ocr?.agreement != null ? ` · engines agree ${fmtNum(fm.ocr.agreement)}` : ""}</dd>
+        ${fm.ocr?.focus ? `<dt>focus</dt><dd>${fm.ocr.focus.variants} bracketed exposure(s) · ${fm.ocr.focus.improved} line(s) improved · ${fm.ocr.focus.filled} filled · ${fm.ocr.focus.unresolved} unresolved</dd>` : ""}
         <dt>llm</dt><dd>${fm.llm ? `${esc(fm.llm.provider)}/${esc(fm.llm.model)} ${esc(fm.llm.prompt)} · tokens ${fm.llm.tokens?.in ?? "?"}→${fm.llm.tokens?.out ?? "?"} · <span class="mono">${esc(fm.llm.request_id || "")}</span>` : "none"}</dd>
         <dt>id</dt><dd class="mono">${esc(p.id)}</dd>
         <dt>file</dt><dd class="mono">documents/${esc(slug)}/pages/${String(seq).padStart(4, "0")}.md</dd>
@@ -500,7 +551,132 @@ async function pageView(slug, seq) {
 window.go = (slug, seq) => { location.hash = `#/doc/${slug}/page/${seq}${reviewMode ? "?review=1" : ""}`; };
 window.setTab = (t) => { pageTab = t; route(); };
 window.setImg = (k) => { imgKind = k; route(); };
-window.zoomImg = (d) => { imgZoom = d === 0 ? 1 : Math.max(0.25, Math.min(4, imgZoom + d)); const img = $("#pimg"); if (img) img.style.width = `${imgZoom * 100}%`; view.querySelector(".mono").textContent = `${Math.round(imgZoom * 100)}%`; };
+window.zoomImg = (d) => {
+  imgZoom = d === 0 ? 1 : Math.max(0.25, Math.min(4, imgZoom + d));
+  const wrap = $("#imgwrap"); if (wrap) wrap.style.width = `${imgZoom * 100}%`;
+  const lbl = $("#zoomlbl"); if (lbl) lbl.textContent = `${Math.round(imgZoom * 100)}%`;
+};
+
+/* ---------- selecting a region of the page ---------- */
+const IMG_HELP = {
+  flat: "flattened and enhanced for reading — illumination divided out, ink and paper stretched apart",
+  processed: "the cropped, rotated page as the LLM sees it",
+  bin: "adaptive threshold; what older OCR engines were given",
+  raw: "the untouched camera frame",
+};
+
+function pct(x) { return `${(x * 100).toFixed(1)}%`; }
+
+function drawSel() {
+  const box = $("#selrect"); if (!box) return;
+  if (!sel) { box.hidden = true; return; }
+  box.hidden = false;
+  Object.assign(box.style, { left: pct(sel.x), top: pct(sel.y), width: pct(sel.w), height: pct(sel.h) });
+}
+
+/* The rectangle is kept in page fractions, not pixels: it has to survive zooming, switching between
+   the flat and processed views, and the re-render that follows every read. */
+function attachSelect(slug, seq) {
+  const wrap = $("#imgwrap"); if (!wrap) return;
+  if (selPage !== `${slug}/${seq}`) { sel = null; readout = null; selPage = `${slug}/${seq}`; }
+  drawSel(); renderSelbar(slug, seq);
+  if (imgKind === "raw") return;                 // the raw frame is not in page coordinates
+  wrap.classList.add("selectable");
+  let start = null;
+  wrap.onpointerdown = (e) => {
+    if (e.button !== 0) return;
+    const r = wrap.getBoundingClientRect();
+    start = { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+    wrap.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  wrap.onpointermove = (e) => {
+    if (!start) return;
+    const r = wrap.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    sel = { x: Math.min(start.x, x), y: Math.min(start.y, y), w: Math.abs(x - start.x), h: Math.abs(y - start.y) };
+    drawSel();
+  };
+  wrap.onpointerup = () => {
+    start = null;
+    if (sel && sel.w * sel.h < 0.0004) sel = null;    // a stray click, not a request
+    drawSel(); renderSelbar(slug, seq);
+  };
+}
+
+function renderSelbar(slug, seq) {
+  const bar = $("#selbar"); if (!bar) return;
+  if (!sel) {
+    bar.innerHTML = imgKind === "raw"
+      ? '<span class="muted">Switch to the flat or processed view to select a region.</span>'
+      : '<span class="muted">Drag a box on the page to read that region on its own.</span>';
+    return;
+  }
+  bar.innerHTML = `
+    <div class="row">
+      <span class="mono">${pct(sel.w)}×${pct(sel.h)} at ${pct(sel.x)},${pct(sel.y)}</span>
+      <button class="small primary" id="r-ocr">Read region</button>
+      <button class="small" id="r-llm" title="sends this one crop to the model; costs tokens">Ask the model</button>
+      <input id="r-ask" class="small" placeholder="ask something about it…" style="flex:1;min-width:140px">
+      <button class="small" id="r-clear">clear</button>
+    </div>
+    <div id="readout"></div>`;
+  $("#r-clear").onclick = () => { sel = null; readout = null; drawSel(); renderSelbar(slug, seq); };
+  $("#r-ocr").onclick = () => readRegion(slug, seq, false);
+  $("#r-llm").onclick = () => readRegion(slug, seq, true);
+  $("#r-ask").onkeydown = (e) => { if (e.key === "Enter") readRegion(slug, seq, true); };
+  renderReadout(slug, seq);
+}
+
+async function readRegion(slug, seq, withLlm) {
+  if (!sel) return;
+  const question = ($("#r-ask")?.value || "").trim() || null;
+  const out = $("#readout");
+  out.innerHTML = `<div class="muted small" style="margin-top:8px">reading${withLlm ? " and asking the model" : ""}…</div>`;
+  try {
+    readout = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/region`, {
+      method: "POST", body: { ...sel, llm: withLlm, question },
+    });
+    renderReadout(slug, seq);
+  } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+}
+
+function renderReadout(slug, seq) {
+  const out = $("#readout"); if (!out) return;
+  if (!readout) { out.innerHTML = ""; return; }
+  const r = readout;
+  out.innerHTML = `
+    <div class="readout">
+      <img src="${esc(r.image)}" alt="the crop as it was read">
+      <div class="row small muted">${r.size[0]}×${r.size[1]}px enlarged ${r.scale}× · ${esc(r.engine || "no OCR engine")}${r.text ? ` · conf ${fmtNum(r.confidence)}` : ""}</div>
+      <label>local OCR</label>
+      <pre class="mono" id="r-text">${esc(r.text) || '<span class="muted">nothing read</span>'}</pre>
+      ${r.llm ? `<label>model</label><pre class="mono" id="r-llmtext">${esc(r.llm)}</pre>` : ""}
+      ${r.llm_error ? `<div class="err small">${esc(r.llm_error)}</div>` : ""}
+      <div class="row">
+        <button class="small" data-copy="text">Copy OCR</button>
+        ${r.llm ? '<button class="small" data-copy="llm">Copy model</button>' : ""}
+        <button class="small" data-insert="${r.llm ? "llm" : "text"}">Insert into body</button>
+      </div>
+    </div>`;
+  out.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => {
+    navigator.clipboard.writeText(b.dataset.copy === "llm" ? r.llm : r.text).then(() => toast("copied", "ok"));
+  }));
+  const ins = out.querySelector("[data-insert]");
+  if (ins) ins.onclick = () => insertIntoBody(ins.dataset.insert === "llm" ? r.llm : r.text);
+}
+
+/* Inserted at the cursor, and only into the editor: a region read is one unreconciled reading, so it
+   is a suggestion for the person looking at the crop, never something the pipeline writes by itself. */
+function insertIntoBody(text) {
+  const ta = $("#body");
+  if (!ta) { toast("open the edit tab to insert", "err"); return; }
+  const at = ta.selectionStart ?? ta.value.length;
+  ta.value = ta.value.slice(0, at) + text + ta.value.slice(ta.selectionEnd ?? at);
+  ta.focus(); ta.selectionStart = ta.selectionEnd = at + text.length;
+  toast("inserted — remember to save", "ok");
+}
 window.resolveFlag = async (slug, seq, n, chosen) => {
   try { await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/resolve`, { method: "POST", body: { n, chosen } }); route(); } catch (e) { toast(e.message, "err"); }
 };
@@ -531,7 +707,7 @@ async function jobsView() {
     </div>
     <div class="panel">
       <h3 style="margin-top:0">Run</h3>
-      <label>Kind</label><select id="k" style="width:100%"><option>verify</option><option>build</option><option>reprocess</option></select>
+      <label>Kind</label><select id="k" style="width:100%"><option>verify</option><option>build</option><option>reconstruct</option><option>reprocess</option></select>
       <label>Document</label><select id="d" style="width:100%"><option value="">all</option>${docs.map((x) => `<option>${esc(x.slug)}</option>`).join("")}</select>
       <label><input type="checkbox" id="o-flag"> flagged only (verify)</label>
       <label><input type="checkbox" id="o-refresh"> refresh: re-run pages made by an older prompt/model — costs tokens</label>

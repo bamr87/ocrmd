@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS llm_calls(
 CREATE TABLE IF NOT EXISTS batches(
   id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, prompt_version TEXT NOT NULL,
   page_ids TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, ended_at TEXT);
+CREATE TABLE IF NOT EXISTS exports(
+  page_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, fidelity REAL, backend TEXT,
+  at TEXT NOT NULL, PRIMARY KEY(page_id, kind));
+CREATE TABLE IF NOT EXISTS etl_writes(
+  id INTEGER PRIMARY KEY, document TEXT NOT NULL, page_id TEXT, pipeline TEXT NOT NULL, operation TEXT,
+  target TEXT NOT NULL, keys TEXT NOT NULL, at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS pages_doc_seq ON pages(document, sequence);
 CREATE INDEX IF NOT EXISTS pages_status ON pages(document, status);
 CREATE INDEX IF NOT EXISTS captures_page ON captures(page_id);
@@ -45,8 +51,12 @@ COLUMNS: dict[str, dict[str, str]] = {
         "written_fingerprint": "TEXT",    # hash of the human-editable parts as last written by the pipeline
         "reviewed_by": "TEXT",
         "reviewed_at": "TEXT",
+        "fidelity": "REAL",               # how closely the last facsimile export matched the crop (0-1)
     },
     "documents": {"title": "TEXT"},
+    # A rejected capture has no page, so without its own `document` column there is nothing tying it
+    # to the scan it came from — `source` records the camera, not the book.
+    "captures": {"rejected": "TEXT", "document": "TEXT"},
 }
 
 STATUSES = ("verified", "flagged", "suspect", "illegible", "blank", "unverified", "reviewed", "error")
@@ -129,10 +139,36 @@ class Store:
         return [r for d, r in sorted(rows, key=lambda x: x[0]) if d <= max_dist]
 
     @_locked
-    def add_capture(self, sha256, phash, page_id, duplicate_of, source) -> None:
-        self.db.execute("INSERT OR IGNORE INTO captures VALUES(?,?,?,?,?,?)",
-                        (sha256, phash, page_id, duplicate_of, now(), source))
+    def add_capture(self, sha256, phash, page_id, duplicate_of, source, rejected: str | None = None,
+                    document: str | None = None) -> None:
+        # Named columns, not positional: `captures` gains columns by migration, and `VALUES(?,?,?...)`
+        # silently binds to the wrong ones the first time it does.
+        self.db.execute("INSERT OR IGNORE INTO captures(sha256, phash, page_id, duplicate_of, captured_at, "
+                        "source, rejected, document) VALUES(?,?,?,?,?,?,?,?)",
+                        (sha256, phash, page_id, duplicate_of, now(), source, rejected, document))
         self.db.commit()
+
+    @_locked
+    def clear_rejection(self, sha256: str) -> None:
+        """Forget that a frame was refused, so a deliberate re-ingest of it can make a page. Without
+        this the refusal row itself reads as an exact duplicate and the override silently does nothing."""
+        self.db.execute("DELETE FROM captures WHERE sha256=? AND rejected IS NOT NULL AND page_id IS NULL",
+                        (sha256,))
+        self.db.commit()
+
+    @_locked
+    def rejected_captures(self, slug: str | None = None) -> list[sqlite3.Row]:
+        """Frames refused as unreadable: kept on disk, never made into pages.
+
+        `page_id IS NULL` matters — half of a spread can be refused while the other half becomes a
+        page, and that capture is not one the operator has to re-shoot.
+        """
+        q = ("SELECT sha256, captured_at, source, rejected, document FROM captures "
+             "WHERE rejected IS NOT NULL AND page_id IS NULL")
+        args: tuple = ()
+        if slug:
+            q, args = q + " AND document=?", (slug,)
+        return self.db.execute(q + " ORDER BY captured_at", args).fetchall()
 
     @_locked
     def capture_source(self, sha256: str) -> str | None:
@@ -272,6 +308,42 @@ class Store:
         r = self.db.execute("SELECT error FROM stages WHERE page_id=? AND stage=? AND completed_at IS NULL",
                             (page_id, stage)).fetchone()
         return r["error"] if r else None
+
+    # exports ---------------------------------------------------------------
+    @_locked
+    def add_export(self, page_id: str, kind: str, path: str, fidelity: float | None = None,
+                   backend: str | None = None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO exports VALUES(?,?,?,?,?,?)",
+                        (page_id, kind, path, fidelity, backend, now()))
+        if fidelity is not None:
+            self.db.execute("UPDATE pages SET fidelity=? WHERE id=?", (fidelity, page_id))
+        self.db.commit()
+
+    @_locked
+    def exports(self, page_id: str | None = None, slug: str | None = None) -> list[sqlite3.Row]:
+        if page_id:
+            return self.db.execute("SELECT * FROM exports WHERE page_id=? ORDER BY kind", (page_id,)).fetchall()
+        if slug:
+            return self.db.execute("SELECT e.*, p.sequence FROM exports e JOIN pages p ON p.id=e.page_id "
+                                   "WHERE p.document=? ORDER BY p.sequence, e.kind", (slug,)).fetchall()
+        return self.db.execute("SELECT * FROM exports ORDER BY at").fetchall()
+
+    # extraction write-backs ------------------------------------------------
+    @_locked
+    def log_etl_write(self, document: str, page_id: str | None, pipeline: str, operation: str | None,
+                      target: str, keys: list[str]) -> None:
+        """Every field an extraction pipeline wrote back into a page, a layout or document.yaml — so
+        an enrichment can be found, questioned and undone, like any other write path's output."""
+        self.db.execute("INSERT INTO etl_writes(document,page_id,pipeline,operation,target,keys,at) VALUES(?,?,?,?,?,?,?)",
+                        (document, page_id, pipeline, operation, target, ",".join(keys), now()))
+        self.db.commit()
+
+    @_locked
+    def etl_writes(self, document: str, page_id: str | None = None) -> list[sqlite3.Row]:
+        q, args = "SELECT * FROM etl_writes WHERE document=?", [document]
+        if page_id:
+            q += " AND page_id=?"; args.append(page_id)
+        return self.db.execute(q + " ORDER BY at DESC, id DESC", args).fetchall()
 
     # llm accounting ------------------------------------------------------
     @_locked

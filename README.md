@@ -48,6 +48,8 @@ ocrmd reprocess --doc lsat                     # re-derive pages after upgrading
 ocrmd delete --doc lsat --page 12 --page 13    # remove pages (+ their raw capture if nothing else uses it)
 ocrmd delete --doc live-test --all             # remove a whole document (asks first; -y skips)
 ocrmd build                                    # regenerate document .md + TOC + nav links
+ocrmd read --doc lsat --page 12 --region 0.1,0.42,0.6,0.05   # re-read one region of a page, harder
+ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --dry-run   # extract structured data (see below)
 ocrmd ocr-bench --doc lsat --compare           # score every installed OCR engine (and pair) against the LLM transcriptions
 ocrmd doctor --costs
 ocrmd --debug verify                           # full tracebacks and debug logs
@@ -67,9 +69,9 @@ Everything above, in a browser, plus what a terminal cannot show:
 px/page, and buttons/keys for capture, focus lock/auto, rotate, zoom, pan. Pick the document, camera, focus mode, OCR-only, optional duration/page limit. Event log and queue state update live.
 - **Documents** — status bars, page table filterable by status (label, width, agreement, overlap,
 advice, continuity, LLM errors), drag-and-drop image ingest, Verify/Build/Reprocess buttons, download of the built `document.md`. Select pages to **delete** them (optionally both halves of a spread); **Delete…** removes the whole document after you type its slug.
-- **Page** — the page image (processed / raw spread / binarised, zoomable) beside the transcription.
-*Edit* tab: each disagreement with one-click **OCR / LLM / type your own**, editable Markdown body. *Preview* tab: rendered Markdown with the `==[…]==` marks highlighted. *Meta* tab: printed page label, chapter/section/running head/tags, verification numbers, model notes, provenance. **Sign off** marks a page `reviewed` (body frozen); **Reopen** undoes it; **Delete…** removes the page (and offers to take its spread partner with it). Keys: `n`/`p` next/previous, `N` next flagged. Review mode (`Review N flagged` on a document) advances to the next flagged page after each sign-off.
-- **Jobs** — verify / build / reprocess with options, live log, progress, cancel.
+- **Page** — the page image beside the transcription, in four views: **flat** (the default — the crop
+flattened and contrast-stretched, the page as a flatbed scanner would have delivered it), **processed** (the crop the model sees), **bin** (the adaptive threshold older engines are given) and **raw** (the untouched frame). Zoomable, and **drag a box on it to read that region on its own** — the selection is cut out, enlarged on its own terms and re-read by the local engines, with an **Ask the model** button for the ones they still cannot get. The result comes back beside its crop, to copy or to insert at the cursor in the editor; nothing is written to the page until you save. *Edit* tab: each disagreement with one-click **OCR / LLM / type your own**, editable Markdown body. *Preview* tab: rendered Markdown with the `==[…]==` marks highlighted. *Meta* tab: printed page label, chapter/section/running head/tags, verification numbers, model notes, provenance. **Sign off** marks a page `reviewed` (body frozen); **Reopen** undoes it; **Delete…** removes the page (and offers to take its spread partner with it). Keys: `n`/`p` next/previous, `N` next flagged. Review mode (`Review N flagged` on a document) advances to the next flagged page after each sign-off.
+- **Jobs** — verify / build / reprocess / rebuild / extract with options, live log, progress, cancel.
 - **Settings** — `document.yaml` editor per document, effective settings, full doctor report.
 
 Edits made in the UI are human edits: they survive later `verify` runs exactly like edits made to the files. The server binds to `127.0.0.1` and has no authentication — keep it that way (`--host` exists for a trusted LAN only). The API is documented at `/api/docs`.
@@ -77,6 +79,44 @@ Edits made in the UI are human edits: they survive later `verify` runs exactly l
 A scan writes an OCR-only page file the moment a capture is processed and upgrades it in place when the model answers, so `documents/<slug>/pages/` is always usable, even mid-session. Quitting drains the queue; pressing Ctrl-C a second time leaves the remainder for `ocrmd verify`.
 
 `reprocess` exists because a page's id is the hash of its *processed* image: when preprocessing improves (better cropping, rotation, spread splitting) the pages themselves change. It re-derives every page from the untouched raw captures and discards the stale OCR/LLM results, which means the LLM pass runs again and costs tokens. Raw captures are never modified.
+
+## Extracting structured data from a scanned book
+
+Once a book is transcribed it is a corpus, and the next question is usually *what is in it* — every case this chapter cites, every dose in the table, every term the glossary defines. `ocrmd etl` runs a declarative pipeline over a document's pages, with the operator model of [DocETL](https://github.com/ucbepic/docetl) (UC Berkeley EPIC lab, MIT):
+
+| operator | what it does | costs tokens |
+|---|---|---|
+| `map` | one prompt per page, its answer merged into the row | yes |
+| `filter` | keep the rows a prompt says to keep | yes |
+| `extract` | a map that must answer in the page's own words | yes |
+| `reduce` | group rows by a field and fold each group with one prompt | yes |
+| `resolve` | canonicalise a field across rows (the same case spelled three ways) | only for pairs that pass fuzzy blocking |
+| `split` / `unnest` / `sample` | chunk long pages, flatten a list into rows, take the first N | no |
+
+```sh
+ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --dry-run   # see the prompts, spend nothing
+ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --limit 5   # try it on five pages
+ocrmd etl --doc lsat -p examples/cases.pipeline.yaml             # -> documents/lsat/extracted/cases.csv
+```
+
+Output is JSON, CSV or a Markdown table; `output: {fields: [...]}` narrows the columns (the provenance ones are always written). The web UI has the same thing: put a spec in `documents/<slug>/etl/*.yaml` (or `<root>/etl/pipelines/`) and an **Extract** panel appears on the document page, with a dry run, a live log and the result to download. [examples/cases.pipeline.yaml](examples/cases.pipeline.yaml) is a worked example.
+
+Three things are ocrmd's rather than DocETL's, and they are why this is built in rather than bolted on:
+
+- **Every row carries the page it came from** (`_page`, `_page_id`, `_document`; `_pages` after a
+  reduce), so an extracted claim can be taken back to the photograph it was read from.
+- **Nothing is inferred.** The operators run under the same refusal as the transcription stage: use
+  what the page says, leave the field empty when it does not say it.
+- **Answers are cached per operator and versioned by the prompt**, so editing one operator re-runs one
+  operator and re-running an unchanged pipeline costs nothing — the same bargain as `verify`.
+
+The implementation is ocrmd's own (six operators over its existing provider, no new dependencies). To use DocETL itself — for its optimizer, which rewrites pipelines — export the same spec:
+
+```sh
+pip install 'ocrmd[docetl]'
+ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --export-docetl out/
+docetl run out/pipeline.yaml
+```
 
 ## Setting up the rig (textbook under a fixed webcam)
 
@@ -87,11 +127,13 @@ turns green (≥900 px across one page). A C525 framing a whole two-page spread 
 2. **Dark, matte surface** under the book. Page detection keys on paper being brighter than what
    surrounds it. A pale wooden desk works but a black mat works better.
 3. **Even light from the side**, no lamp in the frame. Glare and a bright-lit hand both look like paper.
-4. **Run with `--focus settle`** (or `focus = "settle"` in `ocrmd.toml`): continuous autofocus until
+4. **Watch the focus line in the HUD.** ocrmd judges focus from the picture, not from the camera:
+webcams routinely report `continuous` while the lens sits somewhere useless (measured on the C525 this was built on: the same book at sharpness 18 and then 1030 minutes apart, with the driver claiming continuous autofocus throughout). It remembers what your rig has actually managed, warns when a page is far below that, and refocuses the camera itself. If it says it has given up, the lens is not the problem — check the distance, the light, and whether something is between the camera and the page.
+5. **Run with `--focus settle`** (or `focus = "settle"` in `ocrmd.toml`): continuous autofocus until
    the first capture, then locked, so the lens stops hunting every time a hand comes in.
-5. **Start the scan with your hands out of the frame, then turn pages and get your hand out.** The
+6. **Start the scan with your hands out of the frame, then turn pages and get your hand out.** The
 hand gate learns what "paper" looks like from the first frames it sees; a hand that is already there at start is part of the baseline and the first capture will include it (the gate corrects itself as soon as the hand leaves). After that the shutter waits while a hand covers the page (`HAND IN FRAME` in the window). A paperback that will not stay open wants a sheet of glass or a couple of weights on the margins — a hand holding it open blocks the shutter by design.
-6. Watch the **advice line**: `page runs past the top edge — text is being cut off` and
+7. Watch the **advice line**: `page runs past the top edge — text is being cut off` and
    `printed page jumped 37 → 41` are both things to fix *now*, not at review time.
 
 ## The scan window
@@ -103,7 +145,7 @@ hand gate learns what "paper" looks like from the first frames it sees; a hand t
   | State | Meaning |
   |---|---|
   | `MOVING` | frame-to-frame motion above threshold (a page turning, a hand moving) |
-  | `FOCUSING` | the lens is hunting |
+  | `FOCUSING` | page sharpness is still moving: the lens has not settled |
   | `HAND IN FRAME` | paper that was visible a moment ago is covered (hand, pen, curled page) |
   | `SAME PAGE` | looks like the last capture — turn the page |
   | `BLURRY` | sharpness below the floor (absolute, and relative to the best this rig has produced) |
@@ -111,8 +153,8 @@ hand gate learns what "paper" looks like from the first frames it sees; a hand t
 
 - **The detected page outline** drawn on the frame, and **px/page** in green once it clears the threshold.
   Frame edges that cut through text are marked in red.
-- **Camera state**: resolution, focus mode, `*` while the lens is hunting, and the hand gate's
-  numbers (`cover=` how much reference paper is hidden, `skin=` how skin-toned the hidden part is).
+- **Camera state**: resolution, focus mode, `*` while page sharpness is still moving, a warning when
+the page is soft for this rig, and the hand gate's numbers (`cover=` how much reference paper is hidden, `skin=` how skin-toned the hidden part is).
 - **A work panel**: what is being processed right now (`page 0003: llm`), how many captures are
 queued, `LLM OFF` if the service has been given up on for this session, and the status of recent pages colour-coded by verification result.
 - **Advice and errors** along the bottom. A white flash confirms each capture.
@@ -131,6 +173,41 @@ queued, `LLM OFF` if the service has been given up on for this session, and the 
 | `space` / `q` | force capture (bypasses every gate, hand included) / quit |
 
 The view is saved per camera name in `.ocrmd-camera.json` and reapplied next time; `--rotate 180 --zoom 2` set it from the CLI. The same transform is applied to captured frames, so what you see is what gets OCR'd. Zoom is a crop of the sensor frame, so it improves framing and page detection but not pixel density.
+
+## Rebuilding the page from the Markdown
+
+`ocrmd reconstruct --doc mybook` turns each page's Markdown back into a page and scores it against the photograph it came from:
+
+```
+  0129: 1 figure(s) (0 vector), fidelity 0.45 via inkscape
+132 page(s) rebuilt into reconstructed; mean fidelity 0.29
+```
+
+Three files per page. **`.tex`** is the portable master — absolutely positioned at the page's true size, so it is a facsimile rather than a reflow, and it compiles wherever a TeX distribution exists (`--pdf` compiles it if one is installed). **`.svg`** is the same layout with no TeX needed, which is what makes the round trip work on a machine that has none; it renders through Inkscape, `rsvg-convert` or headless Chrome. **`.png`** is that rendering, for looking at side by side with `processed/<id>.png`.
+
+Figures are traced to SVG paths where that measurably worked: a line drawing is traced, the trace is rasterised and compared with the crop it came from, and anything that does not reproduce it falls back to the embedded image. Photographs are never traced.
+
+**The number is the point.** A page that rebuilds badly is a page the transcription lost something on — a heading flattened into body text, a table turned into prose, a figure nobody mentioned. `--review` sends both images to the model and asks what it got wrong, because the score says how much differs, not what.
+
+## Writing on the paper
+
+`ocrmd annotate --doc mybook` puts the camera back on pages you have already scanned. Underline a phrase, run a highlighter over a sentence, write a note in the margin — the page is recognised, the new marks are diffed against the stored crop, and the Markdown is updated:
+
+```
+page 0042: highlight (yellow): a universal look that is beautiful; underline: Helen of Troy  [0 llm call(s)]
+page 0043: note: check this against the 1960 debates  [1 llm call(s)]
+```
+
+| on the paper | in the Markdown |
+|---|---|
+| highlighter | `==the marked words==` |
+| underline | `**the marked words**` |
+| line through the text | `~~the marked words~~` |
+| handwriting | a bullet under `## Notes` |
+
+**Nothing is re-read unless something changed.** The page has already been transcribed and every line's position is on disk, so an underline or a highlight is resolved by geometry alone and costs nothing at all. Only handwriting reaches the model, because it is the one thing on the page that was never transcribed. A page nobody has written on costs one image subtraction.
+
+Marks already in the file are left alone, so the camera can rest on a page without wrapping it again and again, and `--dry-run` reports what it would do without writing. What you write on the paper counts as a human edit and survives the next `verify`.
 
 ## Output
 
@@ -202,13 +279,43 @@ page 0001 -> 0001.md  [suspect agreement=0.22 overlap=0.33]
     page is only 521px wide; body text needs ~900px+ — move the camera closer or fill the frame with one page
 ```
 
-- Orientation is detected automatically and upside-down books are fine (see below).
+- Orientation is detected automatically and upside-down books are usually fine — but see the warning
+  under *How orientation is decided*: on this corpus the cascade is measurably weak.
 - Page detection keys on the page being brighter than what surrounds it — a dark desk or mat helps.
 - Uneven light across a spread hurts the far page more than anything else.
 - ocrmd opens the camera's largest mode. Modes above the sensor size (the C525 advertises 1920x1080
 over a 1280x960 sensor) were assumed to add nothing; measured on a real page, the opposite holds: **146 correctly-read words at 1920x1080 against 98 at 1280x960**. Override with `--resolution 1280x960`.
 - Webcams often power up with focus *locked* at lens position 0 — every frame blurry. `scan` sets
 continuous autofocus (and auto-exposure) through AVFoundation before opening the stream, because OpenCV reports `-1` for every camera property on macOS and ignores writes ([camctl.py](ocrmd/camctl.py)).
+
+### Focus bracketing
+
+Autofocus optimises one number over the whole frame, and on a book that number is dominated by whatever has the most contrast — a page edge, a gutter shadow, the flatter of two leaves. A page that does not lie flat can be sharp at the bottom and soft at the top in the very frame the shutter judged best.
+
+So when a capture is not the sharpest the scene has shown, ocrmd re-shoots it at several lens positions (`focus_bracket = "auto"`, ±0.05 either side, 3 shots) and keeps the losers as **variants** beside the raw capture. Each variant is cropped exactly as the page was, read with the same engines, and its readings are matched to the page's line by line: a line another focus read confidently replaces one the page read badly, and a line the capture missed entirely is filled in. Whatever no focus could read stays in the page at its own low confidence *and* goes to the model — the extra exposures are attached to the LLM request along with what each of them made of the region, so the cross-check happens on the images rather than on the pipeline's guess.
+
+Measured on a 520-px page with its top half out of focus, correct words recovered (page alone → bracketed):
+
+| Gaussian blur on the top half | page alone | bracketed | what fired |
+|---|---|---|---|
+| 5 px | 165 / 165 | 165 | nothing — no false positives on a capture that was already fine |
+| 7 px | 117 / 129 | **138** / 148 | 2 lines replaced |
+| 9 px | 101 / 119 | **146** / 164 | 4 lines filled in |
+| 11 px | 64 / 82 | **165** / 165 | 4 replaced, 6 filled |
+| 13 px | 55 / 55 | **165** / 165 | 10 lines the capture never saw at all |
+
+(correct words / words read; the page holds 165.)
+
+The two biggest gains came from captures the primary read *confidently* — it had simply not emitted the unreadable lines, and confidence says nothing about a line an engine never produced, which is why every variant is read rather than only the doubtful ones. The bill is one OCR pass per variant (~1.2 s with two engines) and, only for pages where a region survives unreadable, ~1.5 k input tokens per attached image.
+
+**Varying the focus needs a camera that can be locked to a custom lens position**, which many webcams cannot — the C525 this was built against offers `locked` and `continuous` focus but no lens position, and `ocrmd doctor` now tells you which of yours can:
+
+```
+camera 0:    HD Webcam C525
+             ocrmd will use 1920x1080; focus modes: locked, continuous; no custom lens position (focus bracket unavailable)
+```
+
+On such a camera the shutter falls back to keeping the **burst's runners-up** as the variants instead of discarding them — the frames `burst_frames` already reads, which differ by sensor noise and the lens's own micro-adjustment. Everything downstream is identical, but they are a much weaker second opinion than a real change of focus, and **the numbers in the table above were measured with genuinely differing focus; the fallback's gain on real hardware is not measured.** `focus_keep = 0` turns it off. `--focus-bracket always` brackets every page, `off` disables the whole thing.
 
 ### How orientation is decided
 
@@ -221,6 +328,34 @@ Vision recogniser does not auto-orient (the accurate one does), which is what ma
 3. **Ink asymmetry** — Latin text puts more ink above each line's centre than below (capitals and
 ascenders outnumber descenders). Weak but never silent, so it breaks the tie on pages far too small for step 2.
 
+## What the shutter refuses
+
+Two things hold the shutter shut that a naive "is the frame still?" test would let through.
+
+**A page turn is not a still frame.** Halfway through one the hand lets go, the page is mid-fall, the pixels go quiet for a fraction of a second, the lens has not moved and the frame is certainly new. Measured on this repository's own store, one two-minute session produced 21 captures and 16 of the 20 consecutive pairs disagree about where the page is by more than 3 % of the frame — the book was still moving, and all 21 became pages. So the shutter now also requires the *detected page outline* to hold its position for three consecutive detections, and after a hand or a moved page it waits `settle_frames` (20) instead of `stable_frames` (8) before it may fire. The HUD says which it is waiting for:
+
+```
+SETTLING AFTER HAND    settling after hand  7/20
+PAGE MOVING            drift 0.148
+```
+
+**A capture nothing can read does not become a page.** Local OCR has already read the crop by the time the page would be created, so it is asked first: fewer than `admit_min_words` (60) words, or mean confidence below `admit_min_confidence` (0.5), and the frame is kept but no page is made and no LLM call is spent. On the real store that refuses 23 of 139 pages, 91 % of which the model had independently called illegible.
+
+Nothing is deleted. `ocrmd status` lists what was refused and how to force one in:
+
+```
+book
+  3 capture(s) refused as unreadable — the frames are kept, no pages were made:
+    raw/9c1f0ad3e2b1…jpg  16:32:08  only 12 word(s) legible (needs 60)
+    force one in with: ocrmd ingest raw/<sha>.jpg --doc book
+```
+
+`--no-admit` turns the test off for a scan; forced (space-bar) captures and `ocrmd ingest` are never subject to it.
+
+**This is not a substitute for framing.** On that same store, admission removes the captures that were never going to be pages, but the share of illegible pages among the ones still made only falls from 73 % to 69 % — the rest fail on resolution, focus and angle, which is what the px/page readout and the framing advice are for. Fix the rig first; the shutter can only refuse what it can detect.
+
 ## Tuning the auto-shutter
 
-`ocrmd.toml`: `motion_threshold`, `stable_frames`, `novelty_threshold`, `blur_threshold`, `occlusion_cover`, `occlusion_rebaseline`. The preview window shows the live gate state and numbers, and every capture's sharpness/occlusion/px-per-page goes to `ocrmd.log`.
+`ocrmd.toml`: `motion_threshold`, `stable_frames`, `settle_frames`, `geometry_frames`, `geometry_tolerance`, `novelty_threshold`, `blur_threshold`, `occlusion_cover`, `occlusion_rebaseline`, `focus_bracket*`, `admit_*`. The preview window shows the live gate state and numbers, and every capture's sharpness/occlusion/px-per-page goes to `ocrmd.log`.
+
+Capturing too seldom? Lower `settle_frames` (the wait after a hand) or raise `geometry_tolerance` (how much the page outline may wander). Still capturing during page turns? Raise them.

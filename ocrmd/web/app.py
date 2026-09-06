@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,7 +18,7 @@ from ..store import Store
 from .. import pipeline, render, review
 from ..session import ScanOptions, ScanSession, make_provider
 from .health import cameras as list_cameras, doctor_report
-from .jobs import JobManager, KINDS
+from .jobs import JobManager, KINDS, BUNDLED_PIPELINES, pipelines as etl_pipelines
 
 log = logging.getLogger("ocrmd.web")
 STATIC = Path(__file__).parent / "static"
@@ -53,6 +53,26 @@ class PageEdit(BaseModel):
     body: str | None = None
     page_label: str | None = None
     context: dict[str, Any] | None = None
+
+
+class LayoutEdit(BaseModel):
+    """A page model as the browser edited it: the blocks, and the column count if it changed."""
+    blocks: list[dict[str, Any]]
+    columns: int | None = None
+
+
+class PipelineSpec(BaseModel):
+    yaml: str
+
+
+class RegionRequest(BaseModel):
+    """A rectangle someone dragged on the page image, in page fractions."""
+    x: float
+    y: float
+    w: float
+    h: float
+    llm: bool = False
+    question: str | None = None
 
 
 class Resolve(BaseModel):
@@ -117,10 +137,17 @@ def create_app(s: Settings) -> FastAPI:
             "reviewed_by": row["reviewed_by"], "llm_error": st.stage_error(pid, "llm"),
             "frontmatter": fm, "body": body, "flags": flags, "unresolved": len(flags),
             "images": {k: f"/api/documents/{slug}/pages/{row['sequence']}/image/{k}"
-                       for k, p in (("processed", s.processed / f"{pid}.png"), ("bin", s.processed / f"{pid}.bin.png"),
+                       for k, p in (("flat", s.processed / f"{pid}.png"),   # rendered on first request
+                                    ("processed", s.processed / f"{pid}.png"), ("bin", s.processed / f"{pid}.bin.png"),
                                     ("raw", s.raw / f"{row['raw_sha256']}.jpg")) if p.exists()},
             "prev": seqs[i - 1] if i > 0 else None, "next": seqs[i + 1] if i + 1 < len(seqs) else None,
             "prev_flagged": prev_flag, "next_flagged": nxt_flag, "exists": path.exists(),
+            "fidelity": row["fidelity"] if "fidelity" in row.keys() else None,
+            "layout": f"/api/documents/{slug}/pages/{row['sequence']}/layout" if pipeline.layout_path(s, pid).exists() else None,
+            "figures": [{"n": n, "asset": f.get("asset"), "caption": f.get("caption"), "bbox": f.get("bbox"),
+                         "url": f"/api/documents/{slug}/pages/{row['sequence']}/figures/{n}.png"}
+                        for n, f in enumerate(((fm.get("references") or {}).get("figures") or []), 1)
+                        if isinstance(f, dict)],
         }
 
     def doc_payload(slug: str) -> dict:
@@ -131,7 +158,10 @@ def create_app(s: Settings) -> FastAPI:
                 "pages": len(pages), "counts": counts,
                 "needs_reshoot": [p["sequence"] for p in pages if p["status"] in ("illegible", "suspect")],
                 "flagged": counts.get("flagged", 0), "unverified": counts.get("unverified", 0) + counts.get("error", 0),
-                "duplicates": len(st.duplicates(slug)), "scanning": scan_running(slug),
+                "duplicates": len(st.duplicates(slug)), "refused": len(st.rejected_captures(slug)),
+                "extracted": sorted(p.name for p in (s.documents / slug / "extracted").glob("*")
+                                    if p.is_file()) if (s.documents / slug / "extracted").exists() else [],
+                "scanning": scan_running(slug),
                 "document_md": f"/api/documents/{slug}/document.md" if (s.documents / slug / f"{slug}.md").exists() else None}
 
     # --- static ----------------------------------------------------------------------------------
@@ -148,7 +178,7 @@ def create_app(s: Settings) -> FastAPI:
 
     @app.get("/api/cameras")
     def api_cameras():
-        return list_cameras()
+        return list_cameras(s.root)
 
     @app.get("/api/settings")
     def api_settings():
@@ -228,7 +258,7 @@ def create_app(s: Settings) -> FastAPI:
         saved = []
         for up in files:
             name = Path(up.filename or "upload").name
-            if Path(name).suffix.lower() not in IMAGE_SUFFIXES:
+            if Path(name).suffix.lower() not in IMAGE_SUFFIXES + (".pdf",):
                 continue
             dest = inbox / f"{int(time.time() * 1000)}-{name}"
             dest.write_bytes(await up.read())
@@ -238,6 +268,60 @@ def create_app(s: Settings) -> FastAPI:
         st.ensure_document(slug)
         job = jobs.submit("ingest", slug, {"files": saved, "no_llm": no_llm})
         return job.to_dict()
+
+    @app.get("/api/documents/{slug}/pipelines")
+    def api_pipelines(slug: str):
+        """The extraction pipelines available to this document (`documents/<slug>/etl/*.yaml`, then
+        `<root>/etl/pipelines/*.yaml`), each with the operators it would run."""
+        _slug(slug)
+        from .. import etl as etl_mod
+        out = []
+        for path in etl_pipelines(s, slug):
+            try:
+                pipe = etl_mod.Pipeline.load(path)
+                out.append({"file": path.name, "name": pipe.name, "steps": pipe.steps, "source": pipe.source,
+                            "llm_steps": pipe.llm_steps, "output": pipe.output, "writes_back": pipe.writes_back,
+                            "bundled": path.parent == BUNDLED_PIPELINES, "yaml": path.read_text(encoding="utf-8")})
+            except Exception as e:                     # a broken spec must not hide the working ones
+                out.append({"file": path.name, "name": path.stem, "error": str(e)[:200]})
+        return out
+
+    @app.put("/api/documents/{slug}/pipelines/{name}")
+    def api_pipeline_save(slug: str, name: str, spec: PipelineSpec):
+        """Save a pipeline into `documents/<slug>/etl/` — by file name only, validated before it lands,
+        so the browser can never write a broken spec or write anywhere else."""
+        _slug(slug)
+        from .. import etl as etl_mod
+        fname = Path(name).name
+        if not fname.endswith(".yaml") or fname != re.sub(r"[^A-Za-z0-9._-]", "", fname):
+            raise HTTPException(400, "pipeline name must be a plain <name>.yaml")
+        d = s.documents / slug / "etl"
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".{fname}.tmp"
+        tmp.write_text(spec.yaml, encoding="utf-8")
+        try:
+            pipe = etl_mod.Pipeline.load(tmp)
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(400, f"invalid pipeline: {e}") from e
+        tmp.replace(d / fname)
+        return {"file": fname, "name": pipe.name, "steps": pipe.steps, "source": pipe.source,
+                "llm_steps": pipe.llm_steps, "output": pipe.output, "writes_back": pipe.writes_back}
+
+    @app.get("/api/documents/{slug}/etl/writes")
+    def api_etl_writes(slug: str):
+        """Every field an extraction pipeline wrote back into this document's pages, layouts or metadata."""
+        _slug(slug)
+        return [dict(r) for r in st.etl_writes(slug)]
+
+    @app.get("/api/documents/{slug}/extracted/{name}")
+    def api_extracted(slug: str, name: str):
+        """Download what a pipeline wrote. Name only — no paths."""
+        _slug(slug)
+        p = s.documents / slug / "extracted" / Path(name).name
+        if not p.exists():
+            raise HTTPException(404, "no such extraction")
+        return FileResponse(p, filename=p.name)
 
     # --- pages -----------------------------------------------------------------------------------
     @app.get("/api/documents/{slug}/pages/{seq}")
@@ -249,12 +333,124 @@ def create_app(s: Settings) -> FastAPI:
     def api_page_image(slug: str, seq: int, kind: str):
         _slug(slug)
         row = page_row(slug, seq)
-        paths = {"processed": s.processed / f"{row['id']}.png", "bin": s.processed / f"{row['id']}.bin.png",
-                 "raw": s.raw / f"{row['raw_sha256']}.jpg"}
-        p = paths.get(kind)
+        if kind == "flat":                     # derived from the crop; rendered now if it is not on disk
+            p = pipeline.ensure_flat(s, row["id"])
+        else:
+            p = {"processed": s.processed / f"{row['id']}.png", "bin": s.processed / f"{row['id']}.bin.png",
+                 "raw": s.raw / f"{row['raw_sha256']}.jpg"}.get(kind)
         if p is None or not p.exists():
             raise HTTPException(404, "no such image")
         return FileResponse(p, headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/documents/{slug}/pages/{seq}/region.png")
+    def api_region_image(slug: str, seq: int, x: float, y: float, w: float, h: float, flat: bool = True):
+        """The selected rectangle as `read_region` cut it, so the operator can see what was read.
+
+        At its own size, not the enlarged one the engines get: the enlargement is interpolation, it
+        tells a person nothing their browser cannot do, and a thin selection at 6x is several MB.
+        """
+        _slug(slug)
+        row = page_row(slug, seq)
+        crop = pipeline.region_crop(s, row["id"], [x, y, w, h], flat=flat)
+        if crop is None:
+            raise HTTPException(404, "no such image")
+        import cv2
+        ok, buf = cv2.imencode(".png", crop)
+        if not ok:
+            raise HTTPException(500, "could not encode the region")
+        return Response(content=buf.tobytes(), media_type="image/png",
+                        headers={"Cache-Control": "private, max-age=600"})
+
+    @app.post("/api/documents/{slug}/pages/{seq}/region")
+    def api_read_region(slug: str, seq: int, req: RegionRequest):
+        """Read one region harder than the page was read. Local OCR always; the model only when asked
+        for — this is the one path in ocrmd where a person, not a threshold, decides to spend tokens."""
+        _slug(slug)
+        row = page_row(slug, seq)
+        prov = make_provider(s, not req.llm, s.provider, s.model) if req.llm else None
+        if req.llm and prov is None:
+            raise HTTPException(409, f"no credentials for {s.provider}; the region was not sent to a model")
+        try:
+            out = pipeline.read_region(s, st, row, [req.x, req.y, req.w, req.h], prov, req.question)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        d = out.__dict__ | {"size": list(out.size)}
+        d["image"] = (f"/api/documents/{slug}/pages/{seq}/region.png"
+                      f"?x={req.x:.5f}&y={req.y:.5f}&w={req.w:.5f}&h={req.h:.5f}")
+        return d
+
+    # --- the page model ----------------------------------------------------------------------------
+    @app.get("/api/documents/{slug}/pages/{seq}/layout")
+    def api_layout(slug: str, seq: int):
+        """The page model: blocks with roles, boxes, reading order, figures (`layout/<pid>.json`),
+        built now if the stage is behind."""
+        _slug(slug)
+        row = page_row(slug, seq)
+        try:
+            return pipeline.page_layout(s, st, row).model_dump()
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.put("/api/documents/{slug}/pages/{seq}/layout")
+    def api_layout_edit(slug: str, seq: int, lay: LayoutEdit):
+        """A human's layout decisions — a figure box dragged, a role corrected, a caption typed. Every
+        block the browser sends is marked `source: human` and survives the next rebuild
+        (`layout.merge_human_layout`); the page fingerprint is untouched, as for any human edit."""
+        _slug(slug)
+        row = page_row(slug, seq)
+        from ..layout import Layout
+        try:
+            current = pipeline.page_layout(s, st, row)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        try:
+            blocks = [b if isinstance(b, dict) else b.model_dump() for b in lay.blocks]
+            new = Layout(page_id=row["id"], width=current.width, height=current.height, columns=lay.columns or current.columns,
+                         blocks=[{**b, "source": "human"} for b in blocks])
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, f"invalid layout: {e}") from e
+        pipeline.save_layout(s, st, new)
+        return new.model_dump()
+
+    @app.get("/api/documents/{slug}/pages/{seq}/boxes")
+    def api_boxes(slug: str, seq: int):
+        """Everything the image pane can draw: line boxes, block boxes by role, figure boxes, and the
+        open flags located on the page by the line that carries their words."""
+        _slug(slug)
+        row = page_row(slug, seq)
+        try:
+            lay = pipeline.page_layout(s, st, row)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        path = render.page_path(s.documents / slug, row["sequence"])
+        body = render.read_page(path)[1] if path.exists() else ""
+        return {"width": lay.width, "height": lay.height, "columns": lay.columns,
+                "blocks": [{"id": b.id, "role": b.role, "bbox": b.bbox, "order": b.order, "column": b.column,
+                            "caption": b.caption, "asset": b.asset} for b in lay.blocks],
+                "lines": [{"text": ln.text, "bbox": ln.bbox, "confidence": ln.confidence, "block": b.id}
+                          for b in lay.blocks for ln in b.lines],
+                "flags": pipeline.locate_flags(lay, body)}
+
+    @app.get("/api/documents/{slug}/pages/{seq}/figures/{n}.png")
+    def api_figure(slug: str, seq: int, n: int):
+        _slug(slug)
+        row = page_row(slug, seq)
+        p = pipeline.figures_dir(s, slug) / f"{row['id']}-{n}.png"
+        if not p.exists():
+            raise HTTPException(404, "no such figure")
+        return FileResponse(p, headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/documents/{slug}/export.json")
+    def api_export_json(slug: str):
+        """The whole document as one JSON object: metadata, every page's frontmatter, body and layout,
+        and the rows every extraction pipeline produced."""
+        _slug(slug)
+        if slug not in st.documents():
+            raise HTTPException(404, "no such document")
+        from ..export import jsondoc
+        return JSONResponse(jsondoc.document(s, st, slug))
 
     def _write(slug: str, row, fm: dict, body: str) -> dict:
         render.write_page(s.documents / slug, row["sequence"], fm, body)

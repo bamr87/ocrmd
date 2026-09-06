@@ -1,4 +1,4 @@
-"""Background jobs for the web UI: verify, build, reprocess, ingest. One worker thread, jobs run in
+"""Background jobs for the web UI: verify, build, reprocess, ingest, reconstruct, etl. One worker thread, jobs run in
 order (the OCR engine is serial and the store is one connection), each with its own log."""
 from __future__ import annotations
 import logging, threading, time, uuid
@@ -14,7 +14,27 @@ from .. import pipeline, render
 from ..session import LLMHealth, make_provider, process_page, summary
 
 log = logging.getLogger("ocrmd.web.jobs")
-KINDS = ("verify", "build", "reprocess", "ingest")
+
+
+BUNDLED_PIPELINES = Path(__file__).resolve().parent.parent / "pipelines"
+
+
+def pipeline_dirs(s: Settings, slug: str) -> list[Path]:
+    """Where extraction pipelines are looked for: the document's own first, then the root's shared
+    ones, then the library that ships with ocrmd (`ocrmd/pipelines/*.yaml`) — same name, nearer wins."""
+    return [s.documents / slug / "etl", s.root / "etl" / "pipelines", BUNDLED_PIPELINES]
+
+
+def pipelines(s: Settings, slug: str) -> list[Path]:
+    return sorted({p.name: p for d in reversed(pipeline_dirs(s, slug)) if d.exists()
+                   for p in sorted(d.glob("*.yaml"))}.values(), key=lambda p: p.name)
+
+
+def pipeline_path(s: Settings, slug: str, name: str) -> Path | None:
+    """A pipeline by file name. Deliberately not an arbitrary path: the browser must not be able to
+    point the runner at a YAML file somewhere else on the machine."""
+    return next((p for p in pipelines(s, slug) if p.name == name or p.stem == name), None)
+KINDS = ("verify", "build", "reprocess", "ingest", "reconstruct", "etl")
 
 
 @dataclass
@@ -180,6 +200,122 @@ class JobManager:
         render.build_document(s.documents / slug, slug)
         summary(st, slug, job.emit)
 
+    def _job_etl(self, job: Job) -> None:
+        """Run an extraction pipeline over a document (see `ocrmd/etl.py`).
+
+        A job rather than a request: a pipeline is one LLM call per page per operator, which is minutes
+        for a book, and it wants the same cancel button and live log every other long job has.
+        """
+        from .. import etl as etl_mod
+        s, st, o = self.s, self.st, job.options
+        slug = job.doc
+        if not slug:
+            raise ValueError("etl needs a document")
+        path = pipeline_path(s, slug, o.get("pipeline") or "")
+        if path is None:
+            raise ValueError(f"no such pipeline: {o.get('pipeline')!r}")
+        pipe = etl_mod.Pipeline.load(path)
+        try:
+            rows = etl_mod.rows_for(s, st, slug, o.get("source") or pipe.source,
+                                    list(o.get("status") or []) or pipe.status or None, o.get("limit"))
+        except (FileNotFoundError, ValueError) as e:
+            raise ValueError(str(e)) from e
+        if not rows:
+            job.emit(f"no {pipe.source} with text to work on", "warn")
+            return
+        prov = self._provider(job)
+        if prov is None and pipe.llm_steps and not o.get("no_llm"):
+            raise ValueError(f"no credentials; {len(pipe.llm_steps)} operator(s) need a model")
+        job.emit(f"{pipe.name}: {len(rows)} {pipe.source} row(s) -> {' -> '.join(pipe.steps)}", "info")
+        job.total = len(rows) * max(1, len(pipe.llm_steps))
+        provider_for = lambda m: make_provider(s, False, o.get("provider") or s.provider, m, job.emit)
+        runner = etl_mod.Runner(s, st, slug, prov, use_cache=not o.get("no_cache"), dry_run=bool(o.get("dry_run")),
+                                provider_for=provider_for)
+        for name in pipe.steps:                      # step by step, so the log and the cancel work
+            if job.cancel.is_set():
+                job.emit("cancelled", "warn"); return
+            op = pipe.op(name)
+            before = len(rows)
+            rows = getattr(runner, f"_{op.type}")(op, rows)
+            job.done = min(job.total, runner.stats.calls + runner.stats.cached)
+            job.emit(f"{op.name} ({op.type}): {before} row(s) -> {len(rows)}", "info")
+        if o.get("dry_run"):
+            if pipe.writes_back:
+                job.emit(f"would write {(pipe.output or {}).get('type')} fields "
+                         f"{', '.join((pipe.output or {}).get('fields', {}).values())} on {len(rows)} row(s)", "info")
+            job.emit(f"{len(runner.prompts)} call(s) would be made; nothing was sent", "ok")
+            return
+        for err in runner.stats.errors[:5]:
+            job.emit(err, "error")
+        found, quoted = etl_mod.locality(rows)
+        if quoted:
+            job.emit(f"locality: {found}/{quoted} quoted span(s) found on the page", "warn" if found < quoted else "ok")
+        if pipe.writes_back:
+            counts = etl_mod.write_back(s, st, slug, pipe, rows, pipe.steps[-1] if pipe.steps else None)
+            job.emit(f"wrote {counts['fields']} field(s) into {counts['pages']} page(s)"
+                     + (f", {counts['blocks']} block(s)" if counts['blocks'] else "")
+                     + (", document.yaml" if counts['document'] else "") + f"  [{runner.stats.describe()}]", "ok")
+            # the rows are also kept as json, so what was written back can be read and chained
+            out_path = s.documents / slug / "extracted" / f"{pipe.name}.json"
+            etl_mod.write(rows, out_path, "json")
+            return
+        out_path, kind, fields = etl_mod.output_path(s, slug, pipe, None)
+        etl_mod.write(rows, out_path, kind, fields)
+        job.emit(f"{len(rows)} row(s) -> {out_path.relative_to(s.root) if out_path.is_relative_to(s.root) else out_path}"
+                 f"  [{runner.stats.describe()}]", "ok")
+
+    def _job_reconstruct(self, job: Job) -> None:
+        """Rebuild pages from their Markdown and score each against the photograph it came from.
+
+        Run as a job rather than inline: rasterising a page takes a second or two, and a book's worth
+        of them is a long wait for a request. The score is the point — a page that rebuilds badly is a
+        page the transcription lost something on.
+        """
+        from .. import reconstruct as rc_mod
+        s, st = self.s, self.st
+        slug = job.doc
+        if not slug:
+            raise ValueError("reconstruct needs a document")
+        out = s.root / "reconstructed" / slug
+        out.mkdir(parents=True, exist_ok=True)
+        if not rc_mod.backends():
+            job.emit("no SVG rasteriser (inkscape, rsvg-convert or Chrome): writing files, "
+                     "but fidelity cannot be scored", "warn")
+        pages = st.pages(slug)
+        job.total = len(pages)
+        scores = []
+        for page in pages:
+            if job.cancel.is_set():
+                job.emit("cancelled", "warn"); break
+            pid = page["id"]
+            img = cv2.imread(str(s.processed / f"{pid}.png"))
+            md_path = render.page_path(s.documents / slug, page["sequence"])
+            if img is None or not md_path.exists():
+                job.emit(f"page {page['sequence']:04d}: missing artifacts, skipped", "warn")
+                job.done += 1
+                continue
+            try:
+                lay = pipeline.page_layout(s, st, page)
+            except Exception as e:
+                job.emit(f"page {page['sequence']:04d}: no layout ({e}), skipped", "warn")
+                job.done += 1
+                continue
+            fm, _body = render.read_page(md_path)
+            r = rc_mod.rebuild(img, lay, title=(fm.get("context") or {}).get("chapter"))
+            stem = out / f"{page['sequence']:04d}"
+            stem.with_suffix(".svg").write_text(r.svg, encoding="utf-8")
+            stem.with_suffix(".tex").write_text(r.latex, encoding="utf-8")
+            if r.png is not None:
+                cv2.imwrite(str(stem.with_suffix(".png")), r.png)
+            if r.fidelity is not None:
+                scores.append(r.fidelity)
+            job.emit(f"page {page['sequence']:04d}: {r.describe()}",
+                     "warn" if (r.fidelity or 1) < 0.5 else "ok")
+            job.done += 1
+        if scores:
+            job.emit(f"{len(scores)} page(s) into {out}; mean fidelity {sum(scores) / len(scores):.2f}",
+                     "info")
+
     def _job_ingest(self, job: Job) -> None:
         s, st = self.s, self.st
         slug = job.doc
@@ -194,15 +330,22 @@ class JobManager:
         for f in files:
             if job.cancel.is_set():
                 job.emit("cancelled", "warn"); break
+            def landed(name: str, res: pipeline.Ingested) -> None:
+                if not res.pages:
+                    job.emit(f"duplicate: {name}", "warn"); return
+                job.emit(f"{name} -> {len(res.pages)} page(s)", "info")
+                for pid in res.pages:
+                    process_page(s, st, pid, None if health.degraded else prov, slug, health=health, emit=job.emit)
+            if f.suffix.lower() == ".pdf":
+                try:
+                    pipeline.ingest_pdf(s, st, f, slug, on_page=landed)
+                except RuntimeError as e:
+                    job.emit(str(e), "error")
+                job.done += 1; continue
             img = cv2.imread(str(f))
             if img is None:
                 job.emit(f"unreadable: {f.name}", "error"); job.done += 1; continue
-            pids = pipeline.ingest_frame(s, st, img, slug, f"file:{f.name}")
-            if not pids:
-                job.emit(f"duplicate: {f.name}", "warn"); job.done += 1; continue
-            job.emit(f"{f.name} -> {len(pids)} page(s)", "info")
-            for pid in pids:
-                process_page(s, st, pid, None if health.degraded else prov, slug, health=health, emit=job.emit)
+            landed(f.name, pipeline.ingest_frame(s, st, img, slug, f"file:{f.name}"))
             job.done += 1
         render.build_document(s.documents / slug, slug)
         summary(st, slug, job.emit)

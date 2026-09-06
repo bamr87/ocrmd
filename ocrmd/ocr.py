@@ -10,6 +10,10 @@ F1): Vision 0.74, RapidOCR 0.66, Tesseract 0.39, Apple Live Text 0.72. Backgroun
 unsharp masking and upscaling beyond 1400 px all scored at or below plain cubic upscaling, so
 preparation is deliberately minimal. Turning Vision's language correction off costs 6 points.
 
+A page captured with a focus bracket is read once per exposure and the readings are combined the same
+way, across focus instead of across engines — that lives in `multifocus.py`, which calls into `merge`'s
+helpers rather than duplicating them.
+
 With more than one engine the primary's lines are kept and the others *vote*: a word another engine
 read identically is confirmed (its confidence rises to at least `CONFIRMED`), a word another engine
 read differently is doubted (confidence scaled by `DOUBTED`), a line the primary missed is filled in
@@ -28,7 +32,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("ocrmd.ocr")
 
-OCR_VERSION = "ocr@2"      # bump when preparation or the merge changes: it is part of the stage version
+OCR_VERSION = "ocr@3"      # bump when preparation or the merge changes: it is part of the stage version
 MIN_SIDE = 1400            # Vision needs ~12px+ text height; webcam page crops are often ~600px wide
 PRIORITY = ("apple_vision", "rapidocr", "tesseract")
 CONFIRMED = 0.90           # floor for a word two engines agree on (>= Settings.ocr_trust: OCR may win a diff)
@@ -43,6 +47,7 @@ class Block(BaseModel):
     bbox: list[float]           # x, y, w, h normalised (0-1, origin top-left)
     engine: str = ""            # which engine produced the text
     agreed: float | None = None  # share of the words another engine confirmed (None: single engine)
+    focus: str = ""             # set when a focus-bracket variant read this line better (multifocus.resolve)
 
 
 class OcrResult(BaseModel):
@@ -57,10 +62,13 @@ class OcrResult(BaseModel):
 
 
 # --- preparation -------------------------------------------------------------------------------
-def upscale_for_ocr(bgr: np.ndarray, min_side: int = MIN_SIDE) -> np.ndarray:
+def upscale_for_ocr(bgr: np.ndarray, min_side: int = MIN_SIDE, max_scale: int = 3) -> np.ndarray:
+    """Enlarge until the short side reaches `min_side`, capped: past 3x a page crop is interpolation,
+    not detail. A *region* of a page is a different bargain (see `pipeline.read_region`) and passes a
+    larger cap, because the same pixels then buy several times the glyph height."""
     import cv2
     short = min(bgr.shape[:2])
-    f = min(3, math.ceil(min_side / short)) if short < min_side else 1
+    f = min(max_scale, math.ceil(min_side / short)) if short < min_side else 1
     return cv2.resize(bgr, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC) if f > 1 else bgr
 
 

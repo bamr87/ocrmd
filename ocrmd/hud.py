@@ -12,8 +12,9 @@ GREEN, AMBER, RED, BLUE, WHITE, GREY = (90, 220, 120), (60, 190, 250), (80, 80, 
 PANEL = (28, 26, 24)
 STATUS_COLOR = {"verified": GREEN, "flagged": AMBER, "suspect": RED, "illegible": RED,
                 "blank": BLUE, "unverified": GREY, "error": RED, "working": WHITE}
-GATE_COLOR = {"READY": GREEN, "moving": AMBER, "focusing": AMBER, "hand": RED, "same page": GREY, "blurry": RED}
-GATE_LABEL = {"hand": "HAND IN FRAME"}
+GATE_COLOR = {"READY": GREEN, "moving": AMBER, "focusing": AMBER, "hand": RED, "same page": GREY,
+              "blurry": RED, "page moved": AMBER, "settling": AMBER}
+GATE_LABEL = {"hand": "HAND IN FRAME", "page moved": "PAGE MOVING"}
 
 
 @dataclass
@@ -65,12 +66,13 @@ def _meter(img, x, y, w, value: float, color, label: str, detail: str = "") -> N
 
 
 def draw(frame: np.ndarray, *, gate: str, motion: float, still: int, stable_frames: int,
+         settling_from: str = "", drift: float = 0.0,
          novelty: int, novelty_threshold: int, sharp: float, blur_threshold: float,
          view_desc: str, focus: str, adjusting: bool, resolution: tuple[int, int],
          page_quad: np.ndarray | None, state: ScanState, help_text: str,
          flash: float = 0.0, width: int = 1000, page_px: int | None = None,
          min_page_px: int = 900, clipped: list[str] | None = None,
-         occlusion: str | None = None) -> np.ndarray:
+         occlusion: str | None = None, focus_note: str = "") -> np.ndarray:
     """Return an annotated copy of `frame`, scaled to `width`."""
     scale = width / max(1, frame.shape[1])
     disp = cv2.resize(frame, (width, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
@@ -87,14 +89,22 @@ def draw(frame: np.ndarray, *, gate: str, motion: float, still: int, stable_fram
     # ---- top bar: gate state + meters
     _panel(disp, 0, 0, w, 78)
     colour = GATE_COLOR.get(gate, WHITE)
-    _text(disp, GATE_LABEL.get(gate, gate.upper()), 14, 30, colour, 0.82 if gate != "hand" else 0.7, 2)
+    label = GATE_LABEL.get(gate, gate.upper())
+    _text(disp, label, 14, 30, colour, 0.82 if len(label) < 10 else 0.62, 2)
     bar_x, bar_w = 190, 200
-    _meter(disp, bar_x, 20, bar_w, still / max(1, stable_frames), colour, "still", f"{motion:.1f}")
+    # "still" is the scene's settle progress, and its target grows after a page turn — showing the
+    # bar against a fixed target would say "nearly there" through the whole of the longer wait.
+    _meter(disp, bar_x, 20, bar_w, still / max(1, stable_frames), colour,
+           f"settling after {settling_from}" if settling_from else "still",
+           f"{still}/{stable_frames}" if settling_from else f"{motion:.1f}")
     _meter(disp, bar_x, 46, bar_w, min(1.0, novelty / max(1, novelty_threshold)), colour, "new page", str(novelty))
     _meter(disp, bar_x + bar_w + 40, 20, bar_w, min(1.0, sharp / max(1.0, blur_threshold * 3)),
            GREEN if sharp >= blur_threshold else RED, "sharpness", f"{sharp:.0f}")
     _text(disp, f"{resolution[0]}x{resolution[1]}  focus={focus}{'*' if adjusting else ''}"
           + (f"  {occlusion}" if occlusion else ""), bar_x + bar_w + 40, 60, GREY, 0.44)
+    if focus_note and not focus_note.startswith("focus ok"):
+        # the lens is the one thing the operator cannot see going wrong until the pages come out soft
+        _text(disp, focus_note, bar_x + bar_w + 40, 76, AMBER if "soft" not in focus_note else RED, 0.44)
     _text(disp, view_desc, w - 8 * len(view_desc) - 14, 30, GREY, 0.44)
     _text(disp, f"captured {state.captured}", w - 130, 60, WHITE, 0.44)
 

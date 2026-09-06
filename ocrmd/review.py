@@ -64,6 +64,8 @@ def fingerprint(fm: dict, body: str) -> str:
         "context": fm.get("context"),
         "page_label": fm.get("page_label"),
         "related": (fm.get("references") or {}).get("related"),
+        "cites": (fm.get("references") or {}).get("cites"),
+        "tags": (fm.get("references") or {}).get("tags"),
         "reviewed_by": (fm.get("verification") or {}).get("reviewed_by"),
         "body": body.strip(),
     }
@@ -83,10 +85,14 @@ def merge_human_edits(new_fm: dict, new_body: str, old_fm: dict, old_body: str) 
     if old_fm.get("page_label") and old_fm.get("page_label") != new_fm.get("page_label"):
         new_fm["page_label"] = old_fm["page_label"]
         kept.append("page_label")
-    related = (old_fm.get("references") or {}).get("related") or []
-    if related:
-        new_fm.setdefault("references", {})["related"] = related
-        kept.append("references.related")
+    # `related` is the human's; `cites` and `tags` are the pipeline's until a person — or an
+    # extraction pipeline writing on their behalf — fills them in, after which the transcription
+    # stage's usually-empty list must not erase them
+    for key in ("related", "cites", "tags"):
+        old_v = (old_fm.get("references") or {}).get(key) or []
+        if old_v and old_v != (new_fm.get("references") or {}).get(key):
+            new_fm.setdefault("references", {})[key] = old_v
+            kept.append(f"references.{key}")
     reviewer = (old_fm.get("verification") or {}).get("reviewed_by")
     body = new_body
     if reviewer:

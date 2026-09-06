@@ -216,6 +216,18 @@ def api(root: Path, port: int) -> None:
             die("page image endpoint did not return a PNG")
         log(f"GET .../pages/1/image/processed -> {len(png)} B PNG")
 
+        flat = s.get(f"/api/documents/{DOC}/pages/1/image/flat")
+        if flat[:4] != b"\x89PNG":
+            die("the flat view did not return a PNG")
+        log(f"GET .../pages/1/image/flat -> {len(flat)} B PNG")
+
+        # the region tool: drag a box on the page image, read that box on its own
+        region = s.post(f"/api/documents/{DOC}/pages/1/region", {"x": 0.05, "y": 0.05, "w": 0.9, "h": 0.35})
+        if not region["text"].strip():
+            die("region read came back empty")
+        log(f"POST .../pages/1/region -> {region['size'][0]}x{region['size'][1]}px enlarged "
+            f"{region['scale']}x, {len(region['text'].split())} word(s)")
+
         # A UI edit must be preserved by a later verify: the write deliberately does NOT refresh the
         # pipeline fingerprint, which is what marks the file as hand-edited.
         edited = page["body"].rstrip() + "\n\nEDITED-BY-DRIVER\n"

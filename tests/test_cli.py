@@ -19,7 +19,7 @@ def cli_root(root, monkeypatch):
 
 def test_help_lists_every_command():
     out = runner.invoke(cli.app, ["--help"]).output
-    for cmd in ("scan", "ingest", "verify", "reprocess", "review", "status", "build", "doctor"):
+    for cmd in ("scan", "ingest", "verify", "reprocess", "review", "status", "build", "doctor", "read", "etl"):
         assert cmd in out
 
 
@@ -87,7 +87,7 @@ def test_review_interactive_resolves_and_signs_off(cli_root, store):
 @needs_ocr
 def test_delete_command(cli_root, store):
     for words in ("one page of text here", "another page of different text"):
-        pid = pipeline.ingest_frame(cli_root, store, on_desk(text_page([words] * 10)), "d", "file:x")[0]
+        pid = pipeline.ingest_frame(cli_root, store, on_desk(text_page([words] * 10)), "d", "file:x").pages[0]
         pipeline.run_page(cli_root, store, store.page(pid), None, "d")
     r = runner.invoke(cli.app, ["delete", "--doc", "d", "--page", "1", "-y"])
     assert r.exit_code == 0 and "1 page(s)" in r.output and len(store.pages("d")) == 1, r.output
@@ -96,3 +96,69 @@ def test_delete_command(cli_root, store):
     r = runner.invoke(cli.app, ["delete", "--doc", "d", "--all", "-y"])
     assert r.exit_code == 0 and "d" not in store.documents() and not (cli_root.documents / "d").exists()
     assert runner.invoke(cli.app, ["delete", "--doc", "d", "--all", "-y"]).exit_code == 1
+
+
+@needs_ocr
+def test_read_prints_a_region_and_writes_nothing(cli_root, store, tmp_path):
+    pid = pipeline.ingest_frame(cli_root, store, on_desk(text_page()), "cli-book", "test").pages[0]
+    crop = tmp_path / "region.png"
+    r = runner.invoke(cli.app, ["read", "--doc", "cli-book", "--page", "1",
+                                "--region", "0.05,0.05,0.9,0.4", "--save", str(crop)])
+    assert r.exit_code == 0, r.output
+    assert "enlarged" in r.output and "truth" in r.output.lower()
+    assert crop.exists()
+    assert not (cli_root.documents / "cli-book" / "pages").exists()      # nothing written to the book
+    assert store.page(pid)["status"] == "unverified"
+
+
+def test_read_refuses_a_page_that_is_not_there(cli_root):
+    r = runner.invoke(cli.app, ["read", "--doc", "nope", "--page", "1"])
+    assert r.exit_code == 1 and "no page 1" in r.output
+
+
+FREE_PIPELINE = """
+name: chunks
+operations:
+  - {name: chop, type: split, split_key: text, words: 6, overlap: 0}
+  - {name: first, type: sample, n: 2}
+pipeline:
+  operations: [chop, first]
+  output: {type: json, path: chunks.json}
+"""
+
+
+@needs_ocr
+def test_etl_runs_a_pipeline_and_writes_where_it_says(cli_root, store, tmp_path, monkeypatch):
+    import json
+    pid = pipeline.ingest_frame(cli_root, store, on_desk(text_page()), "cli-book", "test").pages[0]
+    monkeypatch.setattr(cli, "_provider", lambda *a, **k: FakeProvider(markdown="one two three four five six seven eight"))
+    pipeline.run_page(cli_root, store, store.page(pid), FakeProvider(markdown="one two three four five six seven eight"), "cli-book")
+    spec = tmp_path / "p.yaml"; spec.write_text(FREE_PIPELINE)
+
+    r = runner.invoke(cli.app, ["etl", "--doc", "cli-book", "-p", str(spec)])
+    assert r.exit_code == 0, r.output
+    out = cli_root.documents / "cli-book" / "extracted" / "chunks.json"
+    assert out.exists()
+    rows = json.loads(out.read_text())
+    assert len(rows) == 2 and rows[0]["_page"] == 1 and rows[0]["_document"] == "cli-book"
+
+
+@needs_ocr
+def test_etl_exports_a_docetl_pipeline_without_running_anything(cli_root, store, tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    pid = pipeline.ingest_frame(cli_root, store, on_desk(text_page()), "cli-book", "test").pages[0]
+    pipeline.run_page(cli_root, store, store.page(pid), FakeProvider(markdown="some text"), "cli-book")
+    spec = tmp_path / "p.yaml"; spec.write_text(FREE_PIPELINE)
+    r = runner.invoke(cli.app, ["etl", "--doc", "cli-book", "-p", str(spec), "--export-docetl", str(tmp_path / "x")])
+    assert r.exit_code == 0 and "docetl run" in r.output
+    got = yaml_mod.safe_load((tmp_path / "x" / "pipeline.yaml").read_text())
+    assert [o["name"] for o in got["operations"]] == ["chop", "first"]
+    assert got["pipeline"]["steps"][0]["operations"] == ["chop", "first"]
+    assert not (cli_root.documents / "cli-book" / "extracted").exists()
+
+
+def test_etl_says_which_line_of_a_bad_pipeline_is_wrong(cli_root, tmp_path):
+    spec = tmp_path / "bad.yaml"
+    spec.write_text("name: x\noperations: [{name: a, type: map, output: {schema: {y: timestamp}}}]\n")
+    r = runner.invoke(cli.app, ["etl", "--doc", "cli-book", "-p", str(spec)])
+    assert r.exit_code == 1 and "unknown output type" in r.output
