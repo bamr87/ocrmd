@@ -5,16 +5,19 @@ build/
 .env
 .ocrmd-camera.json
 
-# generated scan data — all of it is local user data, including the built markdown
-raw/
-processed/
-ocr/
-llm/
-documents/
-etl/
-layout/
-export/
-reconstructed/
+# generated scan data — all of it is local user data, including the built markdown.
+# Anchored with a leading slash: these are directories of the *root* (which defaults to
+# the project directory), and an unanchored `export/` also matched the `ocrmd/export/`
+# package, which is how that package went missing from the repository for two releases.
+/raw/
+/processed/
+/ocr/
+/llm/
+/documents/
+/etl/
+/layout/
+/export/
+/reconstructed/
 ocrmd.db
 
 # 0.2 runtime files
