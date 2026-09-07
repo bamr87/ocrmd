@@ -10,7 +10,7 @@ import cv2
 
 from ..config import Settings
 from ..store import Store, DONE_STATUSES
-from .. import pipeline, render
+from .. import library as library_mod, pipeline, render
 from ..session import LLMHealth, make_provider, process_page, summary
 
 log = logging.getLogger("ocrmd.web.jobs")
@@ -170,6 +170,7 @@ class JobManager:
             job.done += 1
         for slug in {p["document"] for p in targets}:
             render.build_document(s.documents / slug, slug)
+            library_mod.sync_document(s, st, slug)
             summary(st, slug, job.emit)
 
     def _job_build(self, job: Job) -> None:
@@ -178,6 +179,7 @@ class JobManager:
         for slug in slugs:
             render.ensure_document_meta(self.s.documents / slug, slug)
             out = render.build_document(self.s.documents / slug, slug)
+            library_mod.sync_document(self.s, self.st, slug)
             job.emit(f"built {out}", "ok")
             job.done += 1
 
@@ -198,6 +200,7 @@ class JobManager:
             process_page(s, st, pid, None if health.degraded else prov, slug, health=health, emit=job.emit)
             job.done += 1
         render.build_document(s.documents / slug, slug)
+        library_mod.sync_document(s, st, slug)
         summary(st, slug, job.emit)
 
     def _job_etl(self, job: Job) -> None:
@@ -348,4 +351,5 @@ class JobManager:
             landed(f.name, pipeline.ingest_frame(s, st, img, slug, f"file:{f.name}"))
             job.done += 1
         render.build_document(s.documents / slug, slug)
+        library_mod.sync_document(s, st, slug)
         summary(st, slug, job.emit)

@@ -11,13 +11,31 @@ Credentials come from `.env` (cwd, project root, then ~/.config/ocrmd/.env; firs
 overrides a variable already in the environment).
 """
 from __future__ import annotations
-import logging, logging.handlers, os, tomllib
+import json, logging, logging.handlers, os, tomllib
 from pathlib import Path
 from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class SinkConfig(BaseModel):
+    """One destination a read page can be sent to — a receiver that speaks the ocrmd sink contract
+    (see ocrmd/sinks.py). The URL is both the descriptor (`GET`) and the intake (`POST`)."""
+    name: str
+    url: str
+    api_key: str = ""                 # sent as X-API-Key
+    bearer: str = ""                  # sent as Authorization: Bearer … (a receiver's user token)
+    timeout: float = 120.0            # the receiver may run a model on the page; a person is waiting
+    options: dict[str, Any] = {}      # defaults for the receiver's own options, e.g. {"section": "LR"}
+
+    @field_validator("name", "url")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not str(v).strip():
+            raise ValueError("a sink needs a name and a url")
+        return str(v).strip()
 
 for _p in (Path.cwd() / ".env", _PROJECT_ROOT / ".env", Path.home() / ".config" / "ocrmd" / ".env"):
     if _p.exists():
@@ -128,6 +146,17 @@ class Settings(BaseModel):
     llm_effort: str = "medium"        # transcription is perception, not reasoning
     batch_poll_seconds: int = 30
 
+    # --- destinations (outbound: a read page is handed to another system) --------------------
+    # Empty disables the whole path — no button, no command, nothing leaves the machine. These are
+    # the only settings in ocrmd that send page text somewhere other than the transcription
+    # provider, so the list is empty until an operator names a receiver (see ocrmd/sinks.py and the
+    # `[[sinks]]` example in ocrmd.example.toml; OCRMD_SINKS takes the same list as JSON).
+    sinks: list[SinkConfig] = []
+    # How this server refers to itself when it tells a receiver where a page image can be seen. A
+    # reviewer over there follows it back to the photograph, so it has to be reachable from a
+    # browser, not from inside a container.
+    web_url: str = "http://127.0.0.1:8765"
+
     # --- logging ----------------------------------------------------------------------------
     log_file: str = "ocrmd.log"       # relative to root; "" disables
     log_level: str = "INFO"
@@ -161,6 +190,22 @@ class Settings(BaseModel):
     def _check_bracket(cls, v: str) -> str:
         if v not in ("auto", "always", "off"):
             raise ValueError("focus_bracket must be auto | always | off")
+        return v
+
+    @field_validator("sinks", mode="before")
+    @classmethod
+    def _parse_sinks(cls, v: Any):
+        """`[[sinks]]` tables from TOML arrive as a list; `OCRMD_SINKS` arrives as a JSON string."""
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return []
+            try:
+                v = json.loads(v)
+            except ValueError as e:
+                raise ValueError(f"sinks must be a JSON list of {{name, url, ...}} objects: {e}") from e
+        if isinstance(v, dict):
+            v = [v]
         return v
 
     @property

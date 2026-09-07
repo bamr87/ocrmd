@@ -1,13 +1,28 @@
 # ocrmd
 
-Incremental scanning + OCR to cross-checked Markdown. Point a webcam at a book, turn pages; each still, new, sharp, **unobstructed** page is captured, OCR'd locally (Apple Vision + RapidOCR voting), transcribed by Claude with vision, and the two readings are diffed into a Markdown page file with rich frontmatter. Built and tuned on a fixed camera over a textbook. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [CHANGELOG.md](CHANGELOG.md) for what changed.
+Turn physical books and loose pages into cross-checked Markdown, plain text and JSON — from a webcam pointed at the book, a folder of photographs, or a PDF — and keep an inventory of everything you have scanned.
+
+Every page is read **twice**: once by local OCR engines (Apple Vision + RapidOCR voting), once by a vision model (Claude by default). The two readings are diffed into a Markdown page file with rich frontmatter; where they disagree the page says so (`==[word]==[^ocrmd-n]`) rather than quietly picking one, and digits are never auto-resolved. The cross-check is the product: an early version fabricated a table of contents for a page it could not read, and only the diff caught it.
+
+What you get, per root directory:
+
+- **A corpus** — `documents/<slug>/pages/0001.md` … one file per page, and a built `<slug>.md` with a TOC;
+  `document.yaml` for what only you know about the book (title, author, ISBN, tags).
+- **An inventory** — every document, its catalogue entry, its progress, in SQLite (`ocrmd library`) and
+  **full-text search across every page ever scanned** (`ocrmd search`).
+- **Exports** — the same pages as Markdown, plain text, one JSON document or JSON-lines (`ocrmd export`).
+- **Destinations** — hand a page's reading to another system that speaks a small HTTP contract
+  (`ocrmd send`); [law-ai](https://github.com/bamr87/law-ai) is the worked example.
+- **A library** — `from ocrmd.api import Library` embeds all of it in another program.
+
+Built and tuned on a fixed camera over a textbook. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the measurements behind each default, and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ## Install (macOS)
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'   # add ,pdf for PDF ingest; ,tesseract as a last resort
 .venv/bin/ocrmd doctor          # engines, cameras, credentials, database health
-.venv/bin/python -m pytest      # 69 checks, ~1 min (needs a local OCR engine for the pipeline ones)
+.venv/bin/python -m pytest      # 306 checks, ~2 min (needs a local OCR engine for the pipeline ones)
 ```
 
 **Camera permission:** macOS must authorize the app that runs `ocrmd` (Terminal, iTerm, VS Code…): System Settings → Privacy & Security → Camera. `ocrmd doctor` tells you if it's denied.
@@ -49,6 +64,10 @@ ocrmd delete --doc lsat --page 12 --page 13    # remove pages (+ their raw captu
 ocrmd delete --doc live-test --all             # remove a whole document (asks first; -y skips)
 ocrmd build                                    # regenerate document .md + TOC + nav links
 ocrmd read --doc lsat --page 12 --region 0.1,0.42,0.6,0.05   # re-read one region of a page, harder
+ocrmd library                                  # the inventory: every document, catalogue entry, progress
+ocrmd search "ridership will rise"             # full-text search across every page ever scanned
+ocrmd export --doc lsat --format jsonl         # md | txt | json | jsonl -> export/lsat/lsat.jsonl
+ocrmd send --doc lsat --page 15 --to law-ai -o hint="question 15"   # hand a page to a destination (see below)
 ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --dry-run   # extract structured data (see below)
 ocrmd ocr-bench --doc lsat --compare           # score every installed OCR engine (and pair) against the LLM transcriptions
 ocrmd doctor --costs
@@ -65,12 +84,14 @@ ocrmd serve            # http://127.0.0.1:8765, opens a browser tab
 
 Everything above, in a browser, plus what a terminal cannot show:
 
+- **Library** — every document as a card with its catalogue entry (title, author, year, kind, printed
+page range), status bar, what needs a re-shoot or a review, and download links for every export format; a search box over every page of every document, with hits that link to the page they sit on.
 - **Scan** — live HUD stream from the camera with the gate state (`READY`, `HAND IN FRAME`, …), meters,
 px/page, and buttons/keys for capture, focus lock/auto, rotate, zoom, pan. Pick the document, camera, focus mode, OCR-only, optional duration/page limit. Event log and queue state update live.
 - **Documents** — status bars, page table filterable by status (label, width, agreement, overlap,
 advice, continuity, LLM errors), drag-and-drop image ingest, Verify/Build/Reprocess buttons, download of the built `document.md`. Select pages to **delete** them (optionally both halves of a spread); **Delete…** removes the whole document after you type its slug.
 - **Page** — the page image beside the transcription, in four views: **flat** (the default — the crop
-flattened and contrast-stretched, the page as a flatbed scanner would have delivered it), **processed** (the crop the model sees), **bin** (the adaptive threshold older engines are given) and **raw** (the untouched frame). Zoomable, and **drag a box on it to read that region on its own** — the selection is cut out, enlarged on its own terms and re-read by the local engines, with an **Ask the model** button for the ones they still cannot get. The result comes back beside its crop, to copy or to insert at the cursor in the editor; nothing is written to the page until you save. *Edit* tab: each disagreement with one-click **OCR / LLM / type your own**, editable Markdown body. *Preview* tab: rendered Markdown with the `==[…]==` marks highlighted. *Meta* tab: printed page label, chapter/section/running head/tags, verification numbers, model notes, provenance. **Sign off** marks a page `reviewed` (body frozen); **Reopen** undoes it; **Delete…** removes the page (and offers to take its spread partner with it). Keys: `n`/`p` next/previous, `N` next flagged. Review mode (`Review N flagged` on a document) advances to the next flagged page after each sign-off.
+flattened and contrast-stretched, the page as a flatbed scanner would have delivered it), **processed** (the crop the model sees), **bin** (the adaptive threshold older engines are given) and **raw** (the untouched frame). Zoomable, and **drag a box on it to read that region on its own** — the selection is cut out, enlarged on its own terms and re-read by the local engines, with an **Ask the model** button for the ones they still cannot get. The result comes back beside its crop, to copy or to insert at the cursor in the editor; nothing is written to the page until you save. *Edit* tab: each disagreement with one-click **OCR / LLM / type your own**, editable Markdown body. *Preview* tab: rendered Markdown with the `==[…]==` marks highlighted. *Meta* tab: printed page label, chapter/section/running head/tags, verification numbers, model notes, provenance. **Sign off** marks a page `reviewed` (body frozen); **Reopen** undoes it; **Delete…** removes the page (and offers to take its spread partner with it). Keys: `n`/`p` next/previous, `N` next flagged. Review mode (`Review N flagged` on a document) advances to the next flagged page after each sign-off. **Send…** (present only when a destination is configured) hands the page's reading, or a region's, to a receiver — see below.
 - **Jobs** — verify / build / reprocess / rebuild / extract with options, live log, progress, cancel.
 - **Settings** — `document.yaml` editor per document, effective settings, full doctor report.
 
@@ -117,6 +138,80 @@ pip install 'ocrmd[docetl]'
 ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --export-docetl out/
 docetl run out/pipeline.yaml
 ```
+
+## The inventory: what has been scanned
+
+`ocrmd.db` records every page and every stage; `document.yaml` holds what only you know about the book. `ocrmd library` joins the two — and mirrors the catalogue fields onto the `documents` table, so any tool that reads SQLite can answer "what has been scanned here":
+
+```
+slug                   title                                       pages      done
+austen                 Pride and Prejudice                        312 page(s)   298 done  [novel · 1813 · Jane Austen]
+    printed iv–301 · tags novel · exported jsonl, md · last capture 2026-09-06T10:41
+lsat                   LSAT Prep                                  139 page(s)    88 done  [textbook]
+```
+
+`ocrmd search "words"` is full-text search over every page's body (SQLite FTS5 where available, a substring scan otherwise); quote a phrase, `word*` for a prefix, `--doc` to narrow. Each hit names its page and links to it in the web UI, because a hit you cannot take back to the page is a rumour. The index is kept up to date **by file mtime, lazily**: a page rewritten by the pipeline, the editor in the web UI, `ocrmd review`, an annotation sync or a text editor is picked up the next time anyone searches, and no write path has to know an index exists (`ocrmd index --force` rebuilds it after a restore).
+
+## Exports
+
+```sh
+ocrmd export --doc austen --format md      # the built document: every page under its anchor, a TOC
+ocrmd export --doc austen --format txt     # plain text, one page after another behind a separator line
+ocrmd export --doc austen --format json    # one JSON object: metadata, every page's frontmatter, body, layout, extractions
+ocrmd export --doc austen --format jsonl   # one JSON object per page — for a search index, a RAG loader, an ETL tool
+```
+
+They land under `export/<slug>/` (or `--out`), are recorded in the inventory, and every one keeps the page ids so a consumer can come back to the photograph. The web UI offers the same four as downloads on every document. The text export does not silently resolve a disagreement: `ambitious[?ambiguous]` keeps both readings in-line (`flags="llm"` or `"ocr"` in the library API picks a side on purpose).
+
+## Destinations: handing a page to another system
+
+ocrmd's only outbound path. A destination is any URL that speaks a small contract (the whole of it is in [ocrmd/sinks.py](ocrmd/sinks.py)): `GET` answers with a *descriptor* — what the receiver is and which typed options it takes — and `POST` takes the *envelope*: the page's **reconciled** text, its provenance (document, page, page id, both agreement scores, the flag count, a link back to the image), the document's catalogue entry, and your options. Configure one in `ocrmd.toml`:
+
+```toml
+[[sinks]]
+name = "law-ai"
+url = "http://localhost:8000/api/lsat/intake/ocr"    # Law AI: the page becomes a draft LSAT question, pending review
+options = { section = "LR" }                         # defaults for the receiver's own options
+```
+
+(or `OCRMD_SINKS='[{"name":"law-ai","url":"…"}]'`). A **Send…** button then appears on every page and in every region readout, drawing the receiver's own options from its descriptor; from a terminal:
+
+```sh
+ocrmd sinks                                                     # what is configured, and what each one takes
+ocrmd send --doc lsat --page 15 --to law-ai -o hint="question 15"
+#   1 question(s) queued for review (key D)
+#     pending   Which of the following statements best… · LR/med · key D (inferred) · grounding 1.0  [prop-de2bcfe12558]
+ocrmd send --doc lsat --page 15 --to law-ai --region 0.1,0.4,0.8,0.3   # read a box first, send *that* reading
+ocrmd send --doc lsat --page 15 --to law-ai --dry-run                  # print the envelope, send nothing
+```
+
+Three things are worth knowing before you press it:
+
+- **The text goes, the photograph does not.** A receiver with the picture and a vision model would
+re-read the page single-pass and overrule the cross-check, which is the one thing this pipeline makes that a single pass cannot. It gets the page id (the sha256 of the processed image) and a link back here, so a reviewer over there can always see the photograph.
+- **A send is not a stage.** Nothing is written or marked; pressing the button twice is safe on this
+  side, and a well-behaved receiver deduplicates and says so.
+- **Failure is reported, never retried into silence.** An unreachable receiver is a 502 from the web
+  UI, not a 500: this server is fine, the page just did not get through.
+
+A Python destination registers through the `ocrmd.sinks` entry-point group instead of a URL. [law-ai](https://github.com/bamr87/law-ai) ships two receivers — its LSAT intake, which extracts questions from the text and parks them in a human-review queue (every draft scored for *grounding* against the page, so an invented answer choice is dropped before a reviewer sees it), and a per-matter door that files the page as a source document — and installs ocrmd itself as an optional plugin for OCR-ing uploads inside the platform.
+
+## Embedding ocrmd in another program
+
+```python
+from ocrmd.api import Library
+
+lib = Library("~/scans")                                   # any directory; created on first use
+report = lib.ingest(["~/photos/austen"], doc="austen", title="Pride and Prejudice")
+print(report.summary())                                   # austen: 312 page(s) from 312 file(s), 3 duplicate(s) skipped
+page = lib.page("austen", 12)                             # .text, .status, .agreement, .images, .frontmatter
+lib.export("austen", "jsonl")
+lib.search("Netherfield")[0].sequence
+lib.envelope("austen", 12)                                # text + provenance, the same object a destination gets
+lib.send("austen", 12, "law-ai", {"hint": "question 15"})
+```
+
+`Library` holds its own settings and store (never the CLI's singleton), so a host can point it at any root, and it takes the model provider as an argument: `"auto"` (the configured one, when credentials exist), `None` (OCR only — nothing leaves the machine), or any object implementing `ocrmd.llm.Provider`, which is how a host with its own model-routing layer keeps every call inside it. Nothing in it prints; progress lines go to an `emit(line, level)` callback if you pass one.
 
 ## Setting up the rig (textbook under a fixed webcam)
 
@@ -221,7 +316,9 @@ llm/<page>.<provider>.json         Claude transcription (structured)
 documents/<slug>/document.yaml     title, author, citation, tags, project — edit this
 documents/<slug>/pages/0001.md     one file per page, frontmatter + canonical markdown
 documents/<slug>/<slug>.md         built document: TOC, page anchors, needs_reshoot, label_gaps
-ocrmd.db                           SQLite: pages, captures, stages, llm_calls, batches
+export/<slug>/<slug>.{md,txt,json,jsonl}   exports (`ocrmd export`)
+ocrmd.db                           SQLite: the inventory — documents (catalogue mirrored from document.yaml), pages,
+                                   captures, stages, llm_calls, batches, page_text (+ FTS5 index), doc_exports
 ocrmd.log                          rotating log (INFO; --debug for everything)
 ```
 

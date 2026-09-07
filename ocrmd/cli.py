@@ -4,7 +4,8 @@ from pathlib import Path
 import typer, cv2, yaml
 from .config import settings as S, setup_logging
 from .store import Store, DONE_STATUSES
-from . import ocr, pipeline, render, review as review_mod
+from . import library as library_mod, ocr, pipeline, render, review as review_mod, sinks as sinks_mod
+from .export import FORMATS, export_document
 from .llm import LLMUnavailable
 from .session import LLMHealth, ScanOptions, ScanSession, make_provider, process_page, summary
 
@@ -51,6 +52,13 @@ def _process(st, page_id, prov, slug, refresh: bool = False, health: LLMHealth |
 
 def _summary(st, slug: str) -> None:
     summary(st, slug, emit)
+
+
+def _build(st, slug: str) -> Path:
+    """Build the document file and mirror document.yaml into the inventory (library.sync_document)."""
+    out = render.build_document(S.documents / slug, slug)
+    library_mod.sync_document(S, st, slug)
+    return out
 
 
 # =================================================================================================
@@ -144,7 +152,7 @@ def annotate(doc: str = typer.Option(..., help="document slug"),
     except (CameraLost, RuntimeError) as e:
         _fail(str(e))
     if seen:
-        render.build_document(S.documents / doc, doc)
+        _build(st, doc)
     typer.echo(f"{sum(seen.values())} change(s) across {len(seen)} page(s)"
                + ("  (dry run: nothing written)" if dry_run else ""))
 
@@ -292,6 +300,172 @@ def read(doc: str = typer.Option(..., help="document slug"),
 
 
 @app.command()
+def send(doc: str = typer.Option(..., help="document slug"),
+         page: int = typer.Option(..., help="page sequence"),
+         to: str = typer.Option("", "--to", help="destination name (see `ocrmd sinks`); may be omitted when only one is configured"),
+         option: list[str] = typer.Option([], "--option", "-o", help="key=value for one of the receiver's options; repeatable"),
+         region: str | None = typer.Option(None, help="x,y,w,h fractions: read this box first and send that reading"),
+         dry_run: bool = typer.Option(False, "--dry-run", help="show the envelope that would be sent, send nothing")):
+    """Hand a page you have read to a destination — a study platform, a knowledge base, anything that
+    speaks the sink contract (ocrmd/sinks.py; `ocrmd sinks` lists what is configured).
+
+    The text goes out, the photograph does not: the receiver gets ocrmd's *reconciled* reading, the
+    page's provenance (document, page, page id, both agreement scores, a link back to the image) and
+    the document's catalogue entry. Nothing here is written and no stage is marked — the same contract
+    as `ocrmd read`. `--region` reads a box first and sends *that* reading, which is what to reach for
+    when one item on a crowded page came out badly.
+    """
+    st = _store()
+    row = st.page_by_sequence(doc, page)
+    if row is None:
+        _fail(f"{doc} has no page {page}")
+    try:
+        sink = sinks_mod.get(S, to)
+        options = sinks_mod.parse_option_args(list(option))
+    except sinks_mod.SinkError as e:
+        _fail(str(e))
+    bbox, text = None, None
+    if region is not None:
+        try:
+            bbox = [float(v) for v in region.split(",")]
+            if len(bbox) != 4:
+                raise ValueError
+        except ValueError:
+            _fail(f"--region wants four numbers 'x,y,w,h' as fractions of the page, not {region!r}")
+        # The region is read the way the web UI's drag-a-box reads it, model included: a selection is a
+        # fraction of a page, so the same pixels buy several times the glyph height.
+        prov = _provider(False, S.provider, S.model)
+        try:
+            out = pipeline.read_region(S, st, row, bbox, prov)
+        except (ValueError, FileNotFoundError) as e:
+            _fail(str(e))
+        text = out.llm or out.text
+        if not (text or "").strip():
+            _fail("the region read produced no text — nothing to send")
+        emit(f"region read: {out.size[0]}x{out.size[1]}px enlarged {out.scale}x · "
+             f"{out.engine or 'no OCR engine'}{'  + model' if out.llm else ''}")
+    try:
+        if text is None:
+            text, _fm = sinks_mod.page_text(S, doc, row)
+        flags = sinks_mod.unresolved_flags(text)
+        if flags and not dry_run:
+            emit(f"{flags} unresolved disagreement(s) in this text — the marks travel with it, and so does the count", "warn")
+        d = sinks_mod.send_page(S, doc, row, sink, options, text=text, bbox=bbox, dry_run=dry_run)
+    except sinks_mod.SinkError as e:
+        _fail(str(e))
+    if dry_run:
+        typer.echo(f"{d.summary} ({getattr(sink, 'url', '')})")
+        typer.echo(json.dumps({k: v for k, v in d.raw.items() if k != "text"}, indent=2, default=str))
+        typer.echo("--- text ---")
+        typer.echo(d.raw.get("text", ""))
+        return
+    emit(d.describe(), "ok" if d.items else "warn")
+
+
+@app.command()
+def sinks(probe: bool = typer.Option(True, "--probe/--no-probe", help="ask each receiver for its descriptor")):
+    """List the destinations a page can be sent to, and the options each one takes."""
+    have = sinks_mod.registry(S)
+    if not have:
+        typer.echo("no destinations configured — add a [[sinks]] table to ocrmd.toml, or set OCRMD_SINKS "
+                   "(see ocrmd.example.toml)")
+        return
+    for sink in have:
+        d = sink.describe(probe=probe) if isinstance(sink, sinks_mod.HttpSink) else sink.describe()
+        state = "" if not probe else ("  reachable" if d.get("reachable") else f"  {d.get('error') or 'unreachable'}")
+        typer.secho(f"{sink.name}  {getattr(sink, 'url', '')}{state}", fg=None if d.get("reachable", True) else "yellow")
+        if d.get("description"):
+            typer.echo(f"    {d['description']}")
+        for o in d.get("options") or []:
+            choices = f" ({', '.join(map(str, o['choices']))})" if o.get("choices") else ""
+            default = f" [default {o['default']}]" if o.get("default") not in (None, "") else ""
+            typer.echo(f"    --option {o['key']}=…  {o.get('type', 'string')}{choices}{default}  {o.get('help') or o.get('label') or ''}")
+        if d.get("defaults"):
+            typer.echo(f"    defaults from ocrmd.toml: {json.dumps(d['defaults'])}")
+
+
+@app.command()
+def library(as_json: bool = typer.Option(False, "--json", help="machine-readable"),
+            all_docs: bool = typer.Option(False, "--all", help="also documents with no pages yet")):
+    """The inventory: every document scanned into this root, what is known about it, how far along it is."""
+    st = _store()
+    docs = [d for d in library_mod.catalog(S, st) if all_docs or d.pages]
+    if as_json:
+        typer.echo(json.dumps([d.to_dict() for d in docs], indent=1, default=str))
+        return
+    if not docs:
+        typer.echo("nothing scanned yet — `ocrmd scan` or `ocrmd ingest` to begin")
+        return
+    typer.echo(f"{'slug':<22} {'title':<38} {'pages':>13} {'done':>9}")
+    for d in docs:
+        colour = "green" if d.pages and d.done == d.pages else ("yellow" if d.needs_attention else None)
+        typer.secho(d.describe(), fg=colour)
+        extras = []
+        if d.page_labels:
+            extras.append(f"printed {d.page_labels}")
+        if d.tags:
+            extras.append("tags " + ", ".join(d.tags))
+        if d.exports:
+            extras.append("exported " + ", ".join(sorted(d.exports)))
+        if d.last_captured_at:
+            extras.append(f"last capture {d.last_captured_at[:16]}")
+        if extras:
+            typer.echo("    " + " · ".join(extras))
+    typer.echo(f"{len(docs)} document(s), {sum(d.pages for d in docs)} page(s), root {S.root}")
+
+
+@app.command()
+def search(query: str = typer.Argument(..., help="words to find; quote a phrase; word* for a prefix"),
+           doc: str | None = typer.Option(None, help="only this document"),
+           limit: int = typer.Option(20, help="most hits to show"),
+           as_json: bool = typer.Option(False, "--json")):
+    """Full-text search across every page ever scanned, or one document. Each hit names its page."""
+    st = _store()
+    hits = library_mod.search(S, st, query, doc, limit)
+    if as_json:
+        typer.echo(json.dumps([h.to_dict() for h in hits], indent=1, ensure_ascii=False))
+        return
+    if not hits:
+        typer.echo(f"no page matches {query!r}  ({'fts5' if st.fts else 'substring scan — this SQLite has no FTS5'})")
+        return
+    for h in hits:
+        where = f"{h.document}/{h.sequence:04d}" + (f" p.{h.page_label}" if h.page_label else "")
+        typer.secho(f"{where:<28} {h.status or '':<10}", fg=STATUS_COLOR.get(h.status or "", None), nl=False)
+        typer.echo(f" {h.snippet[:160]}")
+    typer.echo(f"{len(hits)} hit(s)")
+
+
+@app.command()
+def export(doc: str | None = typer.Option(None, help="document slug; default every document"),
+           fmt: str = typer.Option("md", "--format", "-f", help="md | txt | json | jsonl"),
+           out: Path | None = typer.Option(None, help="write here instead of <root>/export/<slug>/<slug>.<fmt> (one document only)")):
+    """Write a document in another shape: the built Markdown, plain text, one JSON object, or one JSON
+    object per page. Every shape keeps the page ids, so a consumer can always come back to the photograph."""
+    st = _store()
+    if fmt not in FORMATS:
+        _fail(f"--format must be one of {', '.join(FORMATS)}")
+    slugs = [doc] if doc else st.documents()
+    if out is not None and len(slugs) != 1:
+        _fail("--out needs exactly one --doc")
+    for slug in slugs:
+        if slug not in st.documents():
+            _fail(f"no such document: {slug}")
+        path = export_document(S, st, slug, fmt, out)
+        typer.echo(f"{slug} -> {path}  ({path.stat().st_size:,} B)")
+
+
+@app.command()
+def index(doc: str | None = typer.Option(None, help="document slug; default every document"),
+          force: bool = typer.Option(False, "--force", help="re-read every page file, not just the changed ones")):
+    """Rebuild the search index from the page files. Search does this on its own for pages whose file
+    changed; this is for after restoring a backup, or to be sure."""
+    st = _store()
+    n = library_mod.reindex(S, st, doc, force)
+    typer.echo(f"{n} page(s) indexed ({'fts5' if st.fts else 'substring scan: this SQLite has no FTS5'}); "
+               f"{st.indexed_count()} in the index")
+
+
+@app.command()
 def reconstruct(doc: str = typer.Option(..., help="document slug"),
                 page: int | None = typer.Option(None, help="one page sequence; default every page"),
                 out: Path = typer.Option(Path("reconstructed"), help="directory for the .svg/.tex/.png"),
@@ -416,11 +590,11 @@ def ingest(paths: list[Path], doc: str = typer.Option(..., help="document slug")
             if not watch:
                 break
             if files:
-                render.build_document(S.documents / doc, doc)
+                _build(st, doc)
             time.sleep(2.0)
     except KeyboardInterrupt:
         typer.echo("\nstopped watching")
-    render.build_document(S.documents / doc, doc)
+    _build(st, doc)
     _summary(st, doc)
 
 
@@ -468,7 +642,7 @@ def verify(doc: str | None = None,
                 prov = None
             _process(st, page["id"], prov, page["document"], refresh=refresh, health=health)
     for slug in {p["document"] for p in targets}:
-        render.build_document(S.documents / slug, slug)
+        _build(st, slug)
         _summary(st, slug)
 
 
@@ -514,7 +688,7 @@ def _collect_batches(st, prov) -> None:
             _collect_one(st, prov, b["id"])
             slugs |= {st.page(pid)["document"] for pid in b["page_ids"].split(",") if st.page(pid)}
     for slug in slugs:
-        render.build_document(S.documents / slug, slug)
+        _build(st, slug)
         _summary(st, slug)
 
 
@@ -542,7 +716,7 @@ def reprocess(doc: str | None = None, no_llm: bool = typer.Option(False, "--no-l
         health = LLMHealth(S.llm_failure_limit)
         for pid in ids:
             _process(st, pid, None if health.degraded else prov, slug, health=health)
-        render.build_document(S.documents / slug, slug)
+        _build(st, slug)
         _summary(st, slug)
 
 
@@ -603,7 +777,7 @@ def review(doc: str = typer.Option(..., help="document slug"),
         st.set_fingerprint(page["id"], review_mod.fingerprint(fm, body))
         typer.secho(f"  saved; {left} left" + ("  -> reviewed" if left == 0 else ""), fg="green")
     if not list_only:
-        render.build_document(doc_dir, doc)
+        _build(st, doc)
         typer.echo(f"{done} page(s) signed off")
 
 
@@ -678,7 +852,7 @@ def delete(doc: str = typer.Option(..., help="document slug"),
     if not yes and not typer.confirm(f"delete {len(ids)} page(s) from '{doc}'" + (" and their spread partners" if whole_capture else "") + "?", default=False):
         raise typer.Exit()
     out = pipeline.delete_pages(S, st, doc, ids, purge_raw=not keep_raw, whole_capture=whole_capture)
-    render.build_document(S.documents / doc, doc)
+    _build(st, doc)
     typer.echo(f"{doc}: {out.summary()} (pages {', '.join(f'{n:04d}' for n in out.pages)})")
 
 
@@ -688,7 +862,7 @@ def build(doc: str | None = None):
     st = _store()
     for slug in ([doc] if doc else st.documents()):
         render.ensure_document_meta(S.documents / slug, slug)
-        typer.echo(render.build_document(S.documents / slug, slug))
+        typer.echo(_build(st, slug))
 
 
 @app.command()
@@ -783,8 +957,13 @@ def doctor(costs: bool = False):
     else:
         typer.echo(f"openable:    {[c['index'] for c in rep['cameras']] or 'none'}")
     typer.secho(f"database:    {rep['db_path']} integrity={rep['db_integrity']}", fg=None if rep["db_integrity"] == "ok" else "red")
+    lib = rep["library"]
+    typer.echo(f"library:     {lib['documents']} document(s), {lib['pages']} page(s), {lib['indexed']} indexed for search "
+               f"({'fts5' if lib['fts'] else 'substring scan'}); exports under {lib['export_dir']}")
     for d in rep["documents"]:
         typer.echo(f"  {d['slug']}: {d['pages']} page(s) " + ", ".join(f"{n} {k}" for k, n in sorted(d["counts"].items())))
+    typer.echo("sinks:       " + (", ".join(f"{x['name']} ({x['url']})" for x in rep["sinks"]) if rep["sinks"]
+                                 else "none configured (see ocrmd.example.toml [[sinks]])"))
     m = rep["missing_artifacts"]
     if m["raw"] or m["processed"]:
         typer.secho(f"artifacts:   {len(m['raw'])} page(s) without raw capture, {len(m['processed'])} without "

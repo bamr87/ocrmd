@@ -1,6 +1,6 @@
 # ocrmd — Architecture
 
-Incremental scanning + OCR tool that turns webcam frames or image files (book pages, loose text, receipts) into a standardized Markdown corpus, cross-checked by a second, independent transcription source (Claude with vision; xAI as an alternate provider). Version 0.2 is the production-hardening release, shaped by real sessions with a fixed webcam over a textbook.
+Incremental scanning + OCR tool that turns webcam frames, image files or PDFs (book pages, loose text, receipts) into a standardized Markdown corpus, cross-checked by a second, independent transcription source (Claude with vision; xAI as an alternate provider) — with an inventory of everything scanned, exports in several shapes, a generic outbound contract for handing a page to another system, and a library API for embedding the whole thing. Version 0.2 was the production-hardening release, shaped by real sessions with a fixed webcam over a textbook; 0.9 is the one that made it a general-purpose book scanner rather than a rig for one book.
 
 ## 1. Goals and non-goals
 
@@ -15,6 +15,10 @@ Incremental scanning + OCR tool that turns webcam frames or image files (book pa
 - Resumable, idempotent, offline-tolerant: a crash, a dead network or a rate limit never loses a
 capture and never stalls a session. Nothing is deleted automatically; nothing costs tokens twice without an explicit flag.
 - Pluggable LLM providers behind one interface.
+- One root is a **library**: every document scanned into it is catalogued and searchable, and the
+  catalogue lives in SQLite so a tool that is not ocrmd can read it.
+- The corpus is a **source**, not a destination: it exports to the shapes other tools take (Markdown,
+text, JSON, JSON-lines), it can be handed page by page to any receiver that speaks a small HTTP contract, and it can be driven as a library from another program.
 
 **Non-goals**
 - Handwriting, non-Latin scripts beyond what the local engine supports.
@@ -54,8 +58,14 @@ Every stage writes its result to disk and records completion (stage, version) in
 ```
 ocrmd/
   cli.py          typer app: scan | ingest | verify | reprocess | review | status | delete | build | serve | doctor | ocr-bench
-  config.py       Settings (defaults → toml → OCRMD_* env), .env credentials, logging setup
-  store.py        SQLite: documents, pages, captures, stages, llm_calls, batches; migrations; locking
+                  | library | search | index | export | sinks | send | read | etl | reconstruct | annotate
+  api.py          the embedding surface: `Library` — one Settings, one Store, an injectable provider
+  config.py       Settings (defaults → toml → OCRMD_* env), .env credentials, SinkConfig, logging setup
+  store.py        SQLite: documents (with the catalogue mirrored in), pages, captures, stages, llm_calls, batches,
+                  page_text (+ FTS5), doc_exports; migrations; locking
+  library.py      the inventory: document.yaml mirrored into the store, page bodies indexed by mtime, search
+  export/         md | txt | json | jsonl exporters behind one `export_document`
+  sinks.py        destinations: the receiver contract (descriptor + envelope), HttpSink, entry-point sinks
   capture.py      auto-shutter generator: gates (Gate), camera open/reopen, focus bracket, HUD loop
   scene.py        has the desk stopped changing? page-outline stability + the settle state machine
   legibility.py   should a capture become a page at all? (the admission test)
@@ -581,6 +591,51 @@ Two smaller decisions worth keeping: templating is `{{ input.field }}` and `{{ i
 
 The web UI reads specs from `documents/<slug>/etl/*.yaml` and `<root>/etl/pipelines/*.yaml`, by file name only: a browser must not be able to point the runner at a YAML file elsewhere on the machine.
 
+## 11e. Destinations: a page is handed to another system
+
+`ocrmd/sinks.py` — the **Send…** button on the page view and in the region readout, `POST /pages/{seq}/send`, `ocrmd send --doc X --page N --to NAME`. The one **outbound** path in this repository: everything else ends at a file on disk, and this hands a page to a receiver of the operator's choosing.
+
+It is generic on purpose. The first receiver built against it is [law-ai](https://github.com/bamr87/law-ai)'s LSAT intake, and the 0.8 draft of this path was a law-ai module inside ocrmd — `lawai_url`, a "→ LSAT" button, section and difficulty pickers. That is the wrong shape for a scanner: ocrmd should know nothing about LSAT questions, and the next receiver (a matter in the same platform, a knowledge base, a notebook) would have wanted its own module, button and settings. So the receiver now describes itself and ocrmd draws what it says:
+
+- `GET url` → the **descriptor**: `{"ocrmd_sink": 1, "name", "description", "accepts": ["page", "region"],
+  "options": [{"key", "label", "type": string|enum|integer|number|boolean, "choices", "default", "help"}]}`.
+  The CLI prints it, the web UI renders one input per option (a select for an enum, a checkbox for a boolean), and `coerce_options` types and checks the operator's values against it *before* anything leaves — a value outside an enum is refused here, because the receiver's 422 would name a field the person never saw. A receiver with no descriptor still works (the send has no options); one that is down is listed as down.
+- `POST url` → the **envelope**: `{"ocrmd": 1, "kind": page|region, "text", "provenance", "document", "options"}`.
+  `text` is the page body as it stands on disk — the reconciled reading *including* any disagreement the operator has resolved. `provenance` is what the receiver needs to find the page again and to judge the reading: tool and version, document, page, page id, printed label, capture time, OCR engine, model, both agreement scores, the flag count, the count of unresolved marks in the text sent, the status, a URL to the image and one to the page in this UI, and the `bbox` when the send came from a region. `document` is the catalogue entry from document.yaml. The receiver answers 2xx JSON, ideally `{"summary", "items": [{id, title, detail, status}], "warnings"}`; anything else is shown raw with an honest synthesized summary.
+
+Everything else follows from that division of labour:
+
+- **The text travels; the photograph does not.** A page image and a vision model would let the receiver
+do its own single-pass read — which is exactly the thing ocrmd exists to distrust. The page id is the sha256 of the processed image, so it outlives the URL and the process.
+- **This is a send, not a stage.** Same contract as `read_region`: no file is written, no stage marked,
+no version moved. It is safe to press twice, because a well-behaved receiver deduplicates against its own store and says so — which is how a person actually checks "did that go through?".
+- **A region's reading is a better send than a page's.** The region tool already re-reads a box at
+several times the page's glyph height; the readout's own **Send…** sends *that* text with the `bbox` recorded, which is what a person boxing one item out of five on a page wants.
+- **Failure is reported, never retried into silence.** `SinkError` carries the receiver's own reason;
+the web route answers **502**, not 500, because this server is fine and the page simply did not reach the other one.
+- **Off unless configured.** No `[[sinks]]` table (or `OCRMD_SINKS`) means no button, no command, no
+path — these are the only settings in ocrmd that send page text anywhere other than the transcription provider. Credentials (`api_key` → `X-API-Key`, `bearer` → `Authorization`) never reach the browser: `/api/settings` masks them.
+- **A Python receiver** registers through the `ocrmd.sinks` entry-point group instead of a URL:
+  anything with a `name`, a `describe()` and a `send(envelope, options)`, constructed with the `Settings`.
+
+**What the far side does with it** is the receiver's business, but two of law-ai's choices are load-bearing here and were built alongside this: its extractor is told to leave a field empty rather than fill in what a page of this kind would probably say (the same refusal `etl.SYSTEM` runs on), and every draft it produces is scored for **grounding** — the share of the draft's content words that actually occur in the page text, taken as the *minimum* over the stem and the five choices, so one invented choice on an otherwise faithful transcription cannot be averaged away by the four real ones. Below 0.75 the draft is dropped before a reviewer ever sees it wearing a page number. Nothing from that path can reach its live question bank; a human approves it or it stays pending.
+
+## 11f. The inventory: catalogue and search
+
+`ocrmd/library.py` — `ocrmd library`, `ocrmd search`, `ocrmd index`; `GET /api/library`, `GET /api/search`; the Library view and the Search view in the web UI.
+
+The store already knew every page and every stage; what it did not know was *which book*. That lived only in `document.yaml`, which is the right home for it (a person edits it, the pipeline never overwrites it) but the wrong place to answer "what have I scanned" from another tool. `sync_document` mirrors the catalogue fields (title, author, kind, year, ISBN, publisher, tags, project, citation key) onto the `documents` row whenever the file is newer than the last mirror — one `stat` per document per catalogue read, a YAML parse only when something changed — so `ocrmd.db` alone is the inventory. A year written as prose (`1994 (2nd printing)`) still becomes a number; a YAML with a typo is logged and the row keeps what it had.
+
+Search is a `page_text` table of every page's body plus an FTS5 virtual table when SQLite has the module (every python.org and Homebrew build does); without it, `Store.search` falls back to a substring scan with an excerpt cut around the match, so the feature degrades to slower rather than to absent. The user's search box is turned into an FTS5 expression by `fts_query`: every word quoted (so `18-3-102` is a token, not a NOT), ANDed, `word*` kept as a prefix, a quoted query passed through as the phrase it is.
+
+The load-bearing decision is **when the index is updated: on read, by file mtime**. Page files are written by the pipeline, the web editor, `/resolve`, sign-off, `ocrmd review`, the annotation sync, an extraction write-back and any text editor; a hook in each of those would be one more thing every future write path has to remember. Instead `reindex` walks the pages of the documents a search touches, compares each file's mtime to the one the index was built from, and re-reads only what changed — ~300 `stat` calls for a book, which is nothing beside the search itself. Pages that disappear (deletion, `reprocess`) leave the index through `Store.delete_page`. `ocrmd index --force` is for after a restore.
+
+## 11g. Exports and the embedding API
+
+`ocrmd/export/` — one module per shape behind `export_document(s, st, slug, fmt)`: `md` (the built document, regenerated then copied), `txt` (plain text with a separator line per page; the disagreement marks kept visible as `ambitious[?ambiguous]` unless a side is chosen on purpose, because a text export has no footnote to keep the refusal in), `json` (the whole document as one object, with layouts and extraction rows), `jsonl` (one object per page carrying identity, verdict and text — the row a search index or a RAG loader wants). Every export keeps the page ids and is recorded in `doc_exports`, so the inventory can say which shapes a document already exists in.
+
+`ocrmd/api.py` — `Library`, the third driver over the same modules the CLI and the web UI use. It owns a `Settings` and a `Store` of its own rather than the CLI's module-level singleton, so a host can point it at any root and hold several; it takes the provider as an argument (`"auto"`, `None` for OCR-only, or any `llm.Provider`), which is what lets a host with its own model-routing layer keep every model call inside that layer rather than have a dependency call a vendor directly; and it never prints — progress goes to an `emit` callback. `ingest`, `ingest_image`, `verify`, `build`, `page`, `pages`, `document(s)`, `export`, `search`, `envelope`, `read_region`, `send`, `delete_*`, `doctor`. law-ai's plugin is written against exactly this surface with `provider=None`, because its provider chain has no vision path yet and a dependency calling Anthropic directly would bypass its audit layer.
+
 ## 12. State and storage
 
 ```
@@ -597,11 +652,12 @@ The web UI reads specs from `documents/<slug>/etl/*.yaml` and `<root>/etl/pipeli
   llm/<id>.<provider>.json
   documents/<slug>/document.yaml, pages/*.md, <slug>.md
   documents/<slug>/etl/*.yaml, extracted/*   extraction pipelines and what they produced
+  export/<slug>/<slug>.{md,txt,json,jsonl}   exports (`ocrmd export`), recorded in `doc_exports`
   etl/<slug>/<operation>.json    per-operator answer cache, versioned by the prompt
   .ocrmd-camera.json             per-camera view, and the best sharpness that camera has reached
 ```
 
-Tables: `documents`, `pages` (id, document, sequence, hashes, status, page_label, part, width_px, advice, written_fingerprint, reviewed_by/at), `captures` (every frame incl. duplicates and refusals: `duplicate_of`, `rejected`, `document`), `stages` (page_id, stage, version, completed_at, error), `llm_calls` (tokens, latency), `batches`. Indexes on (document, sequence), (document, status), captures.page_id, llm_calls.page_id.
+Tables: `documents` (slug, created_at, and the catalogue mirrored from document.yaml: title, author, kind, year, isbn, publisher, tags, project, citation_key, meta_mtime), `pages` (id, document, sequence, hashes, status, page_label, part, width_px, advice, written_fingerprint, reviewed_by/at), `captures` (every frame incl. duplicates and refusals: `duplicate_of`, `rejected`, `document`), `stages` (page_id, stage, version, completed_at, error), `llm_calls` (tokens, latency), `batches`, `exports` (per-page facsimiles), `etl_writes`, `page_text` (page_id, document, sequence, page_label, status, body, mtime) with the `page_fts` FTS5 table beside it when available, `doc_exports` (document, format, path, at). Indexes on (document, sequence), (document, status), captures.page_id, llm_calls.page_id, page_text(document, sequence).
 
 Stage versions: `preprocess@N`; `ocr@N:<engines>` (a changed engine set re-reads on the next `verify`, locally; the cross-focus merge is part of it); `transcribe@N:<model>` for the LLM pass, so `verify --refresh` re-runs pages made by an older prompt *or* a different model and nothing else does.
 
@@ -665,6 +721,12 @@ ocrmd etl       --doc SLUG -p PIPELINE.yaml [--limit N] [--status S]... [--dry-r
                 [--no-llm] [--out PATH] [--export-docetl DIR]
 ocrmd status    [--doc SLUG] [--all]
 ocrmd build     [--doc SLUG]
+ocrmd library   [--json] [--all]
+ocrmd search    QUERY [--doc SLUG] [--limit N] [--json]
+ocrmd index     [--doc SLUG] [--force]
+ocrmd export    [--doc SLUG] [--format md|txt|json|jsonl] [--out PATH]
+ocrmd sinks     [--no-probe]
+ocrmd send      --doc SLUG --page N [--to NAME] [-o key=value]... [--region x,y,w,h] [--dry-run]
 ocrmd doctor    [--costs]
 ocrmd ocr-bench [--doc SLUG] [--engines a+b | --compare] [--limit N] [-v]
 ocrmd serve     [--host 127.0.0.1] [--port 8765] [--no-open]
@@ -674,7 +736,7 @@ python -m ocrmd <command>
 
 ## 16. Testing
 
-`tests/` runs in about a minute on a Mac (`pytest`): synthetic pages rendered with PIL, a temporary root per test, a `FakeProvider` in place of the API. Covered: camera view keys and persistence; orientation, framing advice, clipped-text detection, spread splitting; the hand gate (detection, reference stability, moved book, non-hand intrusion timeout, page turn) and gate ordering; the store (0.1 migration, document-scoped dedup, thread safety, stage versions, batches); configuration precedence and validation; the pipeline end to end (OCR-only then LLM upgrade with OCR cached, reuse vs `--refresh`, human-edit and reviewer preservation, page-number continuity, error recording, illegible/suspect, duplicates, spreads with hints, batch round trip, re-deriving missing artifacts); build (inheritance, chapter carry-forward, TOC, gaps, needs_reshoot); review parsing/resolution; request shapes for both providers; the CLI (ingest/status/review/build/verify, degraded mode, interactive review); and the web API (documents, pages, images, resolve/sign-off/reopen, human edits surviving a re-run, document.yaml, jobs, upload ingest, scan start failure). `test_etl.py` covers the extraction layer (the type notation, a pipeline naming an operation that does not exist, a missing template field, provenance through map/unnest/reduce, resolve's blocking, the cache reusing and then invalidating, a dry run spending nothing, the DocETL export). `test_region.py` covers the flat rendering (a lamp divided out, ink and paper further apart, a blank crop not stretched into noise, still readable to an engine) and region reads (read on its own terms, only that region, the model asked with the OCR draft as its hint, a provider that cannot do it simply not asked, and nothing written but the flat cache). Tests needing the OCR engine skip where none is installed. CI runs on macOS.
+`tests/` runs in about a minute on a Mac (`pytest`): synthetic pages rendered with PIL, a temporary root per test, a `FakeProvider` in place of the API. Covered: camera view keys and persistence; orientation, framing advice, clipped-text detection, spread splitting; the hand gate (detection, reference stability, moved book, non-hand intrusion timeout, page turn) and gate ordering; the store (0.1 migration, document-scoped dedup, thread safety, stage versions, batches); configuration precedence and validation; the pipeline end to end (OCR-only then LLM upgrade with OCR cached, reuse vs `--refresh`, human-edit and reviewer preservation, page-number continuity, error recording, illegible/suspect, duplicates, spreads with hints, batch round trip, re-deriving missing artifacts); build (inheritance, chapter carry-forward, TOC, gaps, needs_reshoot); review parsing/resolution; request shapes for both providers; the CLI (ingest/status/review/build/verify, degraded mode, interactive review); and the web API (documents, pages, images, resolve/sign-off/reopen, human edits surviving a re-run, document.yaml, jobs, upload ingest, scan start failure). `test_etl.py` covers the extraction layer (the type notation, a pipeline naming an operation that does not exist, a missing template field, provenance through map/unnest/reduce, resolve's blocking, the cache reusing and then invalidating, a dry run spending nothing, the DocETL export). `test_region.py` covers the flat rendering (a lamp divided out, ink and paper further apart, a blank crop not stretched into noise, still readable to an engine) and region reads (read on its own terms, only that region, the model asked with the OCR draft as its hint, a provider that cannot do it simply not asked, and nothing written but the flat cache). `test_library.py`, `test_export.py` and `test_sinks.py` seed pages straight into the store and the page files, so the inventory, the exports and the destination contract are tested without an engine: the catalogue mirror (and a YAML with a typo), search with FTS5 and with the substring fallback, an edited page re-indexed by mtime, a deleted page leaving the index; every export shape with its page ids, the text export keeping both readings; descriptors probed, cached and declined, options typed and refused before the wire, the envelope's contents and the photograph's absence, a dry run, credentials as headers, an entry-point sink, a 502 for a receiver that is down, and nothing written by a send. `test_api.py` drives `Library` the way a host program would. Tests needing the OCR engine skip where none is installed. CI runs on macOS.
 
 ## 17. Build history
 

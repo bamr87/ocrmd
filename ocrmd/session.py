@@ -17,7 +17,7 @@ import cv2
 
 from .config import Settings
 from .store import Store
-from . import legibility, pipeline, render
+from . import legibility, library as library_mod, pipeline, render
 from .hud import ScanState
 from .llm import LLMUnavailable, LLMError
 
@@ -329,6 +329,7 @@ class ScanSession:
                 if pool is not None:
                     pool.shutdown(wait=False, cancel_futures=True)
             render.build_document(s.documents / o.doc, o.doc)
+            library_mod.sync_document(s, st, o.doc)
             if rejected:
                 self.emit(legibility.advice(rejected), "advice")
             summary(st, o.doc, self.emit)

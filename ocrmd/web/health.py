@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from ..config import Settings
 from ..store import Store
-from .. import ocr, pipeline, llm as llm_mod
+from .. import ocr, pipeline, llm as llm_mod, sinks as sinks_mod
 
 
 def cameras(root: Path | None = None) -> list[dict]:
@@ -53,6 +53,10 @@ def doctor_report(s: Settings, st: Store, probe_cameras: bool = True) -> dict:
         "missing_artifacts": missing,
         "orphan_artifacts": len(pipeline.orphan_artifacts(s, st)),
         "open_batches": len(st.open_batches()),
+        # destinations are listed, not probed: a receiver that is down must not slow the doctor down
+        "sinks": [{"name": x.name, "url": getattr(x, "url", "")} for x in sinks_mod.registry(s)],
+        "library": {"documents": len(st.documents()), "pages": len(st.pages()), "indexed": st.indexed_count(),
+                    "fts": st.fts, "export_dir": str(s.export_dir)},
         "costs": [{"provider": r["provider"], "model": r["model"], "n": r["n"], "tokens_in": r["tin"] or 0,
                    "tokens_out": r["tout"] or 0, "cache_read": r["cached"] or 0, "avg_latency_ms": int(r["lat"] or 0)}
                   for r in st.costs()],
