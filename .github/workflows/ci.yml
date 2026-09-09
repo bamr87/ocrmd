@@ -1,5 +1,18 @@
 name: ci
-on: [push, pull_request]
+# `on: [push, pull_request]` ran the whole macOS suite twice for every branch push that had a PR
+# open — the two events fire seconds apart on the same commit. macos-latest bills at 10x, so each
+# duplicate pair cost ~60 billable minutes for no extra signal. Branch coverage comes from
+# `pull_request`; `push` is kept for main so a direct commit there is still tested.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A superseded PR run is worth nothing on a 10x runner. Never cancel a main run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     # Apple Vision (pyobjc) and AVFoundation are macOS-only; the pipeline tests need a local OCR engine.
