@@ -74,6 +74,33 @@ near_duplicate_distance = 4
 flag_threshold = 0.95
 suspect_threshold = 0.35
 
+# --- destinations (outbound: a read page is handed to another system) ---------------------------
+# ocrmd's only outbound path. Each [[sinks]] table names a receiver that speaks the sink contract
+# (ocrmd/sinks.py): GET url answers with a descriptor of the options it takes, POST url takes the
+# page's *reconciled* text plus its provenance (document, page, page id, both agreement scores, a link
+# back to the image) — never the photograph. With one or more configured, every page and every
+# region readout in the web UI grows a "Send…" button, and `ocrmd send --doc X --page N --to NAME`
+# does the same from a terminal. `ocrmd sinks` lists them with their descriptors. Empty disables all
+# of it — nothing leaves the machine. The same list can be given as JSON in OCRMD_SINKS.
+#
+# [[sinks]]
+# name = "law-ai"                                        # what the button and --to call it
+# url = "http://localhost:8000/api/lsat/intake/ocr"      # Law AI: the page becomes a draft LSAT question, pending review
+# api_key = ""                                           # sent as X-API-Key (law-ai is default-open in dev)
+# bearer = ""                                            # or a user token, sent as Authorization: Bearer …
+# timeout = 120.0                                        # the receiver may run a model; a person is waiting
+# options = { section = "LR" }                           # defaults for the receiver's own options
+#
+# [[sinks]]
+# name = "matter"
+# url = "http://localhost:8000/api/matters/smith-lease/intake/ocrmd"   # Law AI: filed as a source document on a matter
+# bearer = "…"                                                          # matters are per-account: a user token, not an API key
+#
+# How this server names itself when it tells a receiver where a page image can be seen. A reviewer over
+# there follows it back to the photograph, so it must be reachable from a browser, not from inside a
+# container.
+# web_url = "http://127.0.0.1:8765"
+
 # --- logging -----------------------------------------------------------------------------------
 log_file = "ocrmd.log"         # relative to root; "" disables
 log_level = "INFO"

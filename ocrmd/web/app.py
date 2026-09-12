@@ -15,7 +15,8 @@ from pydantic import BaseModel
 
 from ..config import Settings
 from ..store import Store
-from .. import pipeline, render, review
+from .. import library as library_mod, pipeline, render, review, sinks as sinks_mod
+from ..export import FORMATS, export_document
 from ..session import ScanOptions, ScanSession, make_provider
 from .health import cameras as list_cameras, doctor_report
 from .jobs import JobManager, KINDS, BUNDLED_PIPELINES, pipelines as etl_pipelines
@@ -75,6 +76,21 @@ class RegionRequest(BaseModel):
     question: str | None = None
 
 
+class SendRequest(BaseModel):
+    """Send this page — or one reading of part of it — to a destination (see ocrmd/sinks.py).
+
+    `text` empty means the page body as it stands on disk (the reconciled reading, including any
+    disagreement the operator has already resolved). A region read supplies its own text and the
+    `bbox` it came from, so the receiver records where on the page the item was. `options` are the
+    receiver's own, as its descriptor declares them.
+    """
+    sink: str = ""                       # may be omitted when exactly one destination is configured
+    options: dict[str, Any] = {}
+    text: str | None = None
+    bbox: list[float] | None = None
+    dry_run: bool = False
+
+
 class Resolve(BaseModel):
     n: int
     chosen: str
@@ -113,6 +129,26 @@ def create_app(s: Settings) -> FastAPI:
         return bool(ses and ses.running and (doc is None or ses.opts.doc == doc))
 
     jobs = JobManager(s, st, scan_running)
+    sink_cache: dict[tuple[str, str], Any] = {}
+
+    def sink_registry() -> list:
+        """The configured destinations, with the descriptor cache kept across requests: settings may
+        change under a test, so the list is re-read, but a receiver is not re-probed on every click."""
+        out = []
+        for sink in sinks_mod.registry(s):
+            key = (sink.name, getattr(sink, "url", ""))
+            out.append(sink_cache.setdefault(key, sink))
+        return out
+
+    def sink_by_name(name: str):
+        have = sink_registry()
+        for sink in have:
+            if sink.name == name:
+                return sink
+        if len(have) == 1 and not name:
+            return have[0]
+        raise HTTPException(404, f"no destination named {name!r}" + (f"; configured: {', '.join(x.name for x in have)}"
+                                                                  if have else " — none configured"))
 
     # --- helpers ---------------------------------------------------------------------------------
     def page_row(slug: str, seq: int):
@@ -154,7 +190,11 @@ def create_app(s: Settings) -> FastAPI:
         counts = st.counts(slug)
         meta = render.load_document_meta(s.documents / slug)
         pages = st.pages(slug)
+        info = library_mod.info(s, st, slug)
         return {"slug": slug, "title": meta.get("title"), "kind": meta.get("kind"), "tags": meta.get("tags") or [],
+                "author": info.author, "year": info.year, "isbn": info.isbn, "project": info.project,
+                "page_labels": info.page_labels, "last_captured_at": info.last_captured_at, "created_at": info.created_at,
+                "exports": info.exports, "done": info.done,
                 "pages": len(pages), "counts": counts,
                 "needs_reshoot": [p["sequence"] for p in pages if p["status"] in ("illegible", "suspect")],
                 "flagged": counts.get("flagged", 0), "unverified": counts.get("unverified", 0) + counts.get("error", 0),
@@ -184,7 +224,32 @@ def create_app(s: Settings) -> FastAPI:
     def api_settings():
         d = s.model_dump()
         d["root"] = str(s.root)
+        # a destination's credentials never reach the browser
+        d["sinks"] = [{**x, "api_key": "•••" if x.get("api_key") else "", "bearer": "•••" if x.get("bearer") else ""}
+                      for x in d.get("sinks") or []]
         return d
+
+    # --- the inventory ---------------------------------------------------------------------------
+    @app.get("/api/library")
+    def api_library():
+        """Every document, with its catalogue entry (document.yaml mirrored into the store) and progress."""
+        return {"documents": [d.to_dict() for d in library_mod.catalog(s, st)],
+                "indexed": st.indexed_count(), "fts": st.fts, "root": str(s.root), "formats": list(FORMATS),
+                "scanning": holder["session"].opts.doc if scan_running() else None}
+
+    @app.get("/api/search")
+    def api_search(q: str = "", doc: str | None = None, limit: int = 50):
+        """Full-text search over every page's body (FTS5 when SQLite has it, a substring scan otherwise)."""
+        if doc:
+            _slug(doc)
+        return {"query": q, "fts": st.fts,
+                "hits": [h.to_dict() for h in library_mod.search(s, st, q, doc, max(1, min(limit, 500)))]}
+
+    @app.post("/api/index")
+    def api_index(doc: str | None = None, force: bool = False):
+        if doc:
+            _slug(doc)
+        return {"indexed": library_mod.reindex(s, st, doc, force), "total": st.indexed_count(), "fts": st.fts}
 
     @app.get("/api/costs")
     def api_costs():
@@ -381,6 +446,31 @@ def create_app(s: Settings) -> FastAPI:
                       f"?x={req.x:.5f}&y={req.y:.5f}&w={req.w:.5f}&h={req.h:.5f}")
         return d
 
+    # --- destinations: a read page is handed to another system (ocrmd/sinks.py) -----------------
+    @app.get("/api/sinks")
+    def api_sinks(probe: bool = True):
+        """The configured destinations with their descriptors, so the UI can draw each one's options —
+        and leave the whole button out when there are none."""
+        out = []
+        for sink in sink_registry():
+            d = sink.describe(probe=probe) if isinstance(sink, sinks_mod.HttpSink) else sink.describe()
+            out.append({"name": sink.name, "url": getattr(sink, "url", ""), "descriptor": d})
+        return out
+
+    @app.post("/api/documents/{slug}/pages/{seq}/send")
+    def api_send(slug: str, seq: int, req: SendRequest):
+        """Hand this page — or a reading of one region of it — to a destination. Nothing here is
+        written or marked; what the receiver did with it comes back as the delivery's summary."""
+        _slug(slug)
+        row = page_row(slug, seq)
+        sink = sink_by_name(req.sink)
+        try:
+            out = sinks_mod.send_page(s, slug, row, sink, req.options, text=req.text, bbox=req.bbox, dry_run=req.dry_run)
+        except sinks_mod.SinkError as e:
+            # 502, not 500: this server is fine — the page did not get through to the other one.
+            raise HTTPException(502, str(e)) from e
+        return out.to_dict()
+
     # --- the page model ----------------------------------------------------------------------------
     @app.get("/api/documents/{slug}/pages/{seq}/layout")
     def api_layout(slug: str, seq: int):
@@ -451,6 +541,19 @@ def create_app(s: Settings) -> FastAPI:
             raise HTTPException(404, "no such document")
         from ..export import jsondoc
         return JSONResponse(jsondoc.document(s, st, slug))
+
+    @app.get("/api/documents/{slug}/export.{fmt}")
+    def api_export(slug: str, fmt: str):
+        """The document in another shape (md | txt | jsonl; json is above), written under <root>/export/
+        and handed back as a download. Every shape keeps the page ids."""
+        _slug(slug)
+        if fmt not in FORMATS:
+            raise HTTPException(400, f"format must be one of {', '.join(FORMATS)}")
+        if slug not in st.documents():
+            raise HTTPException(404, "no such document")
+        path = export_document(s, st, slug, fmt)
+        media = {"md": "text/markdown", "txt": "text/plain", "jsonl": "application/x-ndjson", "json": "application/json"}[fmt]
+        return FileResponse(path, media_type=media, filename=path.name)
 
     def _write(slug: str, row, fm: dict, body: str) -> dict:
         render.write_page(s.documents / slug, row["sequence"], fm, body)

@@ -131,7 +131,27 @@ def pipeline(root: Path, fresh: bool = True) -> None:
     built = root / "documents" / DOC / f"{DOC}.md"
     if not built.exists():
         die(f"build produced no {built}")
-    log(f"pipeline OK: {len(pages)} page file(s), {built.stat().st_size} B document")
+
+    log("ocrmd library / search / export  (the inventory)")
+    p = run([OCRMD, "library"], env=env)
+    if DOC not in p.stdout or "Smoke Test" not in p.stdout:
+        die("`ocrmd library` does not list the smoke document with its title")
+    p = run([OCRMD, "search", "Bennet"], env=env)
+    if f"{DOC}/0002" not in p.stdout:
+        die("`ocrmd search Bennet` did not find page 2")
+    for fmt in ("txt", "jsonl", "json", "md"):
+        run([OCRMD, "export", "--doc", DOC, "--format", fmt], env=env)
+        out = root / "export" / DOC / f"{DOC}.{fmt}"
+        if not out.exists() or out.stat().st_size == 0:
+            die(f"export --format {fmt} wrote nothing at {out}")
+    lines = (root / "export" / DOC / f"{DOC}.jsonl").read_text().splitlines()
+    if len(lines) != len(BODIES) or "page_id" not in lines[0]:
+        die("the jsonl export is not one row per page with a page_id")
+    p = run([OCRMD, "sinks"], env=env)
+    if "no destinations configured" not in p.stdout:
+        die("`ocrmd sinks` should report nothing configured against a throwaway root")
+    log(f"pipeline OK: {len(pages)} page file(s), {built.stat().st_size} B document, "
+        f"{len(lines)} jsonl row(s)")
     print(first[:700])
 
 
@@ -255,8 +275,29 @@ def api(root: Path, port: int) -> None:
         if "EDITED-BY-DRIVER" not in body:
             die("the build job overwrote a human edit")
 
+        lib = s.get("/api/library")
+        if not any(d["slug"] == DOC and d["title"] == "Smoke Test" for d in lib["documents"]):
+            die("/api/library does not list the smoke document with its title")
+        log(f"GET /api/library -> {len(lib['documents'])} document(s), {lib['indexed']} page(s) indexed, fts={lib['fts']}")
+
+        hits = s.get("/api/search?q=Bennet")["hits"]
+        if not any(h["document"] == DOC and h["sequence"] == 2 for h in hits):
+            die(f"/api/search did not find page 2: {hits}")
+        log(f"GET /api/search?q=Bennet -> {len(hits)} hit(s), first: {hits[0]['snippet'][:60]!r}")
+
+        for fmt, needle in (("txt", b"Bennet"), ("jsonl", b'"page_id"')):
+            body = s.get(f"/api/documents/{DOC}/export.{fmt}")
+            if needle not in body:
+                die(f"/export.{fmt} did not contain {needle!r}")
+            log(f"GET /api/documents/{DOC}/export.{fmt} -> {len(body)} B")
+
+        if s.get("/api/sinks") != []:
+            die("/api/sinks should be empty against a throwaway root")
+        log("GET /api/sinks -> [] (no destinations configured; the Send button stays hidden)")
+
         rep = s.get("/api/doctor")
-        log(f"GET /api/doctor -> ocr={rep['ocr_engine']} db={rep['db_integrity']} cameras={len(rep['cameras'])}")
+        log(f"GET /api/doctor -> ocr={rep['ocr_engine']} db={rep['db_integrity']} cameras={len(rep['cameras'])} "
+            f"library={rep['library']['documents']} doc(s)")
     log("api OK")
 
 
@@ -268,7 +309,8 @@ def shots(root: Path, port: int, out: Path) -> None:
     # Page route is #/doc/<slug>/page/<seq> — #/doc/<slug>/<seq> silently falls through to the
     # document view, so a screenshot taken there looks plausible and is the wrong screen.
     views = [
-        ("dashboard", "", ".cards .card"),
+        ("library",   "", ".cards .card"),
+        ("search",    "#/search?q=Bennet", ".readout"),
         ("document",  f"#/doc/{DOC}", "#bulkbar"),
         ("page",      f"#/doc/{DOC}/page/1", "#body"),
         ("scan",      "#/scan", "#gate"),

@@ -19,7 +19,8 @@ def cli_root(root, monkeypatch):
 
 def test_help_lists_every_command():
     out = runner.invoke(cli.app, ["--help"]).output
-    for cmd in ("scan", "ingest", "verify", "reprocess", "review", "status", "build", "doctor", "read", "etl"):
+    for cmd in ("scan", "ingest", "verify", "reprocess", "review", "status", "build", "doctor", "read", "etl",
+                "send", "sinks", "library", "search", "export", "index"):
         assert cmd in out
 
 
@@ -162,3 +163,41 @@ def test_etl_says_which_line_of_a_bad_pipeline_is_wrong(cli_root, tmp_path):
     spec.write_text("name: x\noperations: [{name: a, type: map, output: {schema: {y: timestamp}}}]\n")
     r = runner.invoke(cli.app, ["etl", "--doc", "cli-book", "-p", str(spec)])
     assert r.exit_code == 1 and "unknown output type" in r.output
+
+
+def test_library_search_export_and_sinks_from_the_command_line(cli_root, monkeypatch):
+    """The inventory commands on a store seeded without an OCR engine."""
+    from test_library import seed
+    from ocrmd.store import Store
+    st = Store(cli_root.db_path)
+    seed(cli_root, st, "austen", [("1", "It is a truth universally acknowledged"), ("2", "My dear Mr Bennet")], title="P&P")
+    st.close()
+
+    r = runner.invoke(cli.app, ["library"])
+    assert r.exit_code == 0 and "austen" in r.output and "P&P" in r.output and "1 document(s), 2 page(s)" in r.output, r.output
+    r = runner.invoke(cli.app, ["library", "--json"])
+    assert r.exit_code == 0 and '"slug": "austen"' in r.output
+
+    r = runner.invoke(cli.app, ["search", "Bennet"])
+    assert r.exit_code == 0 and "austen/0002" in r.output and "1 hit(s)" in r.output, r.output
+    r = runner.invoke(cli.app, ["search", "nowhere"])
+    assert r.exit_code == 0 and "no page matches" in r.output
+
+    r = runner.invoke(cli.app, ["export", "--doc", "austen", "--format", "jsonl"])
+    assert r.exit_code == 0 and "austen.jsonl" in r.output, r.output
+    assert (cli_root.export_dir / "austen" / "austen.jsonl").exists()
+    r = runner.invoke(cli.app, ["export", "--doc", "austen", "--format", "docx"])
+    assert r.exit_code == 1
+
+    r = runner.invoke(cli.app, ["index", "--force"])
+    assert r.exit_code == 0 and "2 page(s) indexed" in r.output
+
+    r = runner.invoke(cli.app, ["sinks"])
+    assert r.exit_code == 0 and "no destinations configured" in r.output
+    r = runner.invoke(cli.app, ["send", "--doc", "austen", "--page", "1"])
+    assert r.exit_code == 1
+
+    from ocrmd.config import SinkConfig
+    cli_root.sinks = [SinkConfig(name="study", url="http://localhost:1/intake")]
+    r = runner.invoke(cli.app, ["send", "--doc", "austen", "--page", "2", "--to", "study", "-o", "hint=question 3", "--dry-run"])
+    assert r.exit_code == 0 and "would send" in r.output and '"hint": "question 3"' in r.output and "Bennet" in r.output, r.output

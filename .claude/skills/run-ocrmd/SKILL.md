@@ -3,7 +3,7 @@ name: run-ocrmd
 description: Build, run, and drive ocrmd — the webcam/image-to-Markdown scanner. Use when asked to start ocrmd, serve its web UI, run its tests, ingest pages, take a screenshot of the UI, check the camera/scan path, or verify a change works in the real app.
 ---
 
-ocrmd is a Python CLI (`ocrmd`) plus a FastAPI web UI (`ocrmd serve`) that OCRs page images twice — local engines and a vision LLM — and diffs the readings into Markdown. Drive it with **`.claude/skills/run-ocrmd/driver.py`**: it renders synthetic book pages, runs them through the real pipeline, exercises the JSON API, screenshots every SPA view through Chrome, and can open the live webcam. No book, no camera, and no network required for the default path.
+ocrmd is a Python CLI (`ocrmd`) plus a FastAPI web UI (`ocrmd serve`) — and, since 0.9, a library (`ocrmd.api.Library`) — that OCRs page images twice — local engines and a vision LLM — and diffs the readings into Markdown, keeps an inventory of everything scanned (`ocrmd library`, `ocrmd search`), exports it as md/txt/json/jsonl, and can hand a page to a configured destination (`ocrmd send`). Drive it with **`.claude/skills/run-ocrmd/driver.py`**: it renders synthetic book pages, runs them through the real pipeline, exercises the JSON API, screenshots every SPA view through Chrome, and can open the live webcam. No book, no camera, and no network required for the default path.
 
 All paths below are relative to the repo root. Verified on macOS 15 (arm64), Python 3.14.
 
@@ -34,11 +34,13 @@ Credentials are optional. Everything except `driver.py llm` runs offline. For th
 .venv/bin/python .claude/skills/run-ocrmd/driver.py all
 ```
 
-Wipes `/tmp/ocrmd-drive`, then: renders 2 synthetic pages → `ocrmd doctor` → `ingest --no-llm` → `status` → `build` → serves the API and exercises it → screenshots six SPA views. ~90 s, exit 0 only if every assertion held. Last verified run:
+Wipes `/tmp/ocrmd-drive`, then: renders 2 synthetic pages → `ocrmd doctor` → `ingest --no-llm` → `status` → `build` → `library` / `search` / `export` (every format) → `sinks` → serves the API and exercises it (documents, pages, images, region read, edit + sign-off, a build job, the library, search, exports, the empty destinations list) → screenshots seven SPA views. ~90 s, exit 0 only if every assertion held. Last verified run:
 
 ```
-[driver] pipeline OK: 2 page file(s), 2946 B document
+[driver] pipeline OK: 2 page file(s), 2946 B document, 2 jsonl row(s)
 [driver] GET /api/documents/smoke -> 2 page(s), statuses=['unverified', 'unverified']
+[driver] GET /api/search?q=Bennet -> 1 hit(s), first: '…My dear Mr [Bennet] said his lady…'
+[driver] GET /api/documents/smoke/export.jsonl -> 4211 B
 [driver] GET .../pages/1/image/processed -> 936524 B PNG
 [driver] PUT body + POST signoff -> status=reviewed, edit present
 [driver] POST /api/jobs build -> done
@@ -48,9 +50,9 @@ Wipes `/tmp/ocrmd-drive`, then: renders 2 synthetic pages → `ocrmd doctor` →
 | command | what it does |
 |---|---|
 | `all` | `pipeline` + `api` + `shots`. Offline. The default check. |
-| `pipeline` | fixtures → ingest → OCR → status → build; asserts the OCR actually read the text |
-| `api` | serves, then GETs documents/pages/images/doctor, PUTs a body edit, signs the page off, runs a build job, and checks the job did not clobber the edit |
-| `shots` | serves, screenshots dashboard / document / page / scan / jobs / settings |
+| `pipeline` | fixtures → ingest → OCR → status → build → library/search/export/sinks; asserts the OCR actually read the text and that search finds page 2 |
+| `api` | serves, then GETs documents/pages/images/doctor/library/search/exports/sinks, PUTs a body edit, signs the page off, runs a build job, and checks the job did not clobber the edit |
+| `shots` | serves, screenshots library / search / document / page / scan / jobs / settings |
 | `camera` | opens the real webcam for 8 s via `POST /api/scan/start`, watches the gate states, saves a HUD frame, then deletes what it captured |
 | `llm` | `ocrmd verify` against the real provider — **costs tokens** |
 | `serve` | `ocrmd serve` in the foreground against the throwaway root |
@@ -58,7 +60,7 @@ Wipes `/tmp/ocrmd-drive`, then: renders 2 synthetic pages → `ocrmd doctor` →
 
 Flags: `--root` (throwaway `OCRMD_ROOT`, default `/tmp/ocrmd-drive`), `--keep` (reuse it instead of wiping), `--port` (default 8799), `--shots-dir` (default `/tmp/ocrmd-shots`), `--seconds` (camera).
 
-**Screenshots land in `/tmp/ocrmd-shots/`** — `dashboard.png`, `document.png`, `page.png`, `scan.png`, `jobs.png`, `settings.png`, and `scan-frame.jpg` from the camera check. `page.png` is the one to look at: processed page image beside the transcription, status badge, edit/preview/meta tabs.
+**Screenshots land in `/tmp/ocrmd-shots/`** — `library.png`, `search.png`, `document.png`, `page.png`, `scan.png`, `jobs.png`, `settings.png`, and `scan-frame.jpg` from the camera check. `page.png` is the one to look at: processed page image beside the transcription, status badge, edit/preview/meta tabs.
 
 ### The LLM pass
 
@@ -97,11 +99,36 @@ This is the only way to check the capture lane without sitting at the rig. It is
 
 Both use the repo's own store (`raw/`, `processed/`, `documents/`, `ocrmd.db`). `scan` needs a camera pointed at a book and macOS camera permission for the terminal app.
 
+## Sending a page to a destination (Law AI is the worked example)
+
+Off unless a receiver is named, so nothing in the default path touches one. A destination is any URL that speaks the sink contract in [ocrmd/sinks.py](../../../ocrmd/sinks.py) (`GET` → descriptor, `POST` → envelope):
+
+```sh
+export OCRMD_SINKS='[{"name":"law-ai","url":"http://localhost:8000/api/lsat/intake/ocr"}]'
+.venv/bin/ocrmd sinks                                             # probes the descriptor: name, options, reachable?
+.venv/bin/ocrmd send --doc lsat --page 15 --to law-ai -o hint="question 15" --dry-run   # prints the envelope, sends nothing
+.venv/bin/ocrmd send --doc lsat --page 15 --to law-ai -o hint="question 15"             # posts; the receiver's summary comes back
+```
+
+For law-ai it needs that API up (`bash .claude/skills/run-law-ai/driver.sh` with `KEEP=1`, in the sibling repo) and costs tokens *on law-ai's side* — the extraction runs there, through its provider chain, not through ocrmd's. Its second door, `…/api/matters/<slug>/intake/ocrmd`, files the page as a source document on a matter and needs a user bearer token (`bearer` in the sink config) because matters are per-account. `GET /api/sinks` lists what is configured with descriptors; with none the "Send…" button is absent from the UI and `ocrmd send` refuses.
+
+## Embedding (the library API)
+
+```python
+from ocrmd.api import Library
+lib = Library("/tmp/ocrmd-drive", provider=None)          # OCR only; "auto" uses the configured provider
+lib.ingest(["/tmp/ocrmd-drive/fixtures"], doc="smoke")
+lib.search("Bennet")[0].sequence                     # 2
+lib.export("smoke", "jsonl")
+```
+
+`tests/test_api.py` drives it the way a host program would. law-ai's plugin (`backend/law_ai/ingestionapp/services/ocrmd_plugin.py` in the sibling repo) is built on exactly this surface, with `provider=None`.
+
 ## Test
 
 ```bash
 .venv/bin/ruff check ocrmd tests    # -> All checks passed!
-.venv/bin/python -m pytest          # -> 69 passed, ~1 min
+.venv/bin/python -m pytest          # -> 306 checks, ~2 min
 ```
 
 Both are the CI gates ([.github/workflows/ci.yml](../../../.github/workflows/ci.yml), macOS runner). Single test: `.venv/bin/python -m pytest tests/test_pipeline.py::test_name -q`. Tests that need an OCR engine skip when none is installed, so a green suite does not prove OCR works — `driver.py pipeline` does.

@@ -35,7 +35,14 @@ CREATE TABLE IF NOT EXISTS exports(
 CREATE TABLE IF NOT EXISTS etl_writes(
   id INTEGER PRIMARY KEY, document TEXT NOT NULL, page_id TEXT, pipeline TEXT NOT NULL, operation TEXT,
   target TEXT NOT NULL, keys TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS page_text(
+  page_id TEXT PRIMARY KEY, document TEXT NOT NULL, sequence INTEGER NOT NULL, page_label TEXT, status TEXT,
+  body TEXT NOT NULL, mtime REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS doc_exports(
+  document TEXT NOT NULL, format TEXT NOT NULL, path TEXT NOT NULL, at TEXT NOT NULL,
+  PRIMARY KEY(document, format));
 CREATE INDEX IF NOT EXISTS pages_doc_seq ON pages(document, sequence);
+CREATE INDEX IF NOT EXISTS page_text_doc ON page_text(document, sequence);
 CREATE INDEX IF NOT EXISTS pages_status ON pages(document, status);
 CREATE INDEX IF NOT EXISTS captures_page ON captures(page_id);
 CREATE INDEX IF NOT EXISTS llm_calls_page ON llm_calls(page_id);
@@ -53,7 +60,11 @@ COLUMNS: dict[str, dict[str, str]] = {
         "reviewed_at": "TEXT",
         "fidelity": "REAL",               # how closely the last facsimile export matched the crop (0-1)
     },
-    "documents": {"title": "TEXT"},
+    # The catalogue half of the inventory: document.yaml mirrored onto the row (`library.sync_document`),
+    # so `ocrmd.db` alone answers "what has been scanned" for any tool that can read SQLite.
+    "documents": {"title": "TEXT", "author": "TEXT", "kind": "TEXT", "year": "INTEGER", "isbn": "TEXT",
+                  "publisher": "TEXT", "tags": "TEXT", "project": "TEXT", "citation_key": "TEXT",
+                  "meta_mtime": "REAL"},
     # A rejected capture has no page, so without its own `document` column there is nothing tying it
     # to the scan it came from — `source` records the camera, not the book.
     "captures": {"rejected": "TEXT", "document": "TEXT"},
@@ -65,6 +76,26 @@ DONE_STATUSES = ("verified", "reviewed")
 
 def now() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def fts_query(query: str) -> str:
+    """A person's search box → an FTS5 expression. Every word is quoted (so `-`, `:` and the like are
+    text rather than operators) and the words are ANDed; a trailing `*` keeps prefix matching; a query
+    the person already quoted is passed through as the phrase they meant."""
+    q = query.strip()
+    if '"' in q:
+        return q
+    terms = []
+    for tok in q.split():
+        prefix = tok.endswith("*")
+        tok = tok.rstrip("*").replace('"', "")
+        if tok:
+            terms.append(f'"{tok}"' + ("*" if prefix else ""))
+    return " ".join(terms)
+
+
+def like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _locked(fn):
@@ -89,6 +120,7 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
         self._migrate()
+        self.fts = self._init_fts()
 
     def _migrate(self) -> None:
         for table, cols in COLUMNS.items():
@@ -97,6 +129,17 @@ class Store:
                 if name not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self.db.commit()
+
+    def _init_fts(self) -> bool:
+        """A full-text index over page bodies when this SQLite has FTS5 (every python.org and Homebrew
+        build does); without it `search` falls back to a substring scan of `page_text`."""
+        try:
+            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS page_fts USING fts5("
+                            "body, page_id UNINDEXED, tokenize='porter unicode61')")
+            self.db.commit()
+            return True
+        except sqlite3.OperationalError:
+            return False
 
     def close(self) -> None:
         with self.lock:
@@ -115,6 +158,28 @@ class Store:
     @_locked
     def documents(self) -> list[str]:
         return [r["slug"] for r in self.db.execute("SELECT slug FROM documents ORDER BY created_at")]
+
+    @_locked
+    def document_rows(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM documents ORDER BY created_at").fetchall()
+
+    @_locked
+    def document_row(self, slug: str):
+        return self.db.execute("SELECT * FROM documents WHERE slug=?", (slug,)).fetchone()
+
+    @_locked
+    def set_document_meta(self, slug: str, meta_mtime: float, **fields) -> None:
+        """Mirror document.yaml's catalogue fields onto the row (see `library.sync_document`)."""
+        cols = {k: v for k, v in fields.items() if k in COLUMNS["documents"] and k != "meta_mtime"}
+        cols["meta_mtime"] = meta_mtime
+        sets = ", ".join(f"{k}=?" for k in cols)
+        self.db.execute(f"UPDATE documents SET {sets} WHERE slug=?", (*cols.values(), slug))
+        self.db.commit()
+
+    @_locked
+    def last_captured(self, slug: str) -> str | None:
+        r = self.db.execute("SELECT MAX(captured_at) FROM pages WHERE document=?", (slug,)).fetchone()
+        return r[0] if r else None
 
     @_locked
     def next_sequence(self, slug: str) -> int:
@@ -224,6 +289,7 @@ class Store:
         self.db.execute("DELETE FROM stages WHERE page_id=?", (page_id,))
         self.db.execute("UPDATE captures SET page_id=NULL WHERE page_id=?", (page_id,))
         self.db.execute("DELETE FROM pages WHERE id=?", (page_id,))
+        self._drop_index(page_id)
         self.db.commit()
 
     @_locked
@@ -244,10 +310,79 @@ class Store:
         for pid in ids:
             self.db.execute("DELETE FROM stages WHERE page_id=?", (pid,))
             self.db.execute("DELETE FROM captures WHERE page_id=? OR duplicate_of=?", (pid, pid))
+            self._drop_index(pid)
         self.db.execute("DELETE FROM pages WHERE document=?", (slug,))
+        self.db.execute("DELETE FROM doc_exports WHERE document=?", (slug,))
         self.db.execute("DELETE FROM documents WHERE slug=?", (slug,))
         self.db.commit()
         return len(ids)
+
+    # page text index (the search half of the inventory; see library.py) ------------------------
+    def _drop_index(self, page_id: str) -> None:
+        self.db.execute("DELETE FROM page_text WHERE page_id=?", (page_id,))
+        if self.fts:
+            self.db.execute("DELETE FROM page_fts WHERE page_id=?", (page_id,))
+
+    @_locked
+    def index_page(self, page_id: str, document: str, sequence: int, page_label: str | None, status: str | None,
+                   body: str, mtime: float) -> None:
+        self._drop_index(page_id)
+        self.db.execute("INSERT INTO page_text(page_id,document,sequence,page_label,status,body,mtime) VALUES(?,?,?,?,?,?,?)",
+                        (page_id, document, sequence, page_label, status, body, mtime))
+        if self.fts:
+            self.db.execute("INSERT INTO page_fts(body, page_id) VALUES(?,?)", (body, page_id))
+        self.db.commit()
+
+    @_locked
+    def drop_index(self, page_id: str) -> None:
+        self._drop_index(page_id)
+        self.db.commit()
+
+    @_locked
+    def indexed(self, slug: str | None = None) -> dict[str, float]:
+        """page id -> mtime of the page file the index was built from."""
+        q, args = "SELECT page_id, mtime FROM page_text", ()
+        if slug:
+            q, args = q + " WHERE document=?", (slug,)
+        return {r["page_id"]: r["mtime"] for r in self.db.execute(q, args)}
+
+    @_locked
+    def indexed_count(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM page_text").fetchone()[0])
+
+    @_locked
+    def search(self, query: str, slug: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        """Pages whose body matches `query`, best first: FTS5 ranking with a snippet when the index
+        exists, otherwise a case-insensitive substring scan with an excerpt cut around the match."""
+        if self.fts:
+            q = ("SELECT t.page_id, t.document, t.sequence, t.page_label, t.status, "
+                 "snippet(page_fts, 0, '[', ']', '…', 14) AS snippet, bm25(page_fts) AS rank "
+                 "FROM page_fts JOIN page_text t ON t.page_id = page_fts.page_id WHERE page_fts MATCH ?")
+            args: list = [fts_query(query)]
+            if slug:
+                q += " AND t.document=?"; args.append(slug)
+            q += " ORDER BY rank LIMIT ?"; args.append(limit)
+            try:
+                return self.db.execute(q, args).fetchall()
+            except sqlite3.OperationalError:            # a query FTS5 cannot parse: fall through to the scan
+                pass
+        q = ("SELECT page_id, document, sequence, page_label, status, body AS snippet, 0 AS rank "
+             "FROM page_text WHERE body LIKE ? ESCAPE '\\'")
+        args = [f"%{like_escape(query)}%"]
+        if slug:
+            q += " AND document=?"; args.append(slug)
+        q += " ORDER BY document, sequence LIMIT ?"; args.append(limit)
+        return self.db.execute(q, args).fetchall()
+
+    # document-level exports ------------------------------------------------------------------
+    @_locked
+    def add_doc_export(self, slug: str, fmt: str, path: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO doc_exports VALUES(?,?,?,?)", (slug, fmt, path, now()))
+        self.db.commit()
+
+    @_locked
+    def doc_exports(self, slug: str) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM doc_exports WHERE document=? ORDER BY format", (slug,)).fetchall()
 
     @_locked
     def set_capture_page(self, sha256: str, page_id: str) -> None:

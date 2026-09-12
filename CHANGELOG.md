@@ -1,6 +1,59 @@
 # Changelog
 
-## Unreleased — autofocus
+## 0.9.0 — unreleased: a general-purpose book scanner
+
+### An inventory of everything scanned
+
+`ocrmd library`, `ocrmd search`, `ocrmd index`; `GET /api/library`, `GET /api/search`; the Library and
+Search views in the web UI. The store always knew every page and every stage but not which *book*:
+that lived only in `document.yaml`. `library.sync_document` now mirrors the catalogue fields (title,
+author, kind, year, ISBN, publisher, tags, project, citation key) onto the `documents` row whenever the
+file is newer than the last mirror, so `ocrmd.db` alone answers "what has been scanned here" — for
+ocrmd and for any tool that can read SQLite.
+
+Search is full-text over every page's body: a `page_text` table plus an FTS5 index when SQLite has
+the module, a substring scan with a hand-cut excerpt when it does not. The index is brought up to date
+**on read, by file mtime**: page files are rewritten by the pipeline, the web editor, `/resolve`,
+sign-off, `ocrmd review`, annotation sync, extraction write-backs and any text editor, and none of
+them has to know an index exists. Every hit names its page and links to it.
+
+### Exports in the shapes other tools take
+
+`ocrmd export --doc X --format md | txt | json | jsonl`, and download links on every document in the
+web UI. `md` is the built document; `txt` is plain text with one separator line per page and the
+`==[…]==` marks kept visible as `ambitious[?ambiguous]` rather than silently resolved; `json` is the
+whole document as one object (metadata, frontmatter, bodies, layouts, extraction rows); `jsonl` is one
+object per page with identity, verdict and text — the row a search index or a RAG loader wants. Every
+export keeps the page ids and is recorded in `doc_exports`, so the inventory says which shapes a
+document already exists in.
+
+### Destinations: the law-ai sink became a contract
+
+0.8's draft of the outbound path was a law-ai module inside ocrmd — `lawai_url`, a "→ LSAT" button,
+section and difficulty pickers. A scanner should know nothing about LSAT questions, and the next
+receiver would have wanted its own module. `ocrmd/sinks.py` replaces it with a generic contract a
+receiver implements: `GET url` answers with a **descriptor** (what it is, which typed options it takes),
+`POST url` takes the **envelope** (the page's reconciled text, its provenance — document, page, page
+id, both agreement scores, the flag count, a link back to the image — the document's catalogue entry,
+the operator's options). ocrmd draws the options the descriptor declares, types and checks them
+*before* anything leaves, and shows the receiver's `summary`, `items` and `warnings` when it answers.
+`[[sinks]]` in ocrmd.toml (or `OCRMD_SINKS`) registers an HTTP receiver; the `ocrmd.sinks` entry-point
+group registers a Python one. `ocrmd sinks`, `ocrmd send --doc X --page N --to NAME -o key=value`,
+`GET /api/sinks`, `POST /pages/{seq}/send`, a **Send…** button on every page and in every region
+readout. Everything that was true of the 0.8 path still is: the text travels and the photograph does
+not, a send is not a stage, failure is a 502 and never a silent retry, and with nothing configured
+nothing leaves the machine. `lawai_*` settings are gone; law-ai's two receivers are described in
+ocrmd.example.toml.
+
+### A library API
+
+`from ocrmd.api import Library` — the third driver over the same modules the CLI and the web UI use.
+Its own settings and store (never the CLI's singleton), so a host can point it at any root; the model
+provider as an argument (`"auto"`, `None` for OCR-only, or any `llm.Provider`), so a host with its own
+model-routing layer keeps every call inside it; nothing printed. `ingest`, `ingest_image`, `verify`,
+`build`, `page(s)`, `document(s)`, `export`, `search`, `envelope`, `read_region`, `send`, `delete_*`,
+`doctor`. [law-ai](https://github.com/bamr87/law-ai) installs ocrmd as an optional plugin on this
+surface.
 
 ### The camera was never telling us where the lens was
 
@@ -31,8 +84,13 @@ shows up as crop blur of 149 median for pages that ended merely flagged, 101 for
 The shutter's floor is anchored to that memory, so a soft session can no longer talk itself down.
 `ocrmd doctor` prints what each camera has reached, and the HUD and web scan view show the ratio.
 
-### Fixes
+### Also
 
+- `doc_exports` and the catalogue columns are additive migrations; databases from 0.8 open unchanged.
+- `ocrmd doctor` reports the inventory (documents, pages, indexed pages, FTS5 or not) and the
+  configured destinations; `/api/settings` masks sink credentials.
+- The run skill's driver now asserts the inventory, search, every export shape and the empty
+  destinations list, and screenshots the Library and Search views.
 - **`camctl.focus_state` cost 6.7 ms and was called every frame** — a fifth of the frame budget at
   30 fps, spent building an AVFoundation discovery session to read two booleans off a camera that had
   not moved. The device is cached (invalidated when it disconnects): **0.003 ms**.

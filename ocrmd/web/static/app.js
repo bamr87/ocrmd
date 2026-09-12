@@ -91,29 +91,45 @@ async function refreshTop() {
 }
 
 /* ---------- views ---------- */
+const exportLinks = (slug) => ["md", "txt", "json", "jsonl"].map((f) =>
+  `<a href="/api/documents/${encodeURIComponent(slug)}/export.${f}" download title="download the document as ${f}">${f}</a>`).join(" ");
+/* An FTS snippet marks the match as [word]; show it as a highlight. */
+const snippetHtml = (s) => esc(s).replace(/\[([^\]]+)\]/g, "<mark>$1</mark>");
+
+function docCard(d) {
+  const who = d.author && d.author.length ? d.author.join(", ") : "";
+  const what = [d.kind, d.year, who].filter(Boolean).map(esc).join(" · ");
+  const reshoot = (d.counts.illegible || 0) + (d.counts.suspect || 0);
+  return `
+    <div class="card">
+      <div class="row"><h3><a href="#/doc/${esc(d.slug)}">${esc(d.title || d.slug)}</a></h3>
+        ${d.scanning ? '<span class="right ok small">● scanning</span>' : ""}</div>
+      <div class="muted small">${esc(d.slug)} · ${d.pages} page(s)${d.page_labels ? " · printed " + esc(d.page_labels) : ""}${what ? "<br>" + what : ""}</div>
+      ${statusBar(d.counts)}
+      ${countChips(d.counts)}
+      <div class="row small" style="margin-top:8px">
+        ${reshoot ? `<span class="err">${reshoot} to re-shoot</span>` : ""}
+        ${d.counts.flagged ? `<a href="#/review/${esc(d.slug)}">${d.counts.flagged} to review</a>` : ""}
+        ${d.counts.unverified ? `<span class="muted">${d.counts.unverified} without LLM pass</span>` : ""}
+        <span class="right"></span>
+        <span class="muted">export</span> ${exportLinks(d.slug)}
+      </div>
+    </div>`;
+}
+
+/* The library: every document scanned into this root, its catalogue entry, its progress — and one
+   search box over every page of all of them. */
 async function dashboard() {
-  const [docs, doctor] = await Promise.all([api("/api/documents"), api("/api/doctor?cameras=false")]);
+  const [lib, doctor] = await Promise.all([api("/api/library"), api("/api/doctor?cameras=false"), sinksStatus()]);
+  const docs = lib.documents.map((d) => ({ ...d, scanning: d.slug === lib.scanning }));
+  const pages = docs.reduce((a, d) => a + d.pages, 0);
   view.innerHTML = `
   <div class="grid side">
     <div>
-      <div class="row"><h1>Documents</h1><span class="right"></span>
+      <div class="row"><h1>Library</h1><span class="muted small">${docs.length} document(s) · ${pages} page(s)</span><span class="right"></span>
         <a class="btn" href="#/scan">New scan</a></div>
-      <div class="cards">${docs.map((d) => `
-        <div class="card">
-          <div class="row"><h3><a href="#/doc/${esc(d.slug)}">${esc(d.title || d.slug)}</a></h3>
-            ${d.scanning ? '<span class="right ok small">● scanning</span>' : ""}</div>
-          <div class="muted small">${esc(d.slug)} · ${d.pages} page(s)${d.kind ? " · " + esc(d.kind) : ""}</div>
-          ${statusBar(d.counts)}
-          ${countChips(d.counts)}
-          <div class="row small" style="margin-top:8px">
-            ${d.needs_reshoot.length ? `<span class="err">${d.needs_reshoot.length} to re-shoot</span>` : ""}
-            ${d.flagged ? `<a href="#/review/${esc(d.slug)}">${d.flagged} to review</a>` : ""}
-            ${d.unverified ? `<span class="muted">${d.unverified} without LLM pass</span>` : ""}
-            <span class="right"></span>
-            ${d.document_md ? `<a href="${d.document_md}" download>document.md</a>` : ""}
-          </div>
-        </div>`).join("") || '<div class="muted">No documents yet. Start a scan or upload images.</div>'}
-      </div>
+      <form class="row" id="searchform" style="margin-bottom:12px"><input id="q" placeholder="search every page ever scanned… (quote a phrase, word* for a prefix)" style="flex:1"><button class="primary">Search</button></form>
+      <div class="cards">${docs.map(docCard).join("") || '<div class="muted">Nothing scanned yet. Start a scan, or create a document and drop page images on it.</div>'}</div>
     </div>
     <div>
       <h2>System</h2>
@@ -122,6 +138,7 @@ async function dashboard() {
           <dt>OCR</dt><dd>${esc(doctor.ocr_engine || "none")}</dd>
           <dt>LLM</dt><dd>${esc(doctor.config.provider)} / ${esc(doctor.config.model)} ${doctor.credentials.anthropic || doctor.credentials.xai ? '<span class="ok">credentials found</span>' : '<span class="warn">no credentials — OCR only</span>'}</dd>
           <dt>Prompt</dt><dd>${esc(doctor.config.prompt_version)}</dd>
+          <dt>Index</dt><dd>${doctor.library.indexed} page(s) ${doctor.library.fts ? "(FTS5)" : '<span class="warn">(substring scan — no FTS5)</span>'}</dd>
           <dt>Database</dt><dd>${doctor.db_integrity === "ok" ? '<span class="ok">ok</span>' : `<span class="err">${esc(doctor.db_integrity)}</span>`}</dd>
           <dt>Root</dt><dd class="mono">${esc(doctor.root)}</dd>
           ${doctor.orphan_artifacts ? `<dt>Orphans</dt><dd>${doctor.orphan_artifacts} file(s)</dd>` : ""}
@@ -129,6 +146,10 @@ async function dashboard() {
         </dl>
         <div style="margin-top:8px"><a href="#/settings">full doctor report →</a></div>
       </div>
+      <h2>Destinations</h2>
+      <div class="panel small">${(sinks || []).length
+        ? (sinks || []).map((s) => `<div><b>${esc(s.descriptor?.name || s.name)}</b> <span class="muted">${esc(s.url)}</span>${s.descriptor && s.descriptor.reachable === false ? ` <span class="err">${esc(s.descriptor.error || "unreachable")}</span>` : ""}</div>`).join("")
+        : '<span class="muted">none configured — a <code>[[sinks]]</code> table in ocrmd.toml adds a “Send” button to every page (see ocrmd.example.toml)</span>'}</div>
       <h2>Spend</h2>
       <div class="panel">
         ${doctor.costs.length ? `<table><tr><th>model</th><th class="num">calls</th><th class="num">in</th><th class="num">out</th><th class="num">avg ms</th></tr>
@@ -136,12 +157,29 @@ async function dashboard() {
       </div>
     </div>
   </div>`;
+  $("#searchform").onsubmit = (e) => { e.preventDefault(); const q = $("#q").value.trim(); if (q) location.hash = `#/search?q=${encodeURIComponent(q)}`; };
+}
+
+/* ---------- search ---------- */
+async function searchView(q) {
+  const r = q ? await api(`/api/search?q=${encodeURIComponent(q)}&limit=100`) : { hits: [], fts: true };
+  view.innerHTML = `
+  <div class="row"><h1>Search</h1><span class="muted small">every page of every document</span></div>
+  <form class="row" id="searchform" style="margin-bottom:12px"><input id="q" value="${esc(q || "")}" placeholder="words to find; quote a phrase; word* for a prefix" style="flex:1"><button class="primary">Search</button></form>
+  ${q ? `<div class="muted small" style="margin-bottom:8px">${r.hits.length} hit(s) for <b>${esc(q)}</b>${r.fts ? "" : " · substring scan (this SQLite has no FTS5)"}</div>` : ""}
+  ${r.hits.map((h) => `
+    <div class="readout" style="margin-top:6px">
+      <div class="row small"><a href="#/doc/${esc(h.document)}/page/${h.sequence}"><b>${esc(h.title || h.document)}</b> · page ${String(h.sequence).padStart(4, "0")}${h.page_label ? ` (p. ${esc(h.page_label)})` : ""}</a> ${badge(h.status || "unverified")}</div>
+      <div class="small">${snippetHtml(h.snippet)}</div>
+    </div>`).join("")}`;
+  $("#searchform").onsubmit = (e) => { e.preventDefault(); location.hash = `#/search?q=${encodeURIComponent($("#q").value.trim())}`; };
+  $("#q").focus();
 }
 
 /* ---------- scan ---------- */
 let scanState = null;
 async function scanView() {
-  const [docs, cams, snap, settings] = await Promise.all([api("/api/documents"), api("/api/cameras").catch(() => []), api("/api/scan"), api("/api/settings")]);
+  const [docs, cams, snap, settings] = await Promise.all([api("/api/documents"), api("/api/cameras").catch(() => []), api("/api/scan"), api("/api/settings"), sinksStatus()]);
   scanState = snap;
   view.innerHTML = `
   <div class="grid side">
@@ -267,7 +305,13 @@ function renderScan(s) {
     <dt>Working</dt><dd>${esc(s.working || "idle")}</dd>
     <dt>LLM</dt><dd>${s.llm ? esc(s.llm.provider + "/" + s.llm.model) : "OCR only"}</dd>`;
   const rec = $("#recent");
-  if (rec) rec.innerHTML = (s.recent || []).map((r) => `<span class="s-${r.status}">${esc(r.label)} ${esc(r.status)}</span>`).join("");
+  if (rec) rec.innerHTML = (s.recent || []).map((r) => {
+    const seq = /^\d+$/.test(r.label) ? Number(r.label) : null;
+    const doc = s.doc || (s.opts && s.opts.doc) || "";
+    const page = `<span class="s-${r.status}">${seq != null && doc ? `<a href="#/doc/${esc(doc)}/page/${seq}">${esc(r.label)}</a>` : esc(r.label)} ${esc(r.status)}</span>`;
+    return page + (seq != null && doc && sinks && sinks.length
+      ? ` <a class="chip" href="#/doc/${esc(doc)}/page/${seq}?send=1" title="send this page to a destination">send</a>` : "");
+  }).join(" ");
   const adv = $("#advice"); if (adv) adv.textContent = s.last_error || s.advice || "";
   const log = $("#scanlog");
   if (log && s.events) { const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20; log.innerHTML = logHtml(s.events); if (atBottom) log.scrollTop = log.scrollHeight; }
@@ -287,7 +331,7 @@ async function docView(slug) {
   <div class="row"><h1>${esc(d.title || slug)}</h1><span class="muted">${esc(slug)} · ${d.pages} pages</span><span class="right"></span>
     ${d.flagged ? `<a class="btn" href="#/review/${esc(slug)}">Review ${d.flagged} flagged</a>` : ""}
     <button id="j-verify">Verify</button><button id="j-build">Build</button><button id="j-rebuild" title="Rebuild every page from its Markdown and score it against the photograph">Rebuild</button><button id="j-reprocess" class="danger">Reprocess</button>
-    ${d.document_md ? `<a class="btn" href="${d.document_md}" download>document.md</a>` : ""}
+    <span class="small"><span class="muted">export</span> ${exportLinks(slug)}</span>
     <a class="btn" href="#/settings/${esc(slug)}">Metadata</a>
     <button id="j-delete-doc" class="danger" title="delete the whole document">Delete…</button></div>
   ${statusBar(d.counts)}
@@ -432,7 +476,7 @@ async function deleteDocument(slug, pages) {
 let pageTab = "edit", imgKind = "flat", imgZoom = 1, reviewMode = false;
 let sel = null, selPage = null, readout = null;   // the dragged rectangle, whose page, and what it read
 async function pageView(slug, seq) {
-  const p = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`);
+  const [p] = await Promise.all([api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}`), sinksStatus()]);
   const fm = p.frontmatter || {}, v = fm.verification || {}, ctx = fm.context || {}, proc = fm.processing || {};
   const kinds = Object.keys(p.images);
   if (!kinds.includes(imgKind)) imgKind = kinds[0];
@@ -447,6 +491,7 @@ async function pageView(slug, seq) {
     <button ${p.next == null ? "disabled" : ""} onclick="go('${esc(slug)}',${p.next})" title="n">next ▶</button>
     <button ${p.next_flagged == null ? "disabled" : ""} onclick="go('${esc(slug)}',${p.next_flagged})" title="shift+n">next flagged ⏭</button>
     ${p.status === "reviewed" ? `<button id="reopen">Reopen</button>` : `<button class="primary" id="signoff" ${p.unresolved ? "disabled" : ""} title="${p.unresolved ? p.unresolved + " unresolved" : "sign off as reviewed"}">Sign off</button>`}
+    ${sendButton("send-open", "Send…", "hand this page's reading to a destination — a study platform, a knowledge base")}
     <button class="danger" id="delete-page" title="delete this page">Delete…</button>
   </div>
   <div class="grid page">
@@ -457,6 +502,7 @@ async function pageView(slug, seq) {
       </div>
       <div class="imgbox" id="imgbox"><div class="imgwrap" id="imgwrap" style="width:${imgZoom * 100}%"><img id="pimg" src="${p.images[imgKind] || ""}"><div class="selrect" id="selrect" hidden></div></div></div>
       <div id="selbar" class="selbar small"></div>
+      <div id="send-panel"></div>
       ${p.advice ? `<div class="warn small" style="margin-top:6px">${esc(p.advice)}</div>` : ""}
       ${proc.continuity ? `<div class="warn small">${esc(proc.continuity)}</div>` : ""}
       ${p.llm_error ? `<div class="err small">LLM: ${esc(p.llm_error)}</div>` : ""}
@@ -468,6 +514,9 @@ async function pageView(slug, seq) {
     </div>
   </div>`;
   attachSelect(slug, seq);
+  renderSend(slug, seq, null, p.unresolved);
+  const btn = $("#send-open");
+  if (btn) btn.onclick = () => { sendOpen = !sendOpen; sendOut = null; renderSend(slug, seq, null, p.unresolved); };
   const tab = $("#tab");
   if (pageTab === "edit") {
     tab.innerHTML = `
@@ -556,6 +605,98 @@ window.zoomImg = (d) => {
   const wrap = $("#imgwrap"); if (wrap) wrap.style.width = `${imgZoom * 100}%`;
   const lbl = $("#zoomlbl"); if (lbl) lbl.textContent = `${Math.round(imgZoom * 100)}%`;
 };
+
+/* ---------- sending a page to a destination ----------
+   ocrmd's one outbound path (ocrmd/sinks.py): the reconciled reading of a page (or of one box on it)
+   is handed to a receiver that speaks the sink contract — a study platform, a knowledge base, a
+   notebook. The text travels, the photograph does not; the page id goes with it so a reviewer over
+   there can come back here. Each receiver declares its own options in a descriptor and the panel
+   draws them. The whole UI is absent unless a destination is configured. */
+let sinks = null;                                 // the /api/sinks probe, fetched once per load
+let sendOpen = false, sendOut = null, sendSink = null;
+
+async function sinksStatus() {
+  if (sinks === null) sinks = await api("/api/sinks").catch(() => []);
+  return sinks;
+}
+
+function sendButton(id, label, title) {
+  return sinks && sinks.length ? `<button class="small" id="${id}" title="${esc(title)}">${label}</button>` : "";
+}
+
+/* One input per declared option, typed as the receiver said: a select for an enum, a checkbox for
+   a boolean, a number box, a text box. A blank means "let the receiver decide". */
+function optionField(o, val) {
+  const cur = val ?? o.default ?? "";
+  const key = esc(o.key), label = esc(o.label || o.key), help = esc(o.help || "");
+  if (o.type === "enum") return `<select class="small" data-opt="${key}" title="${help}"><option value="">${label}: auto</option>${(o.choices || []).map((c) => `<option ${String(c) === String(cur) ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+  if (o.type === "boolean") return `<label style="margin:0" title="${help}"><input type="checkbox" data-opt="${key}" ${cur === true || String(cur) === "true" ? "checked" : ""}> ${label}</label>`;
+  const num = o.type === "integer" || o.type === "number";
+  return `<input class="small" type="${num ? "number" : "text"}" data-opt="${key}" value="${esc(cur)}" placeholder="${label}${o.help ? " — " + help : ""}" style="${num ? "width:90px" : "flex:1;min-width:160px"}" title="${help}">`;
+}
+
+/* The page-level panel: pick a destination, fill its options, send. `region` is set when the send
+   comes from a region readout, and then the readout's text is what travels rather than the page body. */
+function renderSend(slug, seq, region, unresolved = 0) {
+  const box = $("#send-panel"); if (!box) return;
+  if (!sendOpen || !sinks || !sinks.length) { box.innerHTML = ""; return; }
+  const cur = sinks.find((s) => s.name === sendSink) || sinks[0];
+  sendSink = cur.name;
+  const d = cur.descriptor || {};
+  const defaults = d.defaults || {};
+  box.innerHTML = `
+    <div class="panel" style="margin-top:8px">
+      <div class="row">
+        <b>Send</b>
+        ${sinks.length > 1 ? `<select id="send-sink" class="small">${sinks.map((s) => `<option ${s.name === cur.name ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select>` : `<b>→ ${esc(d.name || cur.name)}</b>`}
+        <span class="muted small">${region ? "the region reading" : "this page"} — the text and its provenance travel; the photograph does not</span>
+        <span class="right"></span><button class="small" id="send-close">close</button>
+      </div>
+      ${d.description ? `<div class="muted small" style="margin-top:4px">${esc(d.description)}</div>` : ""}
+      ${d.reachable === false ? `<div class="err small" style="margin-top:4px">${esc(d.error || "unreachable")}</div>` : ""}
+      <div class="row" style="margin-top:6px">
+        ${(d.options || []).map((o) => optionField(o, defaults[o.key])).join("")}
+        <button class="small primary" id="send-go">Send to ${esc(d.name || cur.name)}</button>
+      </div>
+      <div class="muted small" style="margin-top:4px">${esc(cur.url)}</div>
+      ${!region && unresolved ? `<div class="warn small">${unresolved} unresolved disagreement${unresolved === 1 ? "" : "s"} in this page — the marks travel with it, and so does the count</div>` : ""}
+      <div id="send-out"></div>`;
+  const pick = $("#send-sink");
+  if (pick) pick.onchange = () => { sendSink = pick.value; sendOut = null; renderSend(slug, seq, region, unresolved); };
+  $("#send-close").onclick = () => { sendOpen = false; sendOut = null; renderSend(slug, seq, region, unresolved); };
+  $("#send-go").onclick = () => sendPage(slug, seq, region);
+  box.querySelectorAll("input[type=text]").forEach((i) => (i.onkeydown = (e) => { if (e.key === "Enter") sendPage(slug, seq, region); }));
+  const first = box.querySelector("[data-opt]"); if (first) first.focus();
+  renderSendOut();
+}
+
+async function sendPage(slug, seq, region) {
+  const out = $("#send-out");
+  out.innerHTML = '<div class="muted small" style="margin-top:8px">sending…</div>';
+  const options = {};
+  $("#send-panel").querySelectorAll("[data-opt]").forEach((el) => { options[el.dataset.opt] = el.type === "checkbox" ? el.checked : el.value; });
+  const body = { sink: sendSink, options };
+  if (region) { body.text = region.text; body.bbox = region.bbox; }
+  try {
+    sendOut = await api(`/api/documents/${encodeURIComponent(slug)}/pages/${seq}/send`, { method: "POST", body });
+    renderSendOut();
+    toast(sendOut.summary, sendOut.items.length ? "ok" : "");
+  } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+}
+
+/* What came back: the receiver's one-line summary, one row per item it made, and its warnings. */
+function renderSendOut() {
+  const out = $("#send-out"); if (!out || !sendOut) return;
+  const r = sendOut;
+  out.innerHTML = `
+    <div class="${r.items.length ? "ok" : "warn"} small" style="margin-top:8px">${esc(r.summary)}</div>
+    ${r.items.map((it) => `
+      <div class="readout" style="margin-top:6px"><div class="row small">
+        ${it.status ? `<span class="chip on">${esc(it.status)}</span>` : ""}<b>${esc(it.title || "")}</b>
+        <span class="muted">${esc(it.detail || "")}</span><span class="right"></span><span class="mono muted">${esc(it.id || "")}</span>
+      </div></div>`).join("")}
+    ${r.warnings.map((w) => `<div class="warn small">${esc(w)}</div>`).join("")}`;
+}
 
 /* ---------- selecting a region of the page ---------- */
 const IMG_HELP = {
@@ -658,6 +799,7 @@ function renderReadout(slug, seq) {
         <button class="small" data-copy="text">Copy OCR</button>
         ${r.llm ? '<button class="small" data-copy="llm">Copy model</button>' : ""}
         <button class="small" data-insert="${r.llm ? "llm" : "text"}">Insert into body</button>
+        ${sendButton("r-send", "Send…", "send this region's reading to a destination")}
       </div>
     </div>`;
   out.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => {
@@ -665,6 +807,14 @@ function renderReadout(slug, seq) {
   }));
   const ins = out.querySelector("[data-insert]");
   if (ins) ins.onclick = () => insertIntoBody(ins.dataset.insert === "llm" ? r.llm : r.text);
+  const toSend = out.querySelector("#r-send");
+  if (toSend) toSend.onclick = () => {
+    // The model's reading when there is one: a region is re-read at several times the page's glyph
+    // height, and that reading is the better evidence about what the box says.
+    sendOpen = true; sendOut = null;
+    renderSend(slug, seq, { text: r.llm || r.text, bbox: [r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3]] });
+    $("#send-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
 }
 
 /* Inserted at the cursor, and only into the editor: a region read is one unreconciled reading, so it
@@ -781,12 +931,15 @@ async function route() {
   const hash = location.hash || "#/";
   const [path, query] = hash.slice(1).split("?");
   const parts = path.split("/").filter(Boolean);
-  reviewMode = new URLSearchParams(query || "").get("review") === "1";
+  const q = new URLSearchParams(query || "");
+  reviewMode = q.get("review") === "1";
+  if (q.get("send") === "1") { sendOpen = true; sendOut = null; }
   const nav = parts[0] || "dash";
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav || (nav === "doc" && a.dataset.nav === "dash")));
   try {
     if (!parts.length) await dashboard();
     else if (parts[0] === "scan") await scanView();
+    else if (parts[0] === "search") await searchView(q.get("q") || "");
     else if (parts[0] === "jobs") await jobsView();
     else if (parts[0] === "settings") await settingsView(parts[1] && decodeURIComponent(parts[1]));
     else if (parts[0] === "review") await reviewView(decodeURIComponent(parts[1]));
