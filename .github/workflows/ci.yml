@@ -1,21 +1,38 @@
 name: ci
 # `on: [push, pull_request]` ran the whole macOS suite twice for every branch push that had a PR
 # open — the two events fire seconds apart on the same commit. macos-latest bills at 10x, so each
-# duplicate pair cost ~60 billable minutes for no extra signal. Branch coverage comes from
-# `pull_request`; `push` is kept for main so a direct commit there is still tested.
+# duplicate pair cost ~60 billable minutes for no extra signal.
+#
+# macOS runs only on pushes to main and manual runs (bamr87/bamr87#268: private-repo Actions
+# spend is held at $0 on purpose). PRs get a cheap Linux lint job. To run the macOS suite on a
+# branch before merging:
+#   gh workflow run ci.yml -R bamr87/ocrmd --ref <branch>
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
-# A superseded PR run is worth nothing on a 10x runner. Never cancel a main run.
+# A superseded PR run is worth nothing. Never cancel a main run.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    # ruff is pure Python, so it runs on Linux at 1x instead of macOS at 10x.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install ruff
+      - run: ruff check ocrmd tests
+
   test:
     # Apple Vision (pyobjc) and AVFoundation are macOS-only; the pipeline tests need a local OCR engine.
+    # main pushes + manual runs only (bamr87/bamr87#268).
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
