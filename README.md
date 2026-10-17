@@ -1,5 +1,11 @@
 # ocrmd
 
+> Scan books and pages into cross-checked Markdown: local OCR diffed against a Claude vision read, with full-text search.
+
+[![CI](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml/badge.svg)](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml)
+
+## Overview
+
 Turn physical books and loose pages into cross-checked Markdown, plain text and JSON — from a webcam pointed at the book, a folder of photographs, or a PDF — and keep an inventory of everything you have scanned.
 
 Every page is read **twice**: once by local OCR engines (Apple Vision + RapidOCR voting), once by a vision model (Claude by default). The two readings are diffed into a Markdown page file with rich frontmatter; where they disagree the page says so (`==[word]==[^ocrmd-n]`) rather than quietly picking one, and digits are never auto-resolved. The cross-check is the product: an early version fabricated a table of contents for a page it could not read, and only the diff caught it.
@@ -16,6 +22,15 @@ What you get, per root directory:
 - **A library** — `from ocrmd.api import Library` embeds all of it in another program.
 
 Built and tuned on a fixed camera over a textbook. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the measurements behind each default, and [CHANGELOG.md](CHANGELOG.md) for what changed.
+
+## Features
+
+- Reads every page twice: local OCR (Apple Vision and RapidOCR voting) and a vision model (Claude by default)
+- Diffs the two readings and flags disagreements instead of silently picking one
+- Ingests from a webcam, a folder of photos or a PDF
+- A SQLite inventory with full-text search across every scanned page
+- Exports to Markdown, plain text and JSON, plus a local web UI
+- Structured-data extraction and hand-off to configured destinations
 
 ## Install (macOS)
 
@@ -456,3 +471,30 @@ book
 `ocrmd.toml`: `motion_threshold`, `stable_frames`, `settle_frames`, `geometry_frames`, `geometry_tolerance`, `novelty_threshold`, `blur_threshold`, `occlusion_cover`, `occlusion_rebaseline`, `focus_bracket*`, `admit_*`. The preview window shows the live gate state and numbers, and every capture's sharpness/occlusion/px-per-page goes to `ocrmd.log`.
 
 Capturing too seldom? Lower `settle_frames` (the wait after a hand) or raise `geometry_tolerance` (how much the page outline may wander). Still capturing during page turns? Raise them.
+
+## Development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'
+.venv/bin/ruff check ocrmd tests
+.venv/bin/python -m pytest
+```
+
+Full commands, conventions and gotchas for humans and AI agents live in [CLAUDE.md](CLAUDE.md).
+
+## Contributing
+
+Contributions are welcome via pull request. Use [Conventional Commits](https://www.conventionalcommits.org/) and keep the CI checks green. The fleet-wide workflow is described in the hub's [CONTRIBUTING.md](https://github.com/bamr87/bamr87/blob/main/CONTRIBUTING.md). AI agents should start with [CLAUDE.md](CLAUDE.md).
+
+## Changelog
+
+Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+`pyproject.toml` declares MIT, but no LICENSE file has been added yet.
+
+---
+
+<!-- bamr87-portfolio-footer -->
+<sub>Part of the [bamr87 portfolio](https://github.com/bamr87) — browse every project on [Amr's GitHub profile](https://github.com/bamr87).</sub>
