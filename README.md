@@ -2,7 +2,7 @@
 
 > Scan books and pages into cross-checked Markdown: local OCR diffed against a Claude vision read, with full-text search.
 
-[![CI](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml/badge.svg)](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml)
+[![CI](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml/badge.svg)](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/bamr87/ocrmd)](LICENSE)
 
 ## Overview
 
@@ -492,7 +492,7 @@ Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-`pyproject.toml` declares MIT, but no LICENSE file has been added yet.
+Released under the [MIT License](LICENSE).
 
 ---
 
