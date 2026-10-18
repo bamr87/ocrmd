@@ -276,7 +276,7 @@ def parse_transcription(text: str) -> Transcription:
 class AnthropicProvider:
     name = "anthropic"
 
-    def __init__(self, model: str = "claude-opus-5", timeout: float = 180.0, max_retries: int = 3,
+    def __init__(self, model: str = "claude-opus-5-5", timeout: float = 180.0, max_retries: int = 3,
                  effort: str = "medium"):
         import anthropic
         # OAuth bearer tokens (ANTHROPIC_AUTH_TOKEN) require the oauth beta header; API keys do not.
@@ -414,7 +414,7 @@ class AnthropicProvider:
             if os.environ.get("ANTHROPIC_AUTH_TOKEN") and body.get("error", {}).get("message") == "Error":
                 # subscription OAuth tokens reach only some models via the API; this bare 429 is that case
                 raise LLMUnavailable(f"{self.model} is not available to this OAuth token via the API; "
-                                     "set OCRMD_MODEL=claude-haiku-4-5 (or use an API key)") from e
+                                     "set OCRMD_MODEL=claude-haiku-5-5 (or use an API key)") from e
             raise LLMUnavailable(f"rate limited after retries: {e.message}") from e
         except anthropic.APIConnectionError as e:
             raise LLMUnavailable(f"cannot reach the Anthropic API: {e}") from e

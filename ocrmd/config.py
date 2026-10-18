@@ -136,7 +136,7 @@ class Settings(BaseModel):
 
     # --- llm --------------------------------------------------------------------------------
     provider: str = "anthropic"
-    model: str = "claude-opus-5"
+    model: str = "claude-opus-5-5"
     xai_model: str = "grok-4"
     prompt_version: str = "transcribe@5"
     llm_workers: int = 2              # concurrent LLM calls during a scan (OCR stays serial)

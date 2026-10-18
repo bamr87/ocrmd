@@ -122,7 +122,7 @@ the round trip (page → Markdown → SVG/LaTeX → page, scored) and annotation
 
 Precedence: defaults → `~/.config/ocrmd/config.toml` → `<root>/ocrmd.toml` → `OCRMD_<FIELD>` env → CLI flags. Every field on `Settings` is automatically an `OCRMD_*` variable; invalid values fail fast naming the key. [ocrmd.example.toml](ocrmd.example.toml) documents the full set. `OCRMD_ROOT` moves all data (default: the project directory itself — `raw/`, `processed/`, `ocr/`, `llm/`, `documents/`, `ocrmd.db` live alongside the code, and all but `documents/` are gitignored).
 
-Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`, first found wins, never overriding the existing environment). `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN` for the SDK. **A subscription OAuth token only serves `claude-haiku-4-5`** — other models come back as a bare 429; set `OCRMD_MODEL=claude-haiku-4-5` alongside it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`.
+Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`, first found wins, never overriding the existing environment). `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN` for the SDK. **A subscription OAuth token only serves `claude-haiku-5-5`** — other models come back as a bare 429; set `OCRMD_MODEL=claude-haiku-5-5` alongside it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`.
 
 ## Testing
 

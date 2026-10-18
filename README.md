@@ -46,8 +46,8 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'   # add ,pdf
 
 | Variable | Notes |
 |---|---|
-| `ANTHROPIC_API_KEY` | Console API key. All models; default model is `claude-opus-5`. Needed for `verify --batch`. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code / subscription OAuth token (`sk-ant-oat…`). Works, but as of Aug 2026 the API only serves **`claude-haiku-4-5`** to it — set `OCRMD_MODEL=claude-haiku-4-5` too. Other models return a bare 429 `Error`; ocrmd reports this as "not available to this OAuth token". |
+| `ANTHROPIC_API_KEY` | Console API key. All models; default model is `claude-opus-5-5`. Needed for `verify --batch`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code / subscription OAuth token (`sk-ant-oat…`). Works, but as of Aug 2026 the API only serves **`claude-haiku-5-5`** to it — set `OCRMD_MODEL=claude-haiku-5-5` too. Other models return a bare 429 `Error`; ocrmd reports this as "not available to this OAuth token". |
 | `ANTHROPIC_AUTH_TOKEN` | Any other bearer token; same rules as above. |
 | `XAI_API_KEY` | For `--provider xai` (Grok vision; implemented against xAI's OpenAI-compatible endpoint, not exercised live here). |
 
