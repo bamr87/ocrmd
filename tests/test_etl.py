@@ -247,8 +247,8 @@ def test_output_writers_lead_with_the_provenance(root, tmp_path):
 # --- handing it to DocETL ----------------------------------------------------------------------------
 def test_the_same_pipeline_exports_as_a_docetl_one(tmp_path):
     out = tmp_path / "x"
-    spec_ = etl.export_docetl(etl.Pipeline.load(spec(tmp_path)), rows(2), out, "claude-haiku-4-5")
-    assert spec_["default_model"] == "anthropic/claude-haiku-4-5"
+    spec_ = etl.export_docetl(etl.Pipeline.load(spec(tmp_path)), rows(2), out, "claude-haiku-5-5")
+    assert spec_["default_model"] == "anthropic/claude-haiku-5-5"
     assert [o["name"] for o in spec_["operations"]] == ["find", "flatten"]
     assert spec_["operations"][0]["output"]["schema"]["cases"] == "list[{name: string, year: integer}]"
     assert spec_["operations"][1]["unnest_key"] == "cases"
@@ -359,8 +359,8 @@ def test_the_docetl_export_speaks_litellm_and_completes_resolve(tmp_path):
 pipeline:""")
     s = s.replace("operations: [find, flatten]", "operations: [find, flatten, same, q]")
     pipe = etl.Pipeline.load(spec(tmp_path, s))
-    out = etl.export_docetl(pipe, rows(), tmp_path / "out", "claude-haiku-4-5")
-    assert out["default_model"] == "anthropic/claude-haiku-4-5"
+    out = etl.export_docetl(pipe, rows(), tmp_path / "out", "claude-haiku-5-5")
+    assert out["default_model"] == "anthropic/claude-haiku-5-5"
     resolve = next(o for o in out["operations"] if o["type"] == "resolve")
     assert "resolution_prompt" in resolve and resolve["output"]["schema"] == {"name": "string"}
     ext = next(o for o in out["operations"] if o["type"] == "extract")

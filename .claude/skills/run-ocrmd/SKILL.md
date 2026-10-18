@@ -17,7 +17,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'
 
 Screenshots use `npx` + the installed **Google Chrome** (`/Applications/Google Chrome.app`). Nothing else to install — see Gotchas for why we don't use Playwright's own browsers.
 
-Credentials are optional. Everything except `driver.py llm` runs offline. For the LLM pass put `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN` + `OCRMD_MODEL=claude-haiku-4-5`) in `.env`.
+Credentials are optional. Everything except `driver.py llm` runs offline. For the LLM pass put `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN` + `OCRMD_MODEL=claude-haiku-5-5`) in `.env`.
 
 ```bash
 .venv/bin/ocrmd doctor
@@ -156,8 +156,8 @@ leave it up; the driver launches it with `start_new_session=True` and signals th
 badly, and page detection keys on paper being *brighter than its surround* — the driver draws Times New Roman on cream paper inset in a dark-grey "desk" margin. A page image with no margin gets no detected page rectangle.
 - **The HUD renders non-ASCII as `?`.** OpenCV's Hershey fonts are ASCII-only, so the advice line's
   em-dashes come out as `???` in `scan-frame.jpg`. Cosmetic, not a corrupted string.
-- **A subscription OAuth token only serves `claude-haiku-4-5`.** Any other model returns a bare 429.
-Set `OCRMD_MODEL=claude-haiku-4-5` alongside `CLAUDE_CODE_OAUTH_TOKEN`, or use an `ANTHROPIC_API_KEY`.
+- **A subscription OAuth token only serves `claude-haiku-5-5`.** Any other model returns a bare 429.
+Set `OCRMD_MODEL=claude-haiku-5-5` alongside `CLAUDE_CODE_OAUTH_TOKEN`, or use an `ANTHROPIC_API_KEY`.
 
 ## Troubleshooting
 

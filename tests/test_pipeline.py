@@ -261,14 +261,14 @@ def test_anthropic_request_shape(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     img = np.zeros((20, 20, 3), np.uint8)
-    opus = llm_mod.AnthropicProvider("claude-opus-5", effort="low")
+    opus = llm_mod.AnthropicProvider("claude-opus-5-5", effort="low")
     p = opus._params(img, "", None)
     assert p["fallbacks"] == "default" and p["betas"] == ["server-side-fallback-2026-07-01"]
     assert p["output_config"]["effort"] == "low" and p["output_config"]["format"]["type"] == "json_schema"
     assert "fallbacks" not in opus._params(img, "", None, batch=True)          # rejected by the Batches API
     assert p["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert p["messages"][0]["content"][1]["text"] == "Transcribe the page."
-    haiku = llm_mod.AnthropicProvider("claude-haiku-4-5")
+    haiku = llm_mod.AnthropicProvider("claude-haiku-5-5")
     ph = haiku._params(img, "", None)
     assert "effort" not in ph["output_config"] and "fallbacks" not in ph
 

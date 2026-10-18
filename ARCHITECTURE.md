@@ -32,8 +32,8 @@ text, JSON, JSON-lines), it can be handed page by page to any receiver that spea
   Runtime, and the official `anthropic` SDK are all first-class.
 - **Local OCR engines:** Apple Vision on macOS plus RapidOCR (`ocrmd[rapidocr]`) as a voting second
   engine; RapidOCR alone elsewhere; Tesseract (`ocrmd[tesseract]`) as a measured-weak last resort.
-- **Cloud LLM:** Claude Opus 5 (`claude-opus-5`, vision, structured outputs) as the default; xAI Grok
-vision models as the alternate. Both are hidden behind `Provider`. Subscription OAuth tokens only reach `claude-haiku-4-5` through the API (measured Aug 2026); ocrmd names that case in its error.
+- **Cloud LLM:** Claude Opus 5 (`claude-opus-5-5`, vision, structured outputs) as the default; xAI Grok
+vision models as the alternate. Both are hidden behind `Provider`. Subscription OAuth tokens only reach `claude-haiku-5-5` through the API (measured Aug 2026); ocrmd names that case in its error.
 - **Storage:** plain files on disk + one SQLite database (WAL) for state. No server.
 - **Rig:** a fixed camera looking down at a book; the operator turns pages by hand. The hand is in
   frame for a large fraction of the session and a paperback may need holding open.
@@ -384,7 +384,7 @@ class Provider(Protocol):
 
 ### Anthropic provider
 
-- `claude-opus-5` default; `output_config.effort = llm_effort` (medium — perception, not reasoning)
+- `claude-opus-5-5` default; `output_config.effort = llm_effort` (medium — perception, not reasoning)
 and server-side refusal fallbacks (`fallbacks="default"`) on the 4.6+/5 family; neither is sent to models that reject them (Haiku 4.5) nor to the Batches API (which rejects `fallbacks`).
 - Streaming with `get_final_message()`; `max_tokens` 16000; client `timeout`/`max_retries` from
   settings (SDK retries 429/5xx/connection errors with backoff).
@@ -449,7 +449,7 @@ processing: { pipeline: preprocess@4, page_detected: true, clipped_edges: [], or
 ocr:  { engine: apple_vision@26.5, confidence: 0.97, artifact: ocr/7f3c….json,
         focus: { variants: 2, improved: 3, filled: 1, unresolved: 0,      # only on bracketed pages
                  artifact: ocr/7f3c….focus.json } }
-llm:  { provider: anthropic, model: claude-opus-5, prompt: transcribe@4, request_id: msg_…,
+llm:  { provider: anthropic, model: claude-opus-5-5, prompt: transcribe@4, request_id: msg_…,
         tokens: { in: 2217, out: 633, cache_read: 1400 } }
 verification:
   status: flagged             # verified | reviewed | flagged | suspect | illegible | blank | unverified
