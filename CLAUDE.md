@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Since 0.9 it is a general-purpose book scanner rather than a rig for one book: the root is a **library** (`ocrmd library`, full-text `ocrmd search` over every page), documents **export** as md/txt/json/jsonl, a page can be **sent** to any receiver that speaks the sink contract in [sinks.py](ocrmd/sinks.py) (law-ai is the worked example, not a special case), and [api.py](ocrmd/api.py) exposes all of it as a library for other programs.
 
-Long-form design lives in [ARCHITECTURE.md](ARCHITECTURE.md) (module-by-module, with the measurements that produced each default) and [README.md](README.md) (operator-facing). [CHANGELOG.md](CHANGELOG.md) records what each version changed and why. Read the relevant ARCHITECTURE section before changing a subsystem — most non-obvious constants there are the result of a measurement, not a guess.
+Long-form design lives in [ARCHITECTURE.md](docs/ARCHITECTURE.md) (module-by-module, with the measurements that produced each default) and [README.md](README.md) (operator-facing). [CHANGELOG.md](CHANGELOG.md) records what each version changed and why. Read the relevant ARCHITECTURE section before changing a subsystem — most non-obvious constants there are the result of a measurement, not a guess.
 
 ## Commands
 

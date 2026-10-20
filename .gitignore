@@ -29,3 +29,6 @@ ocrmd.toml
 inbox/
 .playwright-mcp/
 /*.png
+
+# OS noise
+.DS_Store
