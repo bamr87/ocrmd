@@ -21,7 +21,7 @@ What you get, per root directory:
   (`ocrmd send`); [law-ai](https://github.com/bamr87/law-ai) is the worked example.
 - **A library** — `from ocrmd.api import Library` embeds all of it in another program.
 
-Built and tuned on a fixed camera over a textbook. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and the measurements behind each default, and [CHANGELOG.md](CHANGELOG.md) for what changed.
+Built and tuned on a fixed camera over a textbook. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the measurements behind each default, and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ## Features
 
