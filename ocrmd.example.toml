@@ -3,7 +3,7 @@
 # Precedence: defaults < ~/.config/ocrmd/config.toml < <root>/ocrmd.toml < OCRMD_* env < CLI flags.
 
 # --- LLM ---------------------------------------------------------------------------------------
-model = "claude-opus-5-5"        # OAuth (subscription) tokens only serve claude-haiku-5-5, see README
+model = "claude-opus-5-5"        # OAuth (subscription) tokens only serve claude-haiku-5-5, see docs/setup.md
 provider = "anthropic"         # anthropic | xai
 llm_workers = 2                # concurrent LLM calls during a scan
 llm_timeout = 180.0            # seconds per request
