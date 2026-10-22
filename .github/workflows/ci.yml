@@ -23,8 +23,8 @@ jobs:
     # ruff is pure Python, so it runs on Linux at 1x instead of macOS at 10x.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: python -m pip install ruff
       - run: ruff check ocrmd tests
@@ -35,8 +35,8 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: python -m pip install -e '.[dev,rapidocr]'
       - run: ruff check ocrmd tests
