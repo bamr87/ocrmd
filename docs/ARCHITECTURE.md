@@ -57,8 +57,7 @@ Every stage writes its result to disk and records completion (stage, version) in
 
 ```
 ocrmd/
-  cli.py          typer app: scan | ingest | verify | reprocess | review | status | delete | build | serve | doctor | ocr-bench
-                  | library | search | index | export | sinks | send | read | etl | reconstruct | annotate
+  cli.py          typer app: every command (generated list: docs/reference/cli.md)
   api.py          the embedding surface: `Library` — one Settings, one Store, an injectable provider
   config.py       Settings (defaults → toml → OCRMD_* env), .env credentials, SinkConfig, logging setup
   store.py        SQLite: documents (with the catalogue mirrored in), pages, captures, stages, llm_calls, batches,
@@ -705,34 +704,7 @@ Logging: `ocrmd.*` loggers; console at WARNING (`--debug` DEBUG, `--quiet` ERROR
 
 ## 15. CLI surface
 
-```
-ocrmd scan      --doc SLUG [--camera N|name] [--focus continuous|locked|settle|off] [--no-llm]
-                [--provider anthropic|xai] [--model M] [--resolution WxH] [--rotate D] [--zoom Z]
-                [--title T] [--tag T]... [--project P] [--no-preview] [--duration S] [--max-pages N]
-ocrmd ingest    PATH... --doc SLUG [--watch] [--no-llm] [--title/--tag/--project]
-ocrmd verify    [--doc SLUG] [--flagged-only] [--refresh] [--batch [--no-wait]] [--collect]
-ocrmd reprocess [--doc SLUG] [--no-llm] [-y]
-ocrmd delete    --doc SLUG (--page N... [--whole-capture] | --all) [--keep-raw] [-y]
-ocrmd review    --doc SLUG [--who NAME] [--list]
-ocrmd annotate  --doc SLUG [--camera N|name] [--no-llm] [--dry-run] [--duration S] [--max-pages N]
-ocrmd reconstruct --doc SLUG [--page N] [--out DIR] [--pdf] [--review]
-ocrmd read      --doc SLUG --page N [--region x,y,w,h] [--llm] [--ask Q] [--save PATH]
-ocrmd etl       --doc SLUG -p PIPELINE.yaml [--limit N] [--status S]... [--dry-run] [--no-cache]
-                [--no-llm] [--out PATH] [--export-docetl DIR]
-ocrmd status    [--doc SLUG] [--all]
-ocrmd build     [--doc SLUG]
-ocrmd library   [--json] [--all]
-ocrmd search    QUERY [--doc SLUG] [--limit N] [--json]
-ocrmd index     [--doc SLUG] [--force]
-ocrmd export    [--doc SLUG] [--format md|txt|json|jsonl] [--out PATH]
-ocrmd sinks     [--no-probe]
-ocrmd send      --doc SLUG --page N [--to NAME] [-o key=value]... [--region x,y,w,h] [--dry-run]
-ocrmd doctor    [--costs]
-ocrmd ocr-bench [--doc SLUG] [--engines a+b | --compare] [--limit N] [-v]
-ocrmd serve     [--host 127.0.0.1] [--port 8765] [--no-open]
-ocrmd --debug|--quiet <command>
-python -m ocrmd <command>
-```
+Every command, argument and option, with its default, is in [reference/cli.md](reference/cli.md) — generated from the typer app by `python3 tools/gen_reference.py --write`, so it cannot drift from `cli.py`. Every `Settings` field and its `OCRMD_*` variable is in [reference/settings.md](reference/settings.md), generated the same way.
 
 ## 16. Testing
 
