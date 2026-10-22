@@ -1,5 +1,7 @@
 # Example captures
 
+> Real webcam frames and two generated PDFs from this project's own scans, for trying the pipeline without a camera — and what each one exercises.
+
 Real webcam frames from this project's own scans (Logitech C525 over a desk), plus two generated PDFs, for trying the pipeline without a camera:
 
 ```sh
