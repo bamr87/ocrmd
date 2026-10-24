@@ -23,6 +23,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 | Document | What it covers |
 | --- | --- |
 | [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) | The design, module by module, with the measurement behind each default: capture and the auto-shutter, preprocessing, local OCR and the LLM pass, reconciliation, the page format, storage, concurrency, and the build history. |
+| [`docs/constitution.md`](constitution.md) | The rules every change to this repo must satisfy, whoever makes it — a human or an AI agent. Agents read this before [AGENTS.md](../AGENTS.md) conventions, the [PRD](../PRD.md), or the [feature catalog](../features/features.yml). Ratified… |
 | [`docs/corpus.md`](corpus.md) | What to do with pages once they are scanned: the SQLite inventory and full-text search, the four export formats, and structured-data extraction with `ocrmd etl`. |
 | [`docs/integrations.md`](integrations.md) | How a page leaves ocrmd: the sink contract a receiver speaks (law-ai is the worked example), and `ocrmd.api.Library` for embedding the whole pipeline in another program. |
 | [`docs/operations.md`](operations.md) | Running ocrmd day to day — degraded mode, costs, camera drop-outs, health checks, upgrades, logs, sharing one root — and debugging it in VS Code. |
@@ -32,6 +33,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 | [`docs/setup.md`](setup.md) | What a working install needs beyond `pip install`: macOS camera permission, Claude credentials and which models they reach, the local OCR engines, and where settings come from. |
 | [`docs/web-ui.md`](web-ui.md) | What each view of `ocrmd serve` shows and does — library, scan, documents, page, jobs and settings — and the rules it shares with the CLI. |
 | [`docs/adr/`](adr/README.md) | Every hard-to-reverse decision made for ocrmd, one record each, and the format a new record follows. |
+| [`docs/amendments/`](amendments/README.md) | The append-only log of changes to [the constitution](constitution.md). |
 
 ### `examples/`
 
