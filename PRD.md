@@ -1,8 +1,8 @@
 # PRD — ocrmd
 
-> Product requirements for [`bamr87/ocrmd`](https://github.com/bamr87/ocrmd).
-> Derived from the README, agent docs, config and code in this repo. Anything not
-> stated in those sources is marked **TBD**; success metrics are proposals.
+> What ocrmd is for and whom it serves: the problem, users, goals and non-goals, current features, requirements, proposed success metrics and open questions.
+
+Product requirements for [`bamr87/ocrmd`](https://github.com/bamr87/ocrmd), derived from the README, agent docs, config and code in this repo. Anything not stated in those sources is marked **TBD**; success metrics are proposals.
 
 ## 1. Overview / problem
 
@@ -88,3 +88,4 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 ## 8. Links
 
 - [README.md](README.md) · [AGENTS.md](AGENTS.md) · [CHANGELOG.md](CHANGELOG.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Backlog of record: [GitHub Issues](https://github.com/bamr87/ocrmd/issues)

@@ -1,24 +1,20 @@
 # ocrmd — Architecture
 
+> The design, module by module, with the measurement behind each default: capture and the auto-shutter, preprocessing, local OCR and the LLM pass, reconciliation, the page format, storage, concurrency, and the build history.
+
 Incremental scanning + OCR tool that turns webcam frames, image files or PDFs (book pages, loose text, receipts) into a standardized Markdown corpus, cross-checked by a second, independent transcription source (Claude with vision; xAI as an alternate provider) — with an inventory of everything scanned, exports in several shapes, a generic outbound contract for handing a page to another system, and a library API for embedding the whole thing. Version 0.2 was the production-hardening release, shaped by real sessions with a fixed webcam over a textbook; 0.9 is the one that made it a general-purpose book scanner rather than a rig for one book.
 
 ## 1. Goals and non-goals
 
 **Goals**
-- Point a webcam at a book and turn pages; every stable, new, sharp, *unobstructed* page is captured,
-  OCR'd, and appended to the document without pressing anything.
+- Point a webcam at a book and turn pages; every stable, new, sharp, *unobstructed* page is captured, OCR'd, and appended to the document without pressing anything.
 - Drop images/PDFs into a folder (or pass them on the CLI) and get the same output.
-- One Markdown format for everything, with enough frontmatter that the corpus is queryable and
-  rebuildable, and a document-level metadata file that makes every page citable.
-- Every page has *two* independent transcriptions (local OCR engine + vision LLM) that are diffed;
-  disagreements are surfaced, never silently resolved; a human can resolve them and the resolution sticks.
-- Resumable, idempotent, offline-tolerant: a crash, a dead network or a rate limit never loses a
-capture and never stalls a session. Nothing is deleted automatically; nothing costs tokens twice without an explicit flag.
+- One Markdown format for everything, with enough frontmatter that the corpus is queryable and rebuildable, and a document-level metadata file that makes every page citable.
+- Every page has *two* independent transcriptions (local OCR engine + vision LLM) that are diffed; disagreements are surfaced, never silently resolved; a human can resolve them and the resolution sticks.
+- Resumable, idempotent, offline-tolerant: a crash, a dead network or a rate limit never loses a capture and never stalls a session. Nothing is deleted automatically; nothing costs tokens twice without an explicit flag.
 - Pluggable LLM providers behind one interface.
-- One root is a **library**: every document scanned into it is catalogued and searchable, and the
-  catalogue lives in SQLite so a tool that is not ocrmd can read it.
-- The corpus is a **source**, not a destination: it exports to the shapes other tools take (Markdown,
-text, JSON, JSON-lines), it can be handed page by page to any receiver that speaks a small HTTP contract, and it can be driven as a library from another program.
+- One root is a **library**: every document scanned into it is catalogued and searchable, and the catalogue lives in SQLite so a tool that is not ocrmd can read it.
+- The corpus is a **source**, not a destination: it exports to the shapes other tools take (Markdown, text, JSON, JSON-lines), it can be handed page by page to any receiver that speaks a small HTTP contract, and it can be driven as a library from another program.
 
 **Non-goals**
 - Handwriting, non-Latin scripts beyond what the local engine supports.
@@ -28,15 +24,11 @@ text, JSON, JSON-lines), it can be handed page by page to any receiver that spea
 
 ## 2. Assumptions
 
-- **Language:** Python 3.12+. OpenCV (4.x — see §7), Apple Vision through pyobjc, RapidOCR/ONNX
-  Runtime, and the official `anthropic` SDK are all first-class.
-- **Local OCR engines:** Apple Vision on macOS plus RapidOCR (`ocrmd[rapidocr]`) as a voting second
-  engine; RapidOCR alone elsewhere; Tesseract (`ocrmd[tesseract]`) as a measured-weak last resort.
-- **Cloud LLM:** Claude Opus 5 (`claude-opus-5-5`, vision, structured outputs) as the default; xAI Grok
-vision models as the alternate. Both are hidden behind `Provider`. Subscription OAuth tokens only reach `claude-haiku-5-5` through the API (measured Aug 2026); ocrmd names that case in its error.
+- **Language:** Python 3.12+. OpenCV (4.x — see §7), Apple Vision through pyobjc, RapidOCR/ONNX Runtime, and the official `anthropic` SDK are all first-class.
+- **Local OCR engines:** Apple Vision on macOS plus RapidOCR (`ocrmd[rapidocr]`) as a voting second engine; RapidOCR alone elsewhere; Tesseract (`ocrmd[tesseract]`) as a measured-weak last resort.
+- **Cloud LLM:** Claude Opus 5 (`claude-opus-5-5`, vision, structured outputs) as the default; xAI Grok vision models as the alternate. Both are hidden behind `Provider`. Subscription OAuth tokens only reach `claude-haiku-5-5` through the API (measured Aug 2026); ocrmd names that case in its error.
 - **Storage:** plain files on disk + one SQLite database (WAL) for state. No server.
-- **Rig:** a fixed camera looking down at a book; the operator turns pages by hand. The hand is in
-  frame for a large fraction of the session and a paperback may need holding open.
+- **Rig:** a fixed camera looking down at a book; the operator turns pages by hand. The hand is in frame for a large fraction of the session and a paperback may need holding open.
 
 ## 3. High-level pipeline
 
@@ -57,8 +49,7 @@ Every stage writes its result to disk and records completion (stage, version) in
 
 ```
 ocrmd/
-  cli.py          typer app: scan | ingest | verify | reprocess | review | status | delete | build | serve | doctor | ocr-bench
-                  | library | search | index | export | sinks | send | read | etl | reconstruct | annotate
+  cli.py          typer app: every command (generated list: docs/reference/cli.md)
   api.py          the embedding surface: `Library` — one Settings, one Store, an injectable provider
   config.py       Settings (defaults → toml → OCRMD_* env), .env credentials, SinkConfig, logging setup
   store.py        SQLite: documents (with the catalogue mirrored in), pages, captures, stages, llm_calls, batches,
@@ -104,14 +95,10 @@ The first draft of this document listed sub-packages (`ocr/`, `llm/`, `reconcile
 
 Two device settings dominate image quality and neither is reachable through OpenCV, which returns `-1` for every `CAP_PROP` on macOS and silently ignores writes. `camctl.py` drives them through AVFoundation (`AVCaptureDevice`), which applies to the stream OpenCV is already reading:
 
-- **Focus mode.** Webcams commonly power up *locked* at lens position 0 — every frame blurry, and no
-preprocessing recovers it. Measured on the development rig: a locked C525 produced a sharpness (Laplacian variance) of 38; continuous autofocus took it to 299. `scan` sets continuous focus and exposure before opening the stream. **`--focus settle`** (recommended for a fixed rig) keeps continuous autofocus until the first capture and then locks: the page distance never changes, and a hand entering the frame otherwise makes the lens hunt on every page turn.
-- **Resolution.** ocrmd enumerates `AVCaptureDevice.formats` and opens the largest mode. Modes above
-the sensor size were assumed to be worthless; measurement says otherwise (146 words read at 1920x1080 vs 98 at 1280x960 on the same page) because what matters is pixels landing on the page.
-- **Index mapping.** OpenCV enumerates cameras in a different order than AVFoundation — on the
-development Mac, exactly reversed. Nothing in either API maps between them, so ocrmd identifies each OpenCV index by probing it with a resolution only one attached camera supports.
-- **Drop-outs.** `cap.read()` failing for `camera_reopen_after` consecutive frames releases and reopens
-the device; after five reopens the generator raises `CameraLost` and the scan ends cleanly (queue drained, document built).
+- **Focus mode.** Webcams commonly power up *locked* at lens position 0 — every frame blurry, and no preprocessing recovers it. Measured on the development rig: a locked C525 produced a sharpness (Laplacian variance) of 38; continuous autofocus took it to 299. `scan` sets continuous focus and exposure before opening the stream. **`--focus settle`** (recommended for a fixed rig) keeps continuous autofocus until the first capture and then locks: the page distance never changes, and a hand entering the frame otherwise makes the lens hunt on every page turn.
+- **Resolution.** ocrmd enumerates `AVCaptureDevice.formats` and opens the largest mode. Modes above the sensor size were assumed to be worthless; measurement says otherwise (146 words read at 1920x1080 vs 98 at 1280x960 on the same page) because what matters is pixels landing on the page.
+- **Index mapping.** OpenCV enumerates cameras in a different order than AVFoundation — on the development Mac, exactly reversed. Nothing in either API maps between them, so ocrmd identifies each OpenCV index by probing it with a resolution only one attached camera supports.
+- **Drop-outs.** `cap.read()` failing for `camera_reopen_after` consecutive frames releases and reopens the device; after five reopens the generator raises `CameraLost` and the scan ends cleanly (queue drained, document built).
 
 Digital zoom/pan/rotation (`camview.py`) is a crop-and-rotate of the sensor frame applied identically to the preview and the captured frame, persisted per camera name.
 
@@ -121,20 +108,16 @@ The decision is split in two. `scene.Scene` answers *has the desk stopped changi
 
 **The scene** (`scene.py`), in order, so that each test is only asked when the earlier ones cannot answer:
 
-1. **Motion** — mean absolute difference of the blurred 320-px grey frame vs the previous one, above
-   `motion_threshold`. A hand moving, a page turning.
+1. **Motion** — mean absolute difference of the blurred 320-px grey frame vs the previous one, above `motion_threshold`. A hand moving, a page turning.
 2. **Focus** — the device reports `isAdjustingFocus`; sharpness is meaningless while it hunts.
 3. **Hand** — see below. Must come *before* novelty: the hand is exactly what makes the frame "new".
-4. **Page outline** — the detected sheet must have held its position for `geometry_frames` (3)
-   consecutive detections within `geometry_tolerance` (0.03 of the frame).
-5. **Settling** — after all of the above go quiet, `stable_frames` (8) undisturbed frames, or
-   `settle_frames` (20) if the disturbance being recovered from was a hand or a moved page.
+4. **Page outline** — the detected sheet must have held its position for `geometry_frames` (3) consecutive detections within `geometry_tolerance` (0.03 of the frame).
+5. **Settling** — after all of the above go quiet, `stable_frames` (8) undisturbed frames, or `settle_frames` (20) if the disturbance being recovered from was a hand or a moved page.
 
 **The page**, once the scene is settled:
 
 6. **Novelty** — dHash Hamming distance to the *last captured* frame ≥ `novelty_threshold`.
-7. **Sharpness** — Laplacian variance inside the detected page outline, on the unmodified frame (the
-motion blur must never touch this buffer), above an absolute floor *and* above `sharp_ratio` of the best this scene has produced (decayed, and not updated while a hand is in frame — skin is sharper than paper).
+7. **Sharpness** — Laplacian variance inside the detected page outline, on the unmodified frame (the motion blur must never touch this buffer), above an absolute floor *and* above `sharp_ratio` of the best this scene has produced (decayed, and not updated while a hand is in frame — skin is sharper than paper).
 
 `space` bypasses every gate; `capture_cooldown` limits auto captures to one per second; a capture spends the scene's quiet, so one settled period yields one capture.
 
@@ -168,14 +151,10 @@ The failure that matters is real. The same book under the same lamp, minutes apa
 
 So the lens is judged from the sharpness trace, which every camera has:
 
-- **Moving or still**: the relative spread of page sharpness over a 12-frame window. On a still,
-in-focus scene that spread measured p50 0.012, p99 0.026, max 0.027 over 598 frames, so `HUNT_BAND = 0.06` is a little over twice the worst quiet frame. A step down in sharpness also lands inside the band for one window, which is correct — something just changed, wait for it.
-- **Sharp or soft**: sharpness against the best this *rig* has ever produced, remembered per camera in
-`.ocrmd-camera.json` beside its view. Over 20 s of a working rig the ratio never fell below 0.939; the broken state was 0.017. `SOFT_RATIO = 0.45` sits between them with room for a genuinely low-contrast page.
-- **Then something is done about it**: after `SOFT_FRAMES` (~1.5 s) the watch asks for a retrigger —
-dropping the focus mode and putting it back, which is all a camera without lens control offers — and escalates to restarting the stream. A retrigger is cheap and harmless, which is the point: a mostly blank page can trip the softness test and the worst that costs is one re-hunt.
-- **And the memory is allowed to fall.** A rig moved further from the page really is less sharp, and a
-memory that refused to believe that would block every capture forever. After four failed recoveries the watch accepts the new normal, says so on the status line, and carries on.
+- **Moving or still**: the relative spread of page sharpness over a 12-frame window. On a still, in-focus scene that spread measured p50 0.012, p99 0.026, max 0.027 over 598 frames, so `HUNT_BAND = 0.06` is a little over twice the worst quiet frame. A step down in sharpness also lands inside the band for one window, which is correct — something just changed, wait for it.
+- **Sharp or soft**: sharpness against the best this *rig* has ever produced, remembered per camera in `.ocrmd-camera.json` beside its view. Over 20 s of a working rig the ratio never fell below 0.939; the broken state was 0.017. `SOFT_RATIO = 0.45` sits between them with room for a genuinely low-contrast page.
+- **Then something is done about it**: after `SOFT_FRAMES` (~1.5 s) the watch asks for a retrigger — dropping the focus mode and putting it back, which is all a camera without lens control offers — and escalates to restarting the stream. A retrigger is cheap and harmless, which is the point: a mostly blank page can trip the softness test and the worst that costs is one re-hunt.
+- **And the memory is allowed to fall.** A rig moved further from the page really is less sharp, and a memory that refused to believe that would block every capture forever. After four failed recoveries the watch accepts the new normal, says so on the status line, and carries on.
 
 Two smaller fixes came out of the same measurements. `camctl.focus_state` was called once per frame and cost **6.7 ms** — a fifth of the frame budget at 30 fps — because every call built an AVFoundation discovery session; the device is now cached and it costs 0.003 ms. And a scan that ended with the lens locked (`focus=settle`) left it locked: this rig comes back up `locked` after every such session, which is exactly how a lens ends up parked somewhere useless. The mode the session opened with is now restored on the way out.
 
@@ -183,10 +162,8 @@ Two smaller fixes came out of the same measurements. `camctl.focus_state` was ca
 
 The first real sessions produced a run of captures with a hand flat across the text. All three original gates passed: the hand stopped moving, it changed the hash, and it was in focus. Two approaches were measured against the 57 real captures on disk:
 
-- *Skin fraction inside the page outline* — flagged 48 of 57, including most clean pages, because the
-  wooden desk inside the rotated page rectangle is skin-toned in YCrCb.
-- **Reference paper mask** — the approach shipped. At analysis scale, threshold the frame (Otsu),
-drop skin-coloured pixels, morphologically close/open with a kernel wider than text, and keep the result as *the paper*. Compare each frame's paper mask with a reference:
+- *Skin fraction inside the page outline* — flagged 48 of 57, including most clean pages, because the wooden desk inside the rotated page rectangle is skin-toned in YCrCb.
+- **Reference paper mask** — the approach shipped. At analysis scale, threshold the frame (Otsu), drop skin-coloured pixels, morphologically close/open with a kernel wider than text, and keep the result as *the paper*. Compare each frame's paper mask with a reference:
 
   ```
   missing = reference & ~current      paper that has disappeared   (hand, pen, curled page)
@@ -205,10 +182,8 @@ Offline score against hand-labelled captures: 21 of 26 hand frames caught at `oc
 
 Exact duplicates are caught by content sha256 of the JPEG. Near-duplicates are caught in two steps, **within the same document only** (a global check dropped the first page of every new book that resembled an old one):
 
-1. dHash prefilter within `near_duplicate_distance` bits (loose: 10), then normalised correlation of
-the 96×72 grey frame against the candidate's raw capture ≥ `near_duplicate_similarity` (0.985). Measured on real captures: re-captures of the same page score 0.99, consecutive different pages ≤ 0.98 — but two mostly-blank pages (chapter openers) are indistinguishable this way.
-2. Confirmation by **OCR text**: the new crops are recognised right there (only when a candidate
-exists; the result is kept as the page's OCR stage) and compared with the candidate's OCR text — token overlap ≥ `near_duplicate_text` (0.85) with similar length. Text is invariant to the few pixels of shift a page picks up between captures. When either side has too little text, the fallback is high-pass image correlation ≥ `near_duplicate_detail` (0.5; same page 0.75–0.81, different pages ≤ 0.47 on the real captures).
+1. dHash prefilter within `near_duplicate_distance` bits (loose: 10), then normalised correlation of the 96×72 grey frame against the candidate's raw capture ≥ `near_duplicate_similarity` (0.985). Measured on real captures: re-captures of the same page score 0.99, consecutive different pages ≤ 0.98 — but two mostly-blank pages (chapter openers) are indistinguishable this way.
+2. Confirmation by **OCR text**: the new crops are recognised right there (only when a candidate exists; the result is kept as the page's OCR stage) and compared with the candidate's OCR text — token overlap ≥ `near_duplicate_text` (0.85) with similar length. Text is invariant to the few pixels of shift a page picks up between captures. When either side has too little text, the fallback is high-pass image correlation ≥ `near_duplicate_detail` (0.5; same page 0.75–0.81, different pages ≤ 0.47 on the real captures).
 
 A duplicate is recorded as a `capture` row pointing at the existing page and goes no further. `ocrmd status` reports how many were skipped.
 
@@ -230,19 +205,13 @@ That override is load-bearing because the corpus contains no genuinely empty pag
 
 Ordered, each step recorded in `processed/<id>.json`:
 
-1. Page detection: bright blobs (paper against a darker desk) merged when comparably sized (a deep
-gutter shadow splits a spread into two blobs) → `minAreaRect` → perspective warp. Contour-based quad detection was tried first and failed on real photographs.
-2. Clipped edges: frame edges the sheet touches *and where the edge strip carries ink* — bare
-   geometry cried wolf on nearly every capture.
-3. Orientation cascade, strongest evidence first: text-line-frequency power of the row profile
-(`{0,180}` vs `{90,270}`); dictionary hits from a fast, non-auto-orienting OCR pass; ink asymmetry (ascenders outnumber descenders) as the never-silent tie-breaker.
+1. Page detection: bright blobs (paper against a darker desk) merged when comparably sized (a deep gutter shadow splits a spread into two blobs) → `minAreaRect` → perspective warp. Contour-based quad detection was tried first and failed on real photographs.
+2. Clipped edges: frame edges the sheet touches *and where the edge strip carries ink* — bare geometry cried wolf on nearly every capture.
+3. Orientation cascade, strongest evidence first: text-line-frequency power of the row profile (`{0,180}` vs `{90,270}`); dictionary hits from a fast, non-auto-orienting OCR pass; ink asymmetry (ascenders outnumber descenders) as the never-silent tie-breaker.
 4. Two-page spread split at the **gutter, found by absence of ink** — and only when there is one.
-5. Denoise + adaptive threshold copy for engines that want it (Tesseract). Apple Vision and the LLM
-   get the colour crop.
-6. The **flat rendering** (`processed/<id>.flat.png`) — the page as a flatbed scanner would have
-   delivered it. Derived from the crop, not a stage: see below.
-7. Framing advice: text cut off at an edge, or fewer than `min_page_width` px across the page. Both
-   are shown live in the HUD, written to the page, stored on the `pages` row, and listed by `status`.
+5. Denoise + adaptive threshold copy for engines that want it (Tesseract). Apple Vision and the LLM get the colour crop.
+6. The **flat rendering** (`processed/<id>.flat.png`) — the page as a flatbed scanner would have delivered it. Derived from the crop, not a stage: see below.
+7. Framing advice: text cut off at an edge, or fewer than `min_page_width` px across the page. Both are shown live in the HUD, written to the page, stored on the `pages` row, and listed by `status`.
 
 #### Finding the gutter
 
@@ -252,12 +221,9 @@ A binding is not dark, it is *empty*. `ink_columns` measures fine detail per col
 
 `find_gutter` then requires three things, each of which was put there by a case that failed without it:
 
-- a **trough**, `GUTTER_DEPTH` (0.30) below the page body's detail. Calibrated, not guessed: every one
-of the 60 captures was read whole and split and scored on expected correctly-read words (words × mean confidence, the only fair comparison of one page against two). Splitting genuinely helps 36 and hurts 24; depth separates them at AUC 0.797 (medians 0.527 against 0.225) and 0.30 maximises the net gain — +2652 words against +2161 for splitting everything and +0 for splitting nothing.
-- **text on both sides**, within `GUTTER_BALANCE` (0.25). Emptiness alone is not a binding: a ragged
-right margin, a wide figure or a column break leaves just as empty a stripe, and cutting there turns one page into a page and an offcut. The ratio is deliberately loose, because uneven light across a spread is the commonest complaint on this rig and can leave the far page carrying a quarter of the near page's ink — it has to reject an *empty* side, not a dim one.
-- the split placed at the **middle of the blank band**, not at its lowest point. The band is the
-binding plus two inner margins, which are rarely the same width, so the minimum sits off to one side; the midpoint keeps the most clearance from text on both pages and does not move with noise.
+- a **trough**, `GUTTER_DEPTH` (0.30) below the page body's detail. Calibrated, not guessed: every one of the 60 captures was read whole and split and scored on expected correctly-read words (words × mean confidence, the only fair comparison of one page against two). Splitting genuinely helps 36 and hurts 24; depth separates them at AUC 0.797 (medians 0.527 against 0.225) and 0.30 maximises the net gain — +2652 words against +2161 for splitting everything and +0 for splitting nothing.
+- **text on both sides**, within `GUTTER_BALANCE` (0.25). Emptiness alone is not a binding: a ragged right margin, a wide figure or a column break leaves just as empty a stripe, and cutting there turns one page into a page and an offcut. The ratio is deliberately loose, because uneven light across a spread is the commonest complaint on this rig and can leave the far page carrying a quarter of the near page's ink — it has to reject an *empty* side, not a dim one.
+- the split placed at the **middle of the blank band**, not at its lowest point. The band is the binding plus two inner margins, which are rarely the same width, so the minimum sits off to one side; the midpoint keeps the most clearance from text on both pages and does not move with noise.
 
 `estimated_page_width` runs the same test, or the HUD would promise 900 px a page on a sheet the pipeline is about to keep whole.
 
@@ -275,12 +241,9 @@ Scored on the 40 pages of this store that carry a model transcription, the way `
 
 Three things that measurement decided:
 
-- **No denoising.** A bilateral filter before the unsharp mask makes the page look cleaner and costs
-  0.144 F1 (0.597 against 0.741). At webcam x-heights the "noise" it smooths away is the thin strokes.
-- **Otsu classes, not a fixed percentile.** Ink coverage runs from ~1 % on a chapter opening to ~15 %
-  in a dense table, so a fixed percentile is sometimes the ink and sometimes the paper — and on the sparse page it lands on paper, which is the page that needed the help most.
-- **...but not the class medians.** Mapping median-ink to black and median-paper to white flattens half
-  of every stroke: 0.693 against 0.741 for the 10th/40th percentiles of the two classes.
+- **No denoising.** A bilateral filter before the unsharp mask makes the page look cleaner and costs 0.144 F1 (0.597 against 0.741). At webcam x-heights the "noise" it smooths away is the thin strokes.
+- **Otsu classes, not a fixed percentile.** Ink coverage runs from ~1 % on a chapter opening to ~15 % in a dense table, so a fixed percentile is sometimes the ink and sometimes the paper — and on the sparse page it lands on paper, which is the page that needed the help most.
+- **...but not the class medians.** Mapping median-ink to black and median-paper to white flattens half of every stroke: 0.693 against 0.741 for the 10th/40th percentiles of the two classes.
 
 `bin` is kept because it is what some engines historically wanted, and because a threshold is sometimes the clearer thing to look at. Neither it nor the flat rendering is read by the pipeline: Apple Vision, RapidOCR and the model all get the colour crop, and Tesseract flattens its own input (`ocr.flatten`).
 
@@ -318,12 +281,10 @@ F1 is bag-of-words against the LLM transcription of each page (`bench.py`), on 3
 
 The primary's lines are the skeleton; every secondary line that shares ≥ half its height and any width with a primary line is aligned to it word by word (`SequenceMatcher` on lower-cased alphanumerics):
 
-- an `equal` word is **confirmed**: confidence ≥ `CONFIRMED` (0.9 = `ocr_trust`), so in a short
-  disagreement with the LLM the OCR reading may win;
+- an `equal` word is **confirmed**: confidence ≥ `CONFIRMED` (0.9 = `ocr_trust`), so in a short disagreement with the LLM the OCR reading may win;
 - a `replace`/`delete` word is **doubted**: confidence × `DOUBTED` (0.6), so it is flagged, not trusted;
 - a secondary line no primary line overlaps is **filled in** if it has ≥ 2 words and confidence ≥ 0.85;
-- a primary line under 0.5 confidence with fewer than half its words confirmed is **swapped** for a
-  ≥ 0.9 secondary reading of similar length.
+- a primary line under 0.5 confidence with fewer than half its words confirmed is **swapped** for a ≥ 0.9 secondary reading of similar length.
 
 Measured effect: the text is the same (F1 0.735 → 0.736; fill and swap rarely fire on a working rig) but the confidence becomes informative. Vision alone puts 10 107 of 10 234 words at ≥ 0.9 with 82 % precision; merged, 6 443 words stay ≥ 0.9 at 89 % and 3 619 land in a 0.6–0.9 band at 70 %. That is the difference between `reconcile` trusting an OCR word over the model and flagging it for a human. `ocr_ensemble = false` (or `ocr_engines = ["apple_vision"]`) restores the single engine.
 
@@ -334,10 +295,8 @@ The same idea one axis over: `ocr.merge` votes across *engines* reading one imag
 For each of the page's lines, the variant blocks overlapping it (`ocr._same_line`) are joined left to right at the *minimum* of their confidences, and:
 
 - a line at or above `ocr_trust` (0.9) is never second-guessed;
-- below it, the most confident variant reading that is **acceptable** replaces the line, if it beats
-it by `focus_swap_margin` (0.10). Acceptable means about the same length (0.7-1.4×, `merge`'s rule) **or** substantially longer *and* ≥ `CONFIRMED` (0.9). A shorter reading never qualifies — that is text being dropped;
-- a line only a variant saw is **filled in** at ≥ `CONFIRMED` with ≥ 2 words (stricter than `merge`'s
-  0.85, because variant crops carry more geometric jitter than two engines on one crop);
+- below it, the most confident variant reading that is **acceptable** replaces the line, if it beats it by `focus_swap_margin` (0.10). Acceptable means about the same length (0.7-1.4×, `merge`'s rule) **or** substantially longer *and* ≥ `CONFIRMED` (0.9). A shorter reading never qualifies — that is text being dropped;
+- a line only a variant saw is **filled in** at ≥ `CONFIRMED` with ≥ 2 words (stricter than `merge`'s 0.85, because variant crops carry more geometric jitter than two engines on one crop);
 - one variant line can be spent on only one of the page's lines, so jitter can never write it twice;
 - the page's box is kept after a swap, so reading order cannot be disturbed by the swap itself.
 
@@ -384,15 +343,11 @@ class Provider(Protocol):
 
 ### Anthropic provider
 
-- `claude-opus-5-5` default; `output_config.effort = llm_effort` (medium — perception, not reasoning)
-and server-side refusal fallbacks (`fallbacks="default"`) on the 4.6+/5 family; neither is sent to models that reject them (Haiku 4.5) nor to the Batches API (which rejects `fallbacks`).
-- Streaming with `get_final_message()`; `max_tokens` 16000; client `timeout`/`max_retries` from
-  settings (SDK retries 429/5xx/connection errors with backoff).
-- Image as a base64 JPEG (≤1568 px, quality 95 — small type suffers at 90), then the OCR draft as a
-hint with garbage lines removed (they mislead the model and can trip the output filter; a filter hit is retried from the image alone).
+- `claude-opus-5-5` default; `output_config.effort = llm_effort` (medium — perception, not reasoning) and server-side refusal fallbacks (`fallbacks="default"`) on the 4.6+/5 family; neither is sent to models that reject them (Haiku 4.5) nor to the Batches API (which rejects `fallbacks`).
+- Streaming with `get_final_message()`; `max_tokens` 16000; client `timeout`/`max_retries` from settings (SDK retries 429/5xx/connection errors with backoff).
+- Image as a base64 JPEG (≤1568 px, quality 95 — small type suffers at 90), then the OCR draft as a hint with garbage lines removed (they mislead the model and can trip the output filter; a filter hit is retried from the image alone).
 - Prompt caching: the system prompt is the stable prefix with one `cache_control` breakpoint.
-- **Batches:** `batch_submit` builds the same params per page under a `custom_id` = page id;
-`batch_collect` keys results by `custom_id` (results arrive in any order). Open batches are recorded in SQLite so `verify --collect` can fetch them in a later session.
+- **Batches:** `batch_submit` builds the same params per page under a `custom_id` = page id; `batch_collect` keys results by `custom_id` (results arrive in any order). Open batches are recorded in SQLite so `verify --collect` can fetch them in a later session.
 
 ### Error taxonomy
 
@@ -411,8 +366,7 @@ Same interface; OpenAI-compatible chat endpoint with an image content part and s
 
 ## 9. Auth
 
-- **Anthropic:** `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` env; `CLAUDE_CODE_OAUTH_TOKEN` is mapped
-onto `ANTHROPIC_AUTH_TOKEN` and sent with the `oauth-2025-04-20` beta header; the `ant auth login` profile under `~/.config/anthropic/` is picked up by the SDK's zero-arg client. `.env` is loaded from cwd, the project root, then `~/.config/ocrmd/.env`, never overriding real environment variables.
+- **Anthropic:** `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` env; `CLAUDE_CODE_OAUTH_TOKEN` is mapped onto `ANTHROPIC_AUTH_TOKEN` and sent with the `oauth-2025-04-20` beta header; the `ant auth login` profile under `~/.config/anthropic/` is picked up by the SDK's zero-arg client. `.env` is loaded from cwd, the project root, then `~/.config/ocrmd/.env`, never overriding real environment variables.
 - **xAI:** `XAI_API_KEY` only. xAI does not offer third-party OAuth; the design's OAuth path was dropped.
 - Logs keep HTTP client loggers at WARNING; tokens and request bodies are never written.
 
@@ -496,12 +450,9 @@ Generated by `build`: the document context, page count, first–last printed lab
 ## 11. Reconciliation
 
 1. Normalize both texts (NFC, whitespace, quote/dash folding, de-hyphenation).
-2. Align word sequences with `difflib`; short replaced spans are candidates, long spans and
-   insert/delete are the LLM's (OCR garbage is not evidence).
-3. Per candidate: numeric mismatch → **flag, unresolved**; OCR confident and near-identical → take
-   OCR; OCR middling → flag; otherwise trust the LLM.
-4. Two scores: `agreement` (order-sensitive) and `overlap` (order-insensitive containment of content
-   tokens). Both are required: OCR reads contents pages and columns out of order.
+2. Align word sequences with `difflib`; short replaced spans are candidates, long spans and insert/delete are the LLM's (OCR garbage is not evidence).
+3. Per candidate: numeric mismatch → **flag, unresolved**; OCR confident and near-identical → take OCR; OCR middling → flag; otherwise trust the LLM.
+4. Two scores: `agreement` (order-sensitive) and `overlap` (order-insensitive containment of content tokens). Both are required: OCR reads contents pages and columns out of order.
 
 | Status | Condition |
 |---|---|
@@ -512,10 +463,8 @@ Generated by `build`: the document context, page count, first–last printed lab
 | `illegible` | (pipeline) the model declared the page unreadable and produced < 40 chars |
 | `reviewed` | (review) a human resolved every flag; body frozen |
 
-5. **Anti-fabrication.** The prompt forbids inventing unreadable text, including text under a
-   finger, and requires `legible: false` plus a reason. `suspect` exists to catch what the prompt misses.
-6. **Continuity.** After reconciliation the printed page number is compared with the previous
-page's: a repeat, a small jump (≤ 20) or a step backwards is reported on the page (`processing.continuity`), in the console, in the HUD, and aggregated in the document (`label_gaps`).
+5. **Anti-fabrication.** The prompt forbids inventing unreadable text, including text under a finger, and requires `legible: false` plus a reason. `suspect` exists to catch what the prompt misses.
+6. **Continuity.** After reconciliation the printed page number is compared with the previous page's: a repeat, a small jump (≤ 20) or a step backwards is reported on the page (`processing.continuity`), in the console, in the HUD, and aggregated in the document (`label_gaps`).
 
 ## 11a. Reconstruction: the round trip
 
@@ -539,16 +488,11 @@ The pipeline reads a photograph into text. `reconstruct` reads the text back int
 
 **Only the last step ever costs anything.** By this point the page has been read once and every line's position is on disk, so an underline or a highlight is resolved by geometry alone — the words under the mark are found by intersecting it with stored line boxes, and no recognition of any kind runs. Handwriting is the one thing on the page that has never been transcribed, so a *note* costs one LLM call (`Provider.read_handwriting`); local OCR is not asked, because it is trained on print and reads cursive as noise. A page nobody has written on costs a subtraction on a 900-px greyscale and stops there.
 
-- **Identify** reuses the deduplicator's two steps — dHash prefilter, then correlation against the
-  stored capture — because it is the same question asked for the opposite purpose.
-- **Align** is ECC (`MOTION_EUCLIDEAN`) on plain greyscale. High-passing first was tried and is
-measurably wrong: ECC's correlation coefficient is already invariant to brightness and contrast, and removing the low frequencies takes away the structure it converges on. On a real page nudged 5 px and 0.6°, greyscale registers at cc 0.99 and high-passed input at 0.38, recovering the shift as 21 px instead of 3.
-- **Diff** uses two channels, because pens and highlighters do opposite things. A pen darkens paper; a
-highlighter colours it while leaving it bright and barely registers in luminance at all, so it is found as a rise in saturation instead.
-- **Classify**: a long thin rule through the middle of a line strikes it out, at or below the baseline
-underlines it, and anything else is handwriting. "Anywhere inside the line box" is not the test — OCR boxes carry descender space, so a rule drawn just under the text still falls inside one. A rule that passes under existing print adds no darkness there and arrives as a row of fragments, so the pen mask is closed horizontally (`RULE_JOIN`) before blobs are found.
-- **Apply** writes `==highlight==`, `**underline**`, `~~strike~~` and appends notes under their own
-heading. A phrase already marked is left alone, so a camera resting on one page does not wrap it again and again. The page is written *without* refreshing the fingerprint — what someone wrote on the paper is a human edit and must survive the next `verify`.
+- **Identify** reuses the deduplicator's two steps — dHash prefilter, then correlation against the stored capture — because it is the same question asked for the opposite purpose.
+- **Align** is ECC (`MOTION_EUCLIDEAN`) on plain greyscale. High-passing first was tried and is measurably wrong: ECC's correlation coefficient is already invariant to brightness and contrast, and removing the low frequencies takes away the structure it converges on. On a real page nudged 5 px and 0.6°, greyscale registers at cc 0.99 and high-passed input at 0.38, recovering the shift as 21 px instead of 3.
+- **Diff** uses two channels, because pens and highlighters do opposite things. A pen darkens paper; a highlighter colours it while leaving it bright and barely registers in luminance at all, so it is found as a rise in saturation instead.
+- **Classify**: a long thin rule through the middle of a line strikes it out, at or below the baseline underlines it, and anything else is handwriting. "Anywhere inside the line box" is not the test — OCR boxes carry descender space, so a rule drawn just under the text still falls inside one. A rule that passes under existing print adds no darkness there and arrives as a row of fragments, so the pen mask is closed horizontally (`RULE_JOIN`) before blobs are found.
+- **Apply** writes `==highlight==`, `**underline**`, `~~strike~~` and appends notes under their own heading. A phrase already marked is left alone, so a camera resting on one page does not wrap it again and again. The page is written *without* refreshing the fingerprint — what someone wrote on the paper is a human edit and must survive the next `verify`.
 
 Two refusals matter. A diff covering more than `MAX_CHANGE` of the page is rejected as a misalignment or the wrong page rather than applied, and blobs against the page edge are warp artifacts rather than annotations. Editing a page from a bad alignment is exactly the silent corruption the rest of the pipeline exists to prevent.
 
@@ -580,12 +524,9 @@ A transcribed book is a corpus, and `ocrmd etl` answers the question that follow
 
 Three things belong to ocrmd rather than to the operator model:
 
-- **Provenance.** `_document`, `_page` and `_page_id` are attached at the source and merged through
-every operator; a reduce keeps `_pages`. Output writers put them first. An extraction you cannot take back to the photograph it came from is a rumour, and this repository exists because a model once invented a table of contents.
-- **The same refusal as the transcription stage.** `etl.SYSTEM` is explicit that the text is the whole
-of the evidence, that a field the text does not answer is empty, and that doubtful readings keep the `==[...]==` reading rather than being "corrected".
-- **Caching that matches the rest of the pipeline.** Each operator has a cache file keyed by a hash of
-its prompt, schema, key and model (`etl/<slug>/<op>.json`); change one operator and one operator re-runs. `--dry-run` renders the prompts and reports the call count without sending anything.
+- **Provenance.** `_document`, `_page` and `_page_id` are attached at the source and merged through every operator; a reduce keeps `_pages`. Output writers put them first. An extraction you cannot take back to the photograph it came from is a rumour, and this repository exists because a model once invented a table of contents.
+- **The same refusal as the transcription stage.** `etl.SYSTEM` is explicit that the text is the whole of the evidence, that a field the text does not answer is empty, and that doubtful readings keep the `==[...]==` reading rather than being "corrected".
+- **Caching that matches the rest of the pipeline.** Each operator has a cache file keyed by a hash of its prompt, schema, key and model (`etl/<slug>/<op>.json`); change one operator and one operator re-runs. `--dry-run` renders the prompts and reports the call count without sending anything.
 
 Two smaller decisions worth keeping: templating is `{{ input.field }}` and `{{ inputs }}` and nothing more (a template language in a spec file is a way to run code from a spec file, and a missing field raises rather than expanding to an empty string that silently changes the question), and `resolve` blocks candidate pairs with `rapidfuzz` before asking the model, because all-pairs comparison is quadratic in rows and most pairs are obviously unrelated. Blank and illegible pages are not offered to operators at all — an operator asked to find something in an empty page is being invited to invent it.
 
@@ -600,23 +541,16 @@ It is generic on purpose. The first receiver built against it is [law-ai](https:
 - `GET url` → the **descriptor**: `{"ocrmd_sink": 1, "name", "description", "accepts": ["page", "region"],
   "options": [{"key", "label", "type": string|enum|integer|number|boolean, "choices", "default", "help"}]}`.
   The CLI prints it, the web UI renders one input per option (a select for an enum, a checkbox for a boolean), and `coerce_options` types and checks the operator's values against it *before* anything leaves — a value outside an enum is refused here, because the receiver's 422 would name a field the person never saw. A receiver with no descriptor still works (the send has no options); one that is down is listed as down.
-- `POST url` → the **envelope**: `{"ocrmd": 1, "kind": page|region, "text", "provenance", "document", "options"}`.
-  `text` is the page body as it stands on disk — the reconciled reading *including* any disagreement the operator has resolved. `provenance` is what the receiver needs to find the page again and to judge the reading: tool and version, document, page, page id, printed label, capture time, OCR engine, model, both agreement scores, the flag count, the count of unresolved marks in the text sent, the status, a URL to the image and one to the page in this UI, and the `bbox` when the send came from a region. `document` is the catalogue entry from document.yaml. The receiver answers 2xx JSON, ideally `{"summary", "items": [{id, title, detail, status}], "warnings"}`; anything else is shown raw with an honest synthesized summary.
+- `POST url` → the **envelope**: `{"ocrmd": 1, "kind": page|region, "text", "provenance", "document", "options"}`. `text` is the page body as it stands on disk — the reconciled reading *including* any disagreement the operator has resolved. `provenance` is what the receiver needs to find the page again and to judge the reading: tool and version, document, page, page id, printed label, capture time, OCR engine, model, both agreement scores, the flag count, the count of unresolved marks in the text sent, the status, a URL to the image and one to the page in this UI, and the `bbox` when the send came from a region. `document` is the catalogue entry from document.yaml. The receiver answers 2xx JSON, ideally `{"summary", "items": [{id, title, detail, status}], "warnings"}`; anything else is shown raw with an honest synthesized summary.
 
 Everything else follows from that division of labour:
 
-- **The text travels; the photograph does not.** A page image and a vision model would let the receiver
-do its own single-pass read — which is exactly the thing ocrmd exists to distrust. The page id is the sha256 of the processed image, so it outlives the URL and the process.
-- **This is a send, not a stage.** Same contract as `read_region`: no file is written, no stage marked,
-no version moved. It is safe to press twice, because a well-behaved receiver deduplicates against its own store and says so — which is how a person actually checks "did that go through?".
-- **A region's reading is a better send than a page's.** The region tool already re-reads a box at
-several times the page's glyph height; the readout's own **Send…** sends *that* text with the `bbox` recorded, which is what a person boxing one item out of five on a page wants.
-- **Failure is reported, never retried into silence.** `SinkError` carries the receiver's own reason;
-the web route answers **502**, not 500, because this server is fine and the page simply did not reach the other one.
-- **Off unless configured.** No `[[sinks]]` table (or `OCRMD_SINKS`) means no button, no command, no
-path — these are the only settings in ocrmd that send page text anywhere other than the transcription provider. Credentials (`api_key` → `X-API-Key`, `bearer` → `Authorization`) never reach the browser: `/api/settings` masks them.
-- **A Python receiver** registers through the `ocrmd.sinks` entry-point group instead of a URL:
-  anything with a `name`, a `describe()` and a `send(envelope, options)`, constructed with the `Settings`.
+- **The text travels; the photograph does not.** A page image and a vision model would let the receiver do its own single-pass read — which is exactly the thing ocrmd exists to distrust. The page id is the sha256 of the processed image, so it outlives the URL and the process.
+- **This is a send, not a stage.** Same contract as `read_region`: no file is written, no stage marked, no version moved. It is safe to press twice, because a well-behaved receiver deduplicates against its own store and says so — which is how a person actually checks "did that go through?".
+- **A region's reading is a better send than a page's.** The region tool already re-reads a box at several times the page's glyph height; the readout's own **Send…** sends *that* text with the `bbox` recorded, which is what a person boxing one item out of five on a page wants.
+- **Failure is reported, never retried into silence.** `SinkError` carries the receiver's own reason; the web route answers **502**, not 500, because this server is fine and the page simply did not reach the other one.
+- **Off unless configured.** No `[[sinks]]` table (or `OCRMD_SINKS`) means no button, no command, no path — these are the only settings in ocrmd that send page text anywhere other than the transcription provider. Credentials (`api_key` → `X-API-Key`, `bearer` → `Authorization`) never reach the browser: `/api/settings` masks them.
+- **A Python receiver** registers through the `ocrmd.sinks` entry-point group instead of a URL: anything with a `name`, a `describe()` and a `send(envelope, options)`, constructed with the `Settings`.
 
 **What the far side does with it** is the receiver's business, but two of law-ai's choices are load-bearing here and were built alongside this: its extractor is told to leave a field empty rather than fill in what a page of this kind would probably say (the same refusal `etl.SYSTEM` runs on), and every draft it produces is scored for **grounding** — the share of the draft's content words that actually occur in the page text, taken as the *minimum* over the stem and the five choices, so one invented choice on an otherwise faithful transcription cannot be averaged away by the four real ones. Below 0.75 the draft is dropped before a reviewer ever sees it wearing a page number. Nothing from that path can reach its live question bank; a human approves it or it stays pending.
 
@@ -665,37 +599,25 @@ Stage versions: `preprocess@N`; `ocr@N:<engines>` (a changed engine set re-reads
 
 ## 13. Concurrency and failure
 
-- **Three lanes during a scan.** The capture loop (main thread, owns the window) only enqueues
-frames. One worker thread does ingest/preprocess/OCR — Vision is CPU-bound and serial, and a bracketed page costs one more OCR pass per variant — and renders an OCR-only page immediately. A `ThreadPoolExecutor(llm_workers)` runs the LLM pass and re-renders when it lands. Queue depth (frames + pending LLM jobs) and the active stages are in the HUD.
-- **Store access is serialized** by an `RLock` around every method on one `check_same_thread=False`
-  connection; WAL + `synchronous=NORMAL` keeps a crash mid-write from corrupting the file.
+- **Three lanes during a scan.** The capture loop (main thread, owns the window) only enqueues frames. One worker thread does ingest/preprocess/OCR — Vision is CPU-bound and serial, and a bracketed page costs one more OCR pass per variant — and renders an OCR-only page immediately. A `ThreadPoolExecutor(llm_workers)` runs the LLM pass and re-renders when it lands. Queue depth (frames + pending LLM jobs) and the active stages are in the HUD.
+- **Store access is serialized** by an `RLock` around every method on one `check_same_thread=False` connection; WAL + `synchronous=NORMAL` keeps a crash mid-write from corrupting the file.
 - **Page files are written atomically** (temp file + rename).
-- **Degraded mode:** `LLMHealth` counts consecutive `LLMUnavailable`; past `llm_failure_limit` the
-  pool stops being fed and the HUD shows `LLM OFF`. Page-level errors do not count.
-- **Quit:** drain the frame queue, wait for the pool, build the document. A second Ctrl-C cancels
-  pending LLM jobs; the pages remain `unverified` with their OCR text and `verify` completes them.
-- A stage failure is recorded with the error and the page stays `unverified`; the next `verify`
-  retries it. Nothing is ever deleted automatically.
+- **Degraded mode:** `LLMHealth` counts consecutive `LLMUnavailable`; past `llm_failure_limit` the pool stops being fed and the HUD shows `LLM OFF`. Page-level errors do not count.
+- **Quit:** drain the frame queue, wait for the pool, build the document. A second Ctrl-C cancels pending LLM jobs; the pages remain `unverified` with their OCR text and `verify` completes them.
+- A stage failure is recorded with the error and the page stays `unverified`; the next `verify` retries it. Nothing is ever deleted automatically.
 - Refusal (`stop_reason == "refusal"`) after fallback → `LLMPageError`, recorded, continue.
 
 ## 13a. Web UI
 
 `ocrmd serve` runs a FastAPI app (uvicorn, `127.0.0.1:8765`, no auth) serving a dependency-free single-page frontend from the package. The design constraints:
 
-- **One orchestration, two drivers.** `session.ScanSession` owns a scanning run (capture generator,
-OCR worker, LLM pool, health, event buffer). The CLI calls `run()` on the main thread with the OpenCV window; the web server calls `start()` on a thread with `preview=False`, receives the HUD frame through `auto_shutter(on_frame=…)` as JPEG, and feeds key presses through a command queue (`capture`, `focus_lock`, `rotate`, `zoom_in`, …). Nothing about gating or processing differs.
-- **Streaming.** `/api/scan/stream` is MJPEG (`multipart/x-mixed-replace`) at ≤20 fps from the latest
-frame under a condition variable; `/api/scan` is polled at 2 Hz for gate numbers, queue, recent pages and events. No WebSocket needed for a local tool.
-- **Jobs.** verify/build/reprocess/ingest/reconstruct/etl run on one worker thread (OCR is serial, the store is one
-connection), each with a bounded log, progress and a cancel flag; `reprocess` is refused while its document is being scanned. Uploads land in `<root>/inbox/<slug>/` and go through the same ingest.
-- **Deletion** (`DELETE /pages/{seq}`, `POST /pages/delete`, `DELETE /documents/{slug}?confirm=slug`)
-removes rows, artifacts and page files, and purges the raw capture once no page refers to it. Its capture rows go too, so the same frame can be scanned again without tripping dedup. Sequence numbers are not renumbered (page files are named by sequence and printed labels carry the order). Refused while the document is being scanned.
-- **Edits are human edits.** `PUT /pages/{seq}` and `/resolve` write the page file *without* updating
-the pipeline fingerprint, so the file counts as hand-edited and `verify` preserves it (§10). `/signoff` records the reviewer and freezes the body; `/reopen` reverts to the computed status.
-- **The page image is four views and a selection tool.** `flat` (the default), `processed`, `bin` and
-`raw`; `flat` is rendered on the first request for a page that predates it, since it is a pure function of the crop. Dragging a box on it calls `POST /pages/{seq}/region` (§11c). The rectangle is kept in *page fractions*, not pixels, so it survives zooming, switching views and the re-render after each read.
-- **Frontend.** ~800 lines of vanilla JS with a hash router (dashboard, scan, document, page,
-review mode, jobs, settings) and a small renderer for the Markdown dialect (headings, lists, tables, blockquotes, footnotes, `==[…]==` marks). Works offline; no build step; served as package data.
+- **One orchestration, two drivers.** `session.ScanSession` owns a scanning run (capture generator, OCR worker, LLM pool, health, event buffer). The CLI calls `run()` on the main thread with the OpenCV window; the web server calls `start()` on a thread with `preview=False`, receives the HUD frame through `auto_shutter(on_frame=…)` as JPEG, and feeds key presses through a command queue (`capture`, `focus_lock`, `rotate`, `zoom_in`, …). Nothing about gating or processing differs.
+- **Streaming.** `/api/scan/stream` is MJPEG (`multipart/x-mixed-replace`) at ≤20 fps from the latest frame under a condition variable; `/api/scan` is polled at 2 Hz for gate numbers, queue, recent pages and events. No WebSocket needed for a local tool.
+- **Jobs.** verify/build/reprocess/ingest/reconstruct/etl run on one worker thread (OCR is serial, the store is one connection), each with a bounded log, progress and a cancel flag; `reprocess` is refused while its document is being scanned. Uploads land in `<root>/inbox/<slug>/` and go through the same ingest.
+- **Deletion** (`DELETE /pages/{seq}`, `POST /pages/delete`, `DELETE /documents/{slug}?confirm=slug`) removes rows, artifacts and page files, and purges the raw capture once no page refers to it. Its capture rows go too, so the same frame can be scanned again without tripping dedup. Sequence numbers are not renumbered (page files are named by sequence and printed labels carry the order). Refused while the document is being scanned.
+- **Edits are human edits.** `PUT /pages/{seq}` and `/resolve` write the page file *without* updating the pipeline fingerprint, so the file counts as hand-edited and `verify` preserves it (§10). `/signoff` records the reviewer and freezes the body; `/reopen` reverts to the computed status.
+- **The page image is four views and a selection tool.** `flat` (the default), `processed`, `bin` and `raw`; `flat` is rendered on the first request for a page that predates it, since it is a pure function of the crop. Dragging a box on it calls `POST /pages/{seq}/region` (§11c). The rectangle is kept in *page fractions*, not pixels, so it survives zooming, switching views and the re-render after each read.
+- **Frontend.** ~800 lines of vanilla JS with a hash router (dashboard, scan, document, page, review mode, jobs, settings) and a small renderer for the Markdown dialect (headings, lists, tables, blockquotes, footnotes, `==[…]==` marks). Works offline; no build step; served as package data.
 
 ## 14. Configuration and observability
 
@@ -705,34 +627,7 @@ Logging: `ocrmd.*` loggers; console at WARNING (`--debug` DEBUG, `--quiet` ERROR
 
 ## 15. CLI surface
 
-```
-ocrmd scan      --doc SLUG [--camera N|name] [--focus continuous|locked|settle|off] [--no-llm]
-                [--provider anthropic|xai] [--model M] [--resolution WxH] [--rotate D] [--zoom Z]
-                [--title T] [--tag T]... [--project P] [--no-preview] [--duration S] [--max-pages N]
-ocrmd ingest    PATH... --doc SLUG [--watch] [--no-llm] [--title/--tag/--project]
-ocrmd verify    [--doc SLUG] [--flagged-only] [--refresh] [--batch [--no-wait]] [--collect]
-ocrmd reprocess [--doc SLUG] [--no-llm] [-y]
-ocrmd delete    --doc SLUG (--page N... [--whole-capture] | --all) [--keep-raw] [-y]
-ocrmd review    --doc SLUG [--who NAME] [--list]
-ocrmd annotate  --doc SLUG [--camera N|name] [--no-llm] [--dry-run] [--duration S] [--max-pages N]
-ocrmd reconstruct --doc SLUG [--page N] [--out DIR] [--pdf] [--review]
-ocrmd read      --doc SLUG --page N [--region x,y,w,h] [--llm] [--ask Q] [--save PATH]
-ocrmd etl       --doc SLUG -p PIPELINE.yaml [--limit N] [--status S]... [--dry-run] [--no-cache]
-                [--no-llm] [--out PATH] [--export-docetl DIR]
-ocrmd status    [--doc SLUG] [--all]
-ocrmd build     [--doc SLUG]
-ocrmd library   [--json] [--all]
-ocrmd search    QUERY [--doc SLUG] [--limit N] [--json]
-ocrmd index     [--doc SLUG] [--force]
-ocrmd export    [--doc SLUG] [--format md|txt|json|jsonl] [--out PATH]
-ocrmd sinks     [--no-probe]
-ocrmd send      --doc SLUG --page N [--to NAME] [-o key=value]... [--region x,y,w,h] [--dry-run]
-ocrmd doctor    [--costs]
-ocrmd ocr-bench [--doc SLUG] [--engines a+b | --compare] [--limit N] [-v]
-ocrmd serve     [--host 127.0.0.1] [--port 8765] [--no-open]
-ocrmd --debug|--quiet <command>
-python -m ocrmd <command>
-```
+Every command, argument and option, with its default, is in [reference/cli.md](reference/cli.md) — generated from the typer app by `python3 tools/gen_reference.py --write`, so it cannot drift from `cli.py`. Every `Settings` field and its `OCRMD_*` variable is in [reference/settings.md](reference/settings.md), generated the same way.
 
 ## 16. Testing
 
@@ -741,11 +636,9 @@ python -m ocrmd <command>
 ## 17. Build history
 
 1. ~~Skeleton + files path~~ **done** (0.1)
-2. ~~Anthropic provider + reconcile~~ **done** (0.1) — plus anti-fabrication prompting, the
-`suspect`/`illegible`/`blank` statuses and the order-insensitive overlap metric, none of which were in the original design and all of which real pages forced.
+2. ~~Anthropic provider + reconcile~~ **done** (0.1) — plus anti-fabrication prompting, the `suspect`/`illegible`/`blank` statuses and the order-insensitive overlap metric, none of which were in the original design and all of which real pages forced.
 3. ~~Webcam auto-shutter~~ **done** (0.1) — plus focus/exposure/format control, view transforms, threaded worker.
-4. ~~Production hardening~~ **done** (0.2) — hand gate, focus settle, camera reopen, LLM lanes and
-degraded mode, error taxonomy, continuity, batches, xAI, PDF/watch ingest, document.yaml and inheritance, edit preservation, review, status, configuration, logging, migrations, tests, CI. 4b. ~~Web UI~~ **done** (0.3) — `ocrmd serve`: live scan with HUD stream and controls, document and page browser with images, click-to-resolve review and sign-off, jobs, metadata, doctor.
+4. ~~Production hardening~~ **done** (0.2) — hand gate, focus settle, camera reopen, LLM lanes and degraded mode, error taxonomy, continuity, batches, xAI, PDF/watch ingest, document.yaml and inheritance, edit preservation, review, status, configuration, logging, migrations, tests, CI. 4b. ~~Web UI~~ **done** (0.3) — `ocrmd serve`: live scan with HUD stream and controls, document and page browser with images, click-to-resolve review and sign-off, jobs, metadata, doctor.
 5. **Receipts:** typed line items, arithmetic check, per-kind prompt variants. *not started*
 6. **Cross-provider arbitration** for low-agreement pages. *not started* (the interface allows it)
 
@@ -760,26 +653,17 @@ degraded mode, error taxonomy, continuity, batches, xAI, PDF/watch ingest, docum
 - OpenCV and AVFoundation number the cameras differently, so focus was being set on the other camera.
 - The "interpolated" 1080p mode reads 49% more words than the native 4:3 mode.
 - Frame averaging, Lanczos, CLAHE and unsharp masking all measured as noise; none were kept.
-- Row-profile *variance* let a gutter shadow outvote a page of text; the direction test now measures
-  power at text-line frequencies.
-- **The shutter fired with a hand flat on the page** (0.2). Skin detection inside the page outline
-  failed on a wooden desk; a reference paper mask works.
-- **A dHash cannot tell two pages of one book apart** on near-blank pages; frame correlation plus
-  text-stroke correlation inside the paper can (0.2).
+- Row-profile *variance* let a gutter shadow outvote a page of text; the direction test now measures power at text-line frequencies.
+- **The shutter fired with a hand flat on the page** (0.2). Skin detection inside the page outline failed on a wooden desk; a reference paper mask works.
+- **A dHash cannot tell two pages of one book apart** on near-blank pages; frame correlation plus text-stroke correlation inside the paper can (0.2).
 - **`source.type` was always `file`** — `"webcam" in str(sqlite3.Row)` is never true (0.2).
 
 ## 18. Open questions
 
-- Two-page spread handling from a fixed overhead camera: the perspective warp assumes the page is
-  roughly planar; a dewarp step (e.g. `page-dewarp`) may be needed for thick books near the spine.
+- Two-page spread handling from a fixed overhead camera: the perspective warp assumes the page is roughly planar; a dewarp step (e.g. `page-dewarp`) may be needed for thick books near the spine.
 - Whether to ship PaddleOCR (heavy dependency) or keep it a documented extra.
-- Resolution remains the binding constraint: a 720p webcam framing a full spread gives ~500 px per
-page against the ~900 needed. Options are physical (mount the camera closer, one page at a time) or a stills path — the C525 can produce higher-resolution stills than its video modes, but not through AVFoundation's video capture path.
-- Fingertips on the margin pass the hand gate (cover ≤ 0.05). Lowering the threshold trips on page
-  curl; the honest fix is a glass plate or weights, which the README now says.
-- The hand gate has no reference at session start: a hand already in frame would be baked into the
-first baseline and the first capture would include it. The gate re-baselines the moment the hand withdraws (paper *added*), so only the first capture is exposed. A start-up grace period that waits for the largest paper area seen in the first few seconds would close it.
-- `illegible_reason` is the model's opinion, not a measurement. In the live smoke test Haiku 4.5
-reported a soft left page as "heavily obscured by the hand holding the book open" when no hand was in the frame (the gate's `cover=0.00` was correct; the page curves toward the spine and sat outside the locked focus plane). The prompt now asks for observed symptoms only, but the cross-check — `suspect`/`illegible` from the *numbers* — remains the thing to trust.
-- Thick books: with `--focus settle` the lens locks on whatever it settled on; the half of the spread
-that curves up toward the spine can be soft while the page-level sharpness gate (measured over the whole detected sheet) still passes. Per-half sharpness, or a dewarp step, is the next lever.
+- Resolution remains the binding constraint: a 720p webcam framing a full spread gives ~500 px per page against the ~900 needed. Options are physical (mount the camera closer, one page at a time) or a stills path — the C525 can produce higher-resolution stills than its video modes, but not through AVFoundation's video capture path.
+- Fingertips on the margin pass the hand gate (cover ≤ 0.05). Lowering the threshold trips on page curl; the honest fix is a glass plate or weights, which the README now says.
+- The hand gate has no reference at session start: a hand already in frame would be baked into the first baseline and the first capture would include it. The gate re-baselines the moment the hand withdraws (paper *added*), so only the first capture is exposed. A start-up grace period that waits for the largest paper area seen in the first few seconds would close it.
+- `illegible_reason` is the model's opinion, not a measurement. In the live smoke test Haiku 4.5 reported a soft left page as "heavily obscured by the hand holding the book open" when no hand was in the frame (the gate's `cover=0.00` was correct; the page curves toward the spine and sat outside the locked focus plane). The prompt now asks for observed symptoms only, but the cross-check — `suspect`/`illegible` from the *numbers* — remains the thing to trust.
+- Thick books: with `--focus settle` the lens locks on whatever it settled on; the half of the spread that curves up toward the spine can be soft while the page-level sharpness gate (measured over the whole detected sheet) still passes. Per-half sharpness, or a dewarp step, is the next lever.
