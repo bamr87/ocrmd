@@ -14,7 +14,7 @@ Exit status 2 means the package cannot be imported here (ocrmd is not installed)
 
 The CLI's defaults are read from the *loaded* settings at import time (`typer.Option(S.focus)`), so they
 would otherwise carry whatever ocrmd.toml, .env or OCRMD_* the machine running this has. The generator
-therefore drops OCRMD_* from its environment, points OCRMD_ROOT and HOME at an empty directory, and swaps
+therefore drops OCRMD_* and USER from its environment, points OCRMD_ROOT and HOME at an empty directory, and swaps
 `ocrmd.config.settings` for a pure-defaults `Settings` before `ocrmd.cli` is imported.
 """
 from __future__ import annotations
@@ -63,6 +63,7 @@ def _load_cli():
     """Import the typer app against pure defaults (see the module docstring for why)."""
     for k in [k for k in os.environ if k.startswith("OCRMD_")]:
         del os.environ[k]
+    os.environ.pop("USER", None)   # `review --who` defaults to $USER: "runner" on CI, the login locally
     empty = tempfile.mkdtemp(prefix="ocrmd-ref-")
     atexit.register(shutil.rmtree, empty, True)
     os.environ["OCRMD_ROOT"] = os.environ["HOME"] = empty
