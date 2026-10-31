@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/bamr87/ocrmd/compare/v0.1.0...v0.1.1) (2026-10-31)
+
+
+### Fixed
+
+* **tools:** drop USER before generating the CLI reference ([89f30f4](https://github.com/bamr87/ocrmd/commit/89f30f463a27faadccf4baaf0fb852f5da2cafc2))
+* **tools:** drop USER before generating the CLI reference ([8c51926](https://github.com/bamr87/ocrmd/commit/8c519267098af1df2211529d4c1b2e731493950a))
+
 ## 0.9.0 — unreleased: a general-purpose book scanner
 
 ### An inventory of everything scanned
