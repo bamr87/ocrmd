@@ -96,9 +96,9 @@ ocrmd annotate [OPTIONS]
 
 Extract structured data from a scanned document with a declarative pipeline.
 
-map / filter / extract / reduce / resolve / split / unnest / sample over the document's pages, blocks or figures, each an LLM prompt and an output schema (DocETL's operator model — see ocrmd/etl.py). Every output row carries the page — and, from blocks, the rectangle — it came from; every operator's answers are cached and versioned by its prompt, so changing one operator re-runs one operator. A pipeline may write back into the page files, the page model or document.yaml instead of a spreadsheet (`output.type: frontmatter | layout | document`).
+map / filter / extract / reduce / resolve / split / unnest / sample / crosscheck over the document's pages, blocks or figures, each an LLM prompt and an output schema (DocETL's operator model — see ocrmd/etl.py). Every output row carries the page — and, from blocks, the rectangle — it came from; every operator's answers are cached and versioned by its prompt, so changing one operator re-runs one operator. A pipeline may write back into the page files, the page model or document.yaml instead of a spreadsheet (`output.type: frontmatter | layout | document`).
 
-PIPELINE may be a file, or the name of a bundled one: figures, references, glossary, receipts, cases.
+PIPELINE may be a file, or the name of a bundled one: figures, components, references, glossary, receipts, cases.
 
 ```text
 ocrmd etl [OPTIONS]

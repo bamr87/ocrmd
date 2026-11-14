@@ -30,8 +30,8 @@ Since 0.9 the operators read the *page model* as well as the page text, and can 
 - **Sources** (`source:` in the spec): `pages` — one row per page, with the reconciliation signals
   the frontmatter records (`agreement`, `cer`, `flagged_spans`, …); `blocks` — one row per layout
   block with its role, box and reading order; `figures` — one row per figure with its crop, so an
-  operator with `image: true` can look at the picture; `extracted:<name>` — a previous pipeline's
-  rows, for chaining.
+  operator with `image: true` can look at the picture (over any other source it is shown the page
+  itself); `extracted:<name>` — a previous pipeline's rows, for chaining.
 - **Sinks** (`output.type`): `frontmatter`, `layout` and `document` write fields back into the page
   files, the page model and `document.yaml`, through the same rules as a human edit — a later
   `verify` keeps them — and every such write is logged (`etl_writes`), so an enrichment is as
@@ -70,8 +70,36 @@ Quote spellings, numbers, dates and names exactly as the text has them, includin
 mistakes — the transcription marks its own doubtful readings with ==[...]== and you should keep the
 reading inside the brackets. Return only the structured answer."""
 
+# What an operator with `image: true` runs under instead. `SYSTEM` says the text is the whole of the
+# evidence, which is exactly wrong for a question about a drawing: asked what a figure shows, a model
+# held to "use only the text" either answers nothing or quietly stops obeying. The refusal is the same
+# one, restated for two kinds of evidence that must not be mixed — what is *drawn* and what is *printed*.
+SYSTEM_PICTURE = """You are answering questions about one picture cut out of a photographed page, and about the
+text of that page, which has already been transcribed.
+
+The picture is your evidence for what is drawn. The text is your evidence for what is printed. Keep
+them apart: a name you recognise from the drawing is yours, a name the page prints is the page's, and
+any field that asks for printed words takes them exactly as printed or stays empty.
+
+Report only what you can actually see. These pictures are photographed by a webcam and are often
+small, soft or cropped; when you cannot tell what something is, say so in plain words ("unidentified
+bracket", "small part, unclear") rather than choosing a likely name. Do not list things a picture of
+this kind usually shows, do not carry over something from another page, and never supply a number —
+a quantity, a size, a part number — that is not printed where you can read it. A short honest answer
+is better than a complete-looking one: it will be read as though it came off the page.
+
+Return only the structured answer."""
+
 LLM_OPS = ("map", "filter", "extract", "reduce", "resolve")          # the ones that can spend tokens
-OPERATORS = LLM_OPS + ("unnest", "split", "sample")
+OPERATORS = LLM_OPS + ("unnest", "split", "sample", "crosscheck")
+# crosscheck: two names are one thing at or above this (`same_thing`). Measured on 25 hand-written
+# PC-part name pairs, not on model output (none could be had when this was written): the 13 pairs that
+# are different parts top out at 0.73 ("motherboard" / "motherboard standoff") once names that differ
+# in a number are refused outright, and 8 of the 12 that are one part score >= 0.80 (the lowest of
+# them 0.82). The four it misses ("PSU" / "power supply unit" 0.33, "case fan" / "fan" 0.60, and two
+# at 0.76-0.78) come out as two single readings, which is the direction to be wrong in: an agreement
+# that was not one hides a disagreement. The pairs are in tests/test_etl.py.
+MATCH_THRESHOLD = 0.80
 SOURCES = ("pages", "blocks", "figures")                              # plus extracted:<name>
 SINKS = ("json", "csv", "md", "markdown", "frontmatter", "layout", "document")
 # what a sink may touch: the fields a person may edit, and nothing the pipeline owns
@@ -148,8 +176,14 @@ class Operation:
     n: int = 10                                        # sample: how many
     max_tokens: int = 4000
     model: str | None = None                           # this operator's model, when not the runner's
-    image: bool = False                                # map/extract/filter over `figures`: send the crop too
+    image: bool = False                                # map/extract/filter: send the picture too (`Runner.image_for`)
     extract_key: str = "text"                          # extract: the field the spans must be quoted from
+    first_key: str | None = None                       # crosscheck: the list one reading produced
+    second_key: str | None = None                      # crosscheck: the list the other reading produced
+    match_key: str = "name"                            # crosscheck: the item field two readings are matched on
+    quote_key: str | None = None                       # crosscheck: an item field that claims to quote the page
+    into_key: str = "items"                            # crosscheck: where the merged list goes
+    match_threshold: float = MATCH_THRESHOLD           # crosscheck: name similarity at which two items are one
 
     @property
     def schema(self) -> dict:
@@ -198,6 +232,9 @@ class Pipeline:
                 raise ValueError(f"operation {op.name!r}: {op.type} needs an output schema")
             if op.type == "extract" and not op.output:
                 op.output = {"spans": "list[string]"}
+            if op.type == "crosscheck" and not (op.first_key and op.second_key):
+                raise ValueError(f"crosscheck {op.name!r} needs `first_key` and `second_key`: the two list "
+                                 "fields to compare")
             if op.output:
                 _ = op.schema        # a bad type is an error now, not after the first page has been paid for
             if op.type == "filter" and op.boolean_field is None:
@@ -471,8 +508,8 @@ class Runner:
             if image is None:
                 log.warning("etl %s: figure crop %s missing; asking without it", op.name, image_path)
         try:
-            res = (provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens, image_bgr=image) if image is not None
-                   else provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens))
+            res = (provider.complete_json(SYSTEM_PICTURE, prompt, op.schema, op.max_tokens, image_bgr=image)
+                   if image is not None else provider.complete_json(SYSTEM, prompt, op.schema, op.max_tokens))
         except LLMError as e:
             self.stats.errors.append(f"{op.name}: {e}")
             log.warning("etl %s failed on one row: %s", op.name, e)
@@ -483,6 +520,28 @@ class Runner:
         self.st.log_llm(page_id, res.provider, res.model, res.request_id, res.usage, res.latency_ms)
         cache[h] = res.data
         return res.data
+
+    def image_for(self, op: Operation, row: dict) -> str | None:
+        """The picture an `image: true` operator is shown with this row: a figure row's own crop, and
+        for any other row the page it came from — the processed crop, which for a photograph of the
+        things themselves (a part on the desk, not a page about it) is the whole of the evidence."""
+        if not op.image:
+            return None
+        if row.get("_asset"):
+            return row["_asset"]
+        page = self.s.processed / f"{row.get('_page_id')}.png"
+        return str(page) if row.get("_page_id") and page.exists() else None
+
+    def ask_row(self, op: Operation, row: dict, cache: dict) -> dict | None:
+        """One row's question — unless it is about a picture and there is no picture to show. Asking
+        "what does this show" with nothing attached is an invitation to invent an answer, so that row
+        is not asked, and the run says so."""
+        image = self.image_for(op, row)
+        if op.image and image is None:
+            self.stats.errors.append(f"{op.name}: no picture for page {row.get('_page', '?')}; not asked")
+            log.warning("etl %s: no picture for page %s; not asked", op.name, row.get("_page"))
+            return None
+        return self.ask(op, template(op.prompt, row), cache, op.name, row.get("_page_id"), image_path=image)
 
     # -- operators --------------------------------------------------------------------------------
     def run(self, pipe: Pipeline, rows: list[dict]) -> list[dict]:
@@ -496,8 +555,7 @@ class Runner:
     def _map(self, op: Operation, rows: list[dict]) -> list[dict]:
         cache, out = self._cache(op), []
         for r in rows:
-            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"),
-                            image_path=(r.get("_asset") or None) if op.image else None)
+            data = self.ask_row(op, r, cache)
             out.append(r | (data or {}))
         self._save(op, cache)
         return out
@@ -527,8 +585,7 @@ class Runner:
         cache, out = self._cache(op), []
         key = op.boolean_field
         for r in rows:
-            data = self.ask(op, template(op.prompt, r), cache, op.name, r.get("_page_id"),
-                            image_path=(r.get("_asset") or None) if op.image else None)
+            data = self.ask_row(op, r, cache)
             if data is None:                     # unanswered: keep the row rather than silently dropping it
                 out.append(r)
                 continue
@@ -633,6 +690,47 @@ class Runner:
     def _sample(self, op: Operation, rows: list[dict]) -> list[dict]:
         return rows[:op.n]                    # deliberately the first n: a sample you cannot repeat is not a test
 
+    def _crosscheck(self, op: Operation, rows: list[dict]) -> list[dict]:
+        """Two readings of one thing, diffed: the cross-check the page text gets, for answers that have
+        no local engine to be checked against.
+
+        A picture has only ever been read by a model, so one `map` over a figure is exactly the
+        single-pass read the rest of ocrmd exists to distrust. Two maps that were shown different
+        evidence — or answered by different models — are two readings, and this is their reconcile:
+        an item both named is `readings: both`, an item only one named is kept and says which, and a
+        field they disagree on keeps both values (`second_reading`), with the ones that disagree in
+        *digits* listed in `conflicts`. Nothing is dropped and nothing is chosen.
+
+        `quote_key` names an item field that claims to quote the page (a printed label). It is looked
+        for in the page text the row carries, and comes back as `<quote_key>_found` — false is a label
+        the model says is printed that no reading of the page contains.
+
+        A reading that never happened (no provider, a failed call) is not a reading that found
+        nothing: the row says which one is `missing` and its items stay single readings.
+        """
+        out = []
+        for r in rows:
+            a, b = r.get(op.first_key), r.get(op.second_key)
+            missing = [k for k, v in ((op.first_key, a), (op.second_key, b)) if not isinstance(v, list)]
+            items = crosscheck_items(a if isinstance(a, list) else [], b if isinstance(b, list) else [],
+                                     op.match_key, op.quote_key, op.match_threshold)
+            if op.quote_key:
+                words = _page_words(r)
+                for it in items:
+                    quoted = _norm_text(it.get(op.quote_key, ""))
+                    it[f"{op.quote_key}_found"] = (quoted in words) if quoted else None
+            both = sum(1 for it in items if it["readings"] == "both")
+            summary = {"both": both, "first": sum(1 for it in items if it["readings"] == "first"),
+                       "second": sum(1 for it in items if it["readings"] == "second"),
+                       "agreement": round(both / len(items), 3) if items else None}
+            if missing:
+                summary["missing"] = missing
+            out.append(r | {op.into_key: items, "_crosscheck": summary})
+        if rows and all(not isinstance(r.get(op.first_key), list) and not isinstance(r.get(op.second_key), list)
+                        for r in rows):
+            log.warning("etl %s: no row has %r or %r; nothing to compare", op.name, op.first_key, op.second_key)
+        return out
+
 
 def _pair_prompt(op: Operation, a: str, b: str) -> str:
     return template(op.comparison_prompt, {"a": a, "b": b}) if "{{" in op.comparison_prompt else (
@@ -642,6 +740,88 @@ def _pair_prompt(op: Operation, a: str, b: str) -> str:
 # --- holding an extraction to the page -----------------------------------------------------------
 def _norm_text(s: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]", "", w.lower()) for w in str(s).split() if re.sub(r"[^a-z0-9]", "", w.lower()))
+
+
+def _page_words(row: dict) -> str:
+    """The row's page text as normalised words, with the pipeline's own figure references taken out —
+    `![figure](../figures/…)` is not something the page prints, and a label must not be found in it."""
+    return _norm_text(re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", str(row.get("text", ""))))
+
+
+# --- two readings of one thing -------------------------------------------------------------------
+def _singular(name: str) -> str:
+    return " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+                    for w in _norm_text(name).split())
+
+
+def _digits(v: Any) -> list[str]:
+    return re.findall(r"\d+", str(v if v is not None else ""))
+
+
+def same_thing(a: str, b: str) -> float:
+    """How surely two names are one thing, 0-1.
+
+    Words in any order with plurals folded, or the same letters with the spaces taken out
+    ("thumbscrew" / "thumb screw") — whichever is higher. Not `token_set_ratio`: it scores a name
+    that contains another at 1.0, which makes "fan" and "fan bracket" one part. And two names whose
+    numbers differ are never the same thing however alike they read: an M3 screw is not an M4 screw,
+    and that pair scores 0.88 on the letters alone.
+    """
+    x, y = _singular(a), _singular(b)
+    if not x or not y:
+        return 0.0
+    if sorted(_digits(x)) != sorted(_digits(y)):
+        return 0.0
+    return max(fuzz.token_sort_ratio(x, y), fuzz.ratio(x.replace(" ", ""), y.replace(" ", ""))) / 100.0
+
+
+def crosscheck_items(first: list, second: list, key: str = "name", quote_key: str | None = None,
+                     threshold: float = MATCH_THRESHOLD) -> list[dict]:
+    """Merge two lists of items that are two readings of the same thing. See `Runner._crosscheck`.
+
+    Matching is one-to-one, best pairs first: an item is the same as another when their `key` reads
+    alike (`same_thing`), or when both quote the same printed words in `quote_key` — two readings
+    pointing at one label on the page agree about what they are pointing at, whatever each calls it.
+    """
+    a = [dict(x) for x in first if isinstance(x, dict)]
+    b = [dict(x) for x in second if isinstance(x, dict)]
+    pairs = []
+    for i, x in enumerate(a):
+        for j, y in enumerate(b):
+            score = same_thing(str(x.get(key, "")), str(y.get(key, "")))
+            if quote_key and _norm_text(x.get(quote_key, "")) and _norm_text(x.get(quote_key, "")) == _norm_text(y.get(quote_key, "")):
+                score = max(score, 1.0)
+            if score >= threshold:
+                pairs.append((score, i, j))
+    matched: dict[int, int] = {}
+    taken: set[int] = set()
+    for _score, i, j in sorted(pairs, key=lambda p: (-p[0], p[1], p[2])):
+        if i not in matched and j not in taken:
+            matched[i] = j; taken.add(j)
+    out = []
+    for i, x in enumerate(a):
+        if i not in matched:
+            out.append(x | {"readings": "first"})
+            continue
+        y = b[matched[i]]
+        item, other, conflicts = dict(x), {}, []
+        for f in list(dict.fromkeys(list(x) + list(y))):
+            vx, vy = x.get(f), y.get(f)
+            if _norm_text(_as_text(vx if vx is not None else "")) == _norm_text(_as_text(vy if vy is not None else "")):
+                continue
+            other[f] = vy
+            if vx in (None, "", [], {}):
+                item[f] = vy                      # an empty slot filled, and `second_reading` says by whom
+            elif vy not in (None, "", [], {}) and _digits(vx) != _digits(vy):
+                conflicts.append(f)               # digits are never resolved: both values stay, and it says so
+        item["readings"] = "both"
+        if other:
+            item["second_reading"] = other
+        if conflicts:
+            item["conflicts"] = conflicts
+        out.append(item)
+    out += [y | {"readings": "second"} for j, y in enumerate(b) if j not in taken]
+    return out
 
 
 def locate_span(span: str, row: dict, key: str = "text") -> dict:
@@ -900,8 +1080,15 @@ def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "pages.json").write_text(json.dumps(rows, indent=1, ensure_ascii=False, default=str))
     ops = []
+    steps = []
     for name in pipe.steps:
         op = pipe.op(name)
+        if op.type == "crosscheck":
+            # ocrmd's own, with no counterpart in their runner: the export carries both readings and
+            # leaves the comparing out, rather than naming an operator DocETL would refuse to load
+            log.warning("etl: %s (crosscheck) has no DocETL equivalent; left out of the export", op.name)
+            continue
+        steps.append(name)
         d: dict = {"name": op.name, "type": op.type}
         if op.model:
             d["model"] = litellm_model(op.model)
@@ -938,7 +1125,7 @@ def export_docetl(pipe: Pipeline, rows: list[dict], out_dir: Path, model: str) -
     spec = {"default_model": litellm_model(model),
             "datasets": {"pages": {"type": "file", "path": str((out_dir / "pages.json").resolve())}},
             "operations": ops,
-            "pipeline": {"steps": [{"name": pipe.name, "input": "pages", "operations": pipe.steps}],
+            "pipeline": {"steps": [{"name": pipe.name, "input": "pages", "operations": steps}],
                          "output": {"type": "file", "path": str((out_dir / f"{pipe.name}.json").resolve())}}}
     (out_dir / "pipeline.yaml").write_text(yaml.safe_dump(spec, sort_keys=False, width=100))
     return spec

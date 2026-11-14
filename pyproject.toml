@@ -6,11 +6,15 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
+  # typer 0.29 vendors click (`typer._click`) and its options no longer carry `.type`, which is what
+  # tools/gen_reference.py reads: on 0.29.0 the generator dies with AttributeError and
+  # tests/test_reference_docs.py fails on a fresh install; 0.28.0 regenerates docs/reference/ byte for
+  # byte. Capped until the generator is ported to the new parameter classes.
   # The KleidiCV HAL segfaults in cv2.resize on some page crops (arm64 macOS, measured). It was first
   # hit on opencv 5.0.0.93 and pinned out with `<5` — but KleidiCV ships in 4.12+ as well, and 4.14
   # crashes the same way on the wider crops this pipeline now produces. 4.11.0.86 is the last release
   # with no KleidiCV at all (`getBuildInformation()` lists the custom HALs); keep below 4.12.
-  "opencv-python>=4.9,<4.12", "numpy>=1.26", "anthropic>=1.0", "pydantic>=2", "rapidfuzz", "pyyaml", "typer>=0.12",
+  "opencv-python>=4.9,<4.12", "numpy>=1.26", "anthropic>=1.0", "pydantic>=2", "rapidfuzz", "pyyaml", "typer>=0.12,<0.29",
   "python-dotenv", "pillow", "fastapi>=0.110", "uvicorn>=0.27", "python-multipart",
   "pyobjc-framework-Vision; sys_platform == 'darwin'", "pyobjc-framework-AVFoundation; sys_platform == 'darwin'",
 ]
