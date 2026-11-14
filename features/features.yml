@@ -71,3 +71,12 @@ features:
     surface: infra
     link: "ocrmd/etl.py"
     docs: "README.md"
+  - id: OCRMD-007
+    title: "Component identification in figures"
+    description: "The bundled `components` extraction pipeline names the parts, fasteners, tools and cables each figure shows; every figure is read twice and the readings are diffed (`crosscheck`), keeping every item and both sides of a disagreement. Not yet run against a live model."
+    implemented: true
+    status: partial
+    prd: [TBD]
+    surface: cli
+    link: "ocrmd/pipelines/components.yaml"
+    docs: "docs/corpus.md"

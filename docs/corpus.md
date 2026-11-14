@@ -38,6 +38,7 @@ Once a book is transcribed it is a corpus, and the next question is usually *wha
 | `reduce` | group rows by a field and fold each group with one prompt | yes |
 | `resolve` | canonicalise a field across rows (the same case spelled three ways) | only for pairs that pass fuzzy blocking |
 | `split` / `unnest` / `sample` | chunk long pages, flatten a list into rows, take the first N | no |
+| `crosscheck` | diff two list fields that are two readings of the same thing; keep every item and say who read it | no |
 
 ```sh
 ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --dry-run   # see the prompts, spend nothing
@@ -60,3 +61,28 @@ pip install 'ocrmd[docetl]'
 ocrmd etl --doc lsat -p examples/cases.pipeline.yaml --export-docetl out/
 docetl run out/pipeline.yaml
 ```
+
+## What the figures show: components
+
+The transcription stops at a figure's edge on purpose — the page body carries the printed caption and a reference to the crop, never a description of the picture. For a document whose content *is* its pictures (an assembly manual, a parts diagram), the bundled `components` pipeline names what each figure shows, one row per part, fastener, tool or cable:
+
+```sh
+ocrmd etl --doc manual -p components --dry-run   # the prompts and the call count; nothing sent
+ocrmd etl --doc manual -p components             # -> documents/manual/extracted/components.json
+ocrmd etl --doc build -p components --source pages   # whole captured images: a photograph of the parts themselves
+```
+
+A picture has no local engine to be read by, so one model pass over a figure would be exactly the single reading the rest of ocrmd distrusts. The pipeline therefore reads every figure **twice, on different evidence** — once as the crop alone, once as the crop with the page's own text — and `crosscheck` diffs the answers the way OCR and the model are diffed for text:
+
+| field | meaning |
+|---|---|
+| `readings` | `both` — the two readings named it; `first` / `second` — only one did. A single reading is kept and marked, never dropped and never promoted |
+| `second_reading` | every field on which the second reading said something else, with what it said |
+| `conflicts` | the fields where the two disagree in **digits** (a quantity, a size). Both values stay; neither is chosen |
+| `printed_as_found` | whether the label the model says is printed occurs in the page text. `false` is a label no reading of the page contains |
+| `_crosscheck` | per figure: how many items both readings named, how many only one did, and `missing` when a reading never happened |
+
+Two names are one item when they read alike with the words in any order (`etl.same_thing`, at 0.80), or when both readings quote the same printed label. Names that differ in a number are never merged — an M3 screw is not an M4 screw — and a name that merely contains another is not the same thing ("fan", "fan bracket"). The matcher is deliberately the kind that under-merges: "PSU" and "power supply unit" come out as two single readings unless the page prints the name both point at.
+
+What this is not yet: **it has not been run against a live model** — the operator, the prompts and the pipeline are tested with a stand-in provider, and the 0.80 was set on 25 hand-written part-name pairs, not on two real readings. Two passes by one model are also a weaker second opinion than OCR against a model; for one that is independent in more than its evidence, copy the spec to `documents/<slug>/etl/components.yaml` and give `look_again` a `model:` of its own. It costs two calls a figure. Over `--source pages` an `image: true` operator is shown the page's whole processed crop instead of a figure crop, which is what a photograph of objects needs — but such a capture still goes through the *page* pipeline first, which was built for paper: the first photograph of a motherboard and a graphics card on a desk was split down the middle as a two-page spread and both halves turned upside down, and a capture with no readable text at all has an empty body and is not offered to operators. A capture mode that keeps a scene whole does not exist yet. And it can only name what the camera resolved: see [illustrated pages](scanning.md#illustrated-pages-manuals-diagrams-assembly-steps) for the framing that makes a figure legible at all.
+

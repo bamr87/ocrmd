@@ -1,0 +1,92 @@
+# Name what every figure shows — the parts, fasteners, tools and cables drawn in it — one row per
+# component, each carrying the page and the rectangle it was seen in.
+#
+# A picture has no local engine to be read by, so each figure is read TWICE by the model, on different
+# evidence, and the two answers are diffed (`crosscheck`) the way OCR and the model are diffed for text:
+#
+#   look        the crop alone — what can be recognised from the drawing
+#   look_again  the crop and the page's own text — what the page calls the things it shows
+#
+# A component both readings named is `readings: both`; one only a single reading named is kept and says
+# which (`first` | `second`); a quantity or a size the two disagree on keeps both values and is listed in
+# `conflicts`. `printed_as_found: false` is a label the model says is printed that the page text does
+# not contain. Nothing is dropped and nothing is chosen for you.
+#
+# For a second reading that is independent in more than its evidence, give `look_again` another model:
+# copy this file to documents/<slug>/etl/components.yaml and add `model: <id>` to that operation.
+#
+# Over `--source pages` the same two readings are made of each whole captured image instead of each
+# figure crop — for a photograph of the things themselves rather than a page that draws them.
+#
+#   ocrmd etl --doc X -p components --dry-run     # the prompts and the call count, nothing sent
+#   ocrmd etl --doc X -p components --limit 2     # two pages' figures: two calls per figure
+#   ocrmd etl --doc X -p components               # -> documents/X/extracted/components.json
+#   ocrmd etl --doc X -p components --source pages   # one whole captured image at a time, not figure crops
+name: components
+source: figures            # one row per figure block, with its crop and the page text
+
+operations:
+  - name: look
+    type: map
+    image: true
+    prompt: |
+      This is one picture cut out of page {{ input._page }} of "{{ input.document_title }}".
+
+      List every distinct physical thing drawn in it: parts, fasteners, tools, cables. One entry per
+      kind of thing, not one per copy. For each:
+      - `name`: what it is, in a few plain words. If you cannot tell, describe it ("unidentified bracket").
+      - `printed_as`: the label printed IN THIS PICTURE that names it, exactly as printed; empty when the
+        picture prints none.
+      - `quantity`: the count printed beside it (for example "x4"), exactly as printed; empty when none
+        is printed. Do not count the copies yourself.
+      - `type`: part, fastener, tool, cable, or other.
+
+      An empty list is a valid answer for a picture too small or too soft to make out.
+    output:
+      schema:
+        seen: "list[{name: string, printed_as: string, quantity: string, type: enum[part, fastener, tool, cable, other]}]"
+
+  - name: look_again
+    type: map
+    image: true
+    prompt: |
+      This is one picture cut out of page {{ input._page }} of "{{ input.document_title }}", and below it
+      is the text of that page as transcribed.
+
+      List every distinct physical thing the picture shows: parts, fasteners, tools, cables. One entry
+      per kind of thing. Where the page's text names something the picture shows, use the page's name
+      for it. For each:
+      - `name`: what it is, in a few plain words. If you cannot tell, describe it ("unidentified bracket").
+      - `printed_as`: the words the page prints for it — in the picture or in the text below — exactly
+        as printed; empty when the page does not name it.
+      - `quantity`: the count the page prints for it (for example "x4"), exactly as printed; empty when
+        none is printed. Do not count the copies yourself.
+      - `type`: part, fastener, tool, cable, or other.
+
+      List only what is drawn in THIS picture. Something the text mentions that the picture does not
+      show is not an entry. An empty list is a valid answer.
+
+      The page's text:
+
+      {{ input.text }}
+    output:
+      schema:
+        seen_again: "list[{name: string, printed_as: string, quantity: string, type: enum[part, fastener, tool, cable, other]}]"
+
+  - name: agree
+    type: crosscheck       # free: the two readings diffed, printed labels looked for in the page text
+    first_key: seen
+    second_key: seen_again
+    match_key: name
+    quote_key: printed_as
+    into_key: components
+
+  - name: each
+    type: unnest
+    unnest_key: components
+
+pipeline:
+  operations: [look, look_again, agree, each]
+  output:
+    type: json
+    fields: [name, type, quantity, printed_as, printed_as_found, readings, second_reading, conflicts, caption, page_label, _crosscheck]

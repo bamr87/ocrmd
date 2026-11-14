@@ -456,7 +456,159 @@ pipeline:
 def test_the_bundled_library_parses():
     from ocrmd.web.jobs import BUNDLED_PIPELINES
     names = {p.stem for p in BUNDLED_PIPELINES.glob("*.yaml")}
-    assert names >= {"figures", "references", "glossary", "receipts", "cases"}
+    assert names >= {"figures", "components", "references", "glossary", "receipts", "cases"}
     for p in BUNDLED_PIPELINES.glob("*.yaml"):
         pipe = etl.Pipeline.load(p)
         assert pipe.steps
+
+
+# --- two readings of a picture: crosscheck and the components pipeline ---------------------------------
+# One part, named two ways — and two parts whose names read alike. Hand-written, not model output: the
+# measurement behind `etl.MATCH_THRESHOLD`.
+SAME_PART = [("screw", "screws"), ("power supply unit", "power supply"), ("side panel", "left side panel"),
+             ("thumbscrew", "thumb screw"), ("hard drive cage", "drive cage"), ("SATA cable", "SATA data cable"),
+             ("PSU", "power supply unit"), ("case fan", "fan"), ("tempered glass side panel", "glass side panel"),
+             ("PCI slot cover", "PCI slot covers"), ("Phillips screwdriver", "screwdriver"),
+             ("power supply", "PSU (power supply)")]
+OTHER_PART = [("fan", "fan bracket"), ("side panel", "front panel"), ("PSU shroud", "PSU"),
+              ("motherboard", "motherboard standoff"), ("screw", "screwdriver"), ("power cable", "power button"),
+              ("drive cage", "drive tray"), ("top panel", "side panel"), ("SATA cable", "SATA port"),
+              ("fan", "fan hub"), ("case", "case foot"), ("M3 screw", "M4 screw"), ("6-32 screw", "M3 screw")]
+
+
+def test_two_names_for_one_part_match_and_two_parts_never_do():
+    assert max(etl.same_thing(a, b) for a, b in OTHER_PART) < etl.MATCH_THRESHOLD      # no false agreement
+    assert sum(etl.same_thing(a, b) >= etl.MATCH_THRESHOLD for a, b in SAME_PART) == 8  # ...at the cost of four misses
+    assert etl.same_thing("fan", "fan bracket") < 0.5         # containment is not sameness (token_set_ratio says 1.0)
+    assert etl.same_thing("M3 screw", "M4 screw") == 0.0      # names that differ in a number are never one thing
+    assert etl.same_thing("thumbscrew", "thumb screw") == 1.0
+    assert etl.same_thing("", "screw") == 0.0
+
+
+def test_crosscheck_keeps_every_item_and_says_who_read_it():
+    first = [{"name": "power supply", "printed_as": "", "quantity": ""},
+             {"name": "screws", "printed_as": "", "quantity": "x4"},
+             {"name": "fan bracket", "printed_as": "", "quantity": ""}]
+    second = [{"name": "screw", "printed_as": "", "quantity": "x6"},
+              {"name": "power supply unit", "printed_as": "Power Supply Unit", "quantity": ""},
+              {"name": "screwdriver", "printed_as": "", "quantity": ""}]
+    items = {it["name"]: it for it in etl.crosscheck_items(first, second, "name", "printed_as")}
+    assert set(items) == {"power supply", "screws", "fan bracket", "screwdriver"}      # nothing dropped, nothing doubled
+    assert items["power supply"]["readings"] == "both"
+    assert items["power supply"]["printed_as"] == "Power Supply Unit"                  # an empty slot is filled...
+    assert items["power supply"]["second_reading"]["printed_as"] == "Power Supply Unit"  # ...and says by whom
+    assert "conflicts" not in items["power supply"]                                    # wording is not a conflict
+    assert items["screws"]["readings"] == "both" and items["screws"]["quantity"] == "x4"
+    assert items["screws"]["second_reading"]["quantity"] == "x6"                       # both counts kept
+    assert items["screws"]["conflicts"] == ["quantity"]                                # digits are never resolved
+    assert items["fan bracket"]["readings"] == "first" and items["screwdriver"]["readings"] == "second"
+
+
+def test_two_readings_quoting_the_same_printed_label_are_one_item():
+    items = etl.crosscheck_items([{"name": "PSU", "printed_as": "Power Supply Unit"}],
+                                 [{"name": "power supply unit", "printed_as": "power supply unit"}], "name", "printed_as")
+    assert len(items) == 1 and items[0]["readings"] == "both"      # the names alone score 0.33
+    assert len(etl.crosscheck_items([{"name": "PSU", "printed_as": ""}],
+                                    [{"name": "power supply unit", "printed_as": ""}], "name", "printed_as")) == 2
+
+
+def test_a_crosscheck_needs_two_lists_to_compare(tmp_path):
+    with pytest.raises(ValueError, match="first_key"):
+        etl.Pipeline.load(spec(tmp_path, "operations:\n  - {name: agree, type: crosscheck, first_key: a}\n"))
+
+
+class LookingProvider:
+    """Answers each operator from its own canned list, and records what it was shown."""
+    name, model = "anthropic", "fake-model"
+
+    def __init__(self, by_field: dict):
+        self.by_field, self.asked = by_field, []            # asked: (field, system, had an image)
+
+    def complete_json(self, system, user, schema, max_tokens=4000, image_bgr=None):
+        from ocrmd.llm import JsonResult
+        fld = next(iter(schema["properties"]))
+        self.asked.append((fld, system, image_bgr is not None))
+        data = self.by_field[fld]
+        if isinstance(data, Exception):
+            raise data
+        return JsonResult(data={fld: data}, provider=self.name, model=self.model, request_id="msg_x",
+                          usage={"input_tokens": 9, "output_tokens": 4}, latency_ms=1)
+
+
+def figure_rows(tmp_path, text="Install the Power Supply Unit\n\n![figure](../figures/p0-1.png)"):
+    import cv2, numpy as np
+    crop = tmp_path / "p0-1.png"
+    cv2.imwrite(str(crop), np.full((120, 160, 3), 240, np.uint8))
+    return [{"_document": "d", "_page": 1, "_page_id": "p0", "_block": "f1", "_bbox": [0.1, 0.2, 0.3, 0.4],
+             "_asset": str(crop), "role": "figure", "caption": "", "page_label": "6", "document_title": "Case manual",
+             "text": text}]
+
+
+def components_pipeline():
+    from ocrmd.web.jobs import BUNDLED_PIPELINES
+    return etl.Pipeline.load(BUNDLED_PIPELINES / "components.yaml")
+
+
+def test_every_figure_is_read_twice_and_the_readings_are_diffed(root, store, tmp_path):
+    prov = LookingProvider({
+        "seen": [{"name": "power supply", "printed_as": "", "quantity": "", "type": "part"},
+                 {"name": "screws", "printed_as": "", "quantity": "x4", "type": "fastener"},
+                 {"name": "figure", "printed_as": "figure", "quantity": "", "type": "other"}],
+        "seen_again": [{"name": "power supply unit", "printed_as": "Power Supply Unit", "quantity": "", "type": "part"},
+                       {"name": "screw", "printed_as": "PSU screws", "quantity": "x4", "type": "fastener"},
+                       {"name": "side panel", "printed_as": "", "quantity": "", "type": "part"}]})
+    r = runner(root, store, prov)
+    out = r.run(components_pipeline(), figure_rows(tmp_path))
+    assert [(f, img) for f, _s, img in prov.asked] == [("seen", True), ("seen_again", True)]   # two calls, the crop in both
+    assert all(s is etl.SYSTEM_PICTURE for _f, s, _img in prov.asked)       # held to the picture, not to "only the text"
+    assert r.stats.calls == 2
+    by = {row["name"]: row for row in out}
+    assert set(by) == {"power supply", "screws", "figure", "side panel"}
+    assert all(row["_page"] == 1 and row["_block"] == "f1" and row["_bbox"] == [0.1, 0.2, 0.3, 0.4] for row in out)
+    assert by["power supply"]["readings"] == "both" and by["power supply"]["printed_as_found"] is True
+    assert by["screws"]["readings"] == "both" and by["screws"]["printed_as_found"] is False    # the page prints no such label
+    assert by["side panel"]["readings"] == "second" and by["side panel"]["printed_as_found"] is None
+    assert by["figure"]["printed_as_found"] is False          # the pipeline's own ![figure](…) is not the page's print
+    assert by["screws"]["_crosscheck"] == {"both": 2, "first": 1, "second": 1, "agreement": 0.5}
+
+
+def test_a_reading_that_failed_is_missing_not_empty(root, store, tmp_path):
+    prov = LookingProvider({"seen": [{"name": "power supply", "printed_as": "", "quantity": "", "type": "part"}],
+                            "seen_again": LLMPageError("refusal")})
+    r = runner(root, store, prov)
+    out = r.run(components_pipeline(), figure_rows(tmp_path))
+    assert len(out) == 1 and out[0]["readings"] == "first"              # kept, and not promoted to agreed
+    assert out[0]["_crosscheck"]["missing"] == ["seen_again"] and out[0]["_crosscheck"]["agreement"] == 0.0
+    assert len(r.stats.errors) == 1
+
+
+def test_the_components_dry_run_counts_two_calls_a_figure_and_sends_nothing(root, store, tmp_path):
+    prov = LookingProvider({})
+    r = runner(root, store, prov, dry_run=True)
+    out = r.run(components_pipeline(), figure_rows(tmp_path))
+    assert prov.asked == [] and out == []                               # nothing asked, so nothing to list
+    assert [name for name, _p in r.prompts] == ["look", "look_again"]
+    assert "Install the Power Supply Unit" not in r.prompts[0][1]       # the first reading is the crop alone
+    assert "Install the Power Supply Unit" in r.prompts[1][1]           # the second is given the page's words
+
+
+def test_the_docetl_export_leaves_the_crosscheck_out(tmp_path):
+    out = etl.export_docetl(components_pipeline(), figure_rows(tmp_path), tmp_path / "out", "claude-opus-5-5")
+    assert [o["name"] for o in out["operations"]] == ["look", "look_again", "each"]
+    assert out["pipeline"]["steps"][0]["operations"] == ["look", "look_again", "each"]
+
+
+def test_over_pages_an_image_operator_is_shown_the_whole_captured_image(root, store, tmp_path):
+    import cv2, numpy as np
+    cv2.imwrite(str(root.processed / "p0.png"), np.full((90, 120, 3), 200, np.uint8))     # page 1 has a crop on disk
+    prov = LookingProvider({"seen": [{"name": "motherboard", "printed_as": "DARK HERO", "quantity": "", "type": "part"}],
+                            "seen_again": [{"name": "motherboard", "printed_as": "DARK HERO", "quantity": "", "type": "part"}]})
+    page_rows = [r | {"document_title": "Build", "text": "DARK HERO"} for r in rows(2)]   # p0 has an image, p1 has none
+    r = runner(root, store, prov)
+    out = r.run(components_pipeline(), page_rows)
+    assert [(f, img) for f, _s, img in prov.asked] == [("seen", True), ("seen_again", True)]   # p1 has no picture...
+    assert len(r.stats.errors) == 2 and "no picture for page 2" in r.stats.errors[0]            # ...so it is not asked
+    assert r.image_for(components_pipeline().op("look"), page_rows[0]).endswith("p0.png")
+    assert r.image_for(components_pipeline().op("agree"), page_rows[0]) is None           # only operators that ask for one
+    assert out[0]["name"] == "motherboard" and out[0]["readings"] == "both" and out[0]["printed_as_found"] is True
+    assert out[0]["_page"] == 1 and "_block" not in out[0]                                # a page row: no rectangle to claim
