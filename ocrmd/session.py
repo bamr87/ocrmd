@@ -301,7 +301,9 @@ class ScanSession:
         thread = threading.Thread(target=worker, name="ocrmd-worker", daemon=True)
         thread.start()
         try:
-            for fr in auto_shutter(s, preview=self.preview, on_status=lambda m: self.emit(m, "info"), view=view,
+            # `self.emit` itself, not a one-argument wrapper: the focus watch reports with a level, and a
+            # callback that could not take one killed this thread the first time a soft page made it speak
+            for fr in auto_shutter(s, preview=self.preview, on_status=self.emit, view=view,
                                    resolution=o.resolution, focus=o.focus, state=state, duration=o.duration,
                                    max_captures=o.max_pages, on_frame=None if self.preview else on_frame,
                                    commands=self.commands):
@@ -314,6 +316,10 @@ class ScanSession:
             self.emit("interrupted", "warn")
         except (CameraLost, RuntimeError) as e:
             self.error = str(e); self.emit(str(e), "error")
+        except Exception as e:      # a bug in the capture loop: the scan is over, and the operator must be told
+            self.error = f"scan stopped: {type(e).__name__}: {e}"
+            self.emit(self.error, "error")
+            log.exception("capture loop failed")
         finally:
             left = pending()
             if left:

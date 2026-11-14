@@ -136,7 +136,7 @@ def annotate(doc: str = typer.Option(..., help="document slug"),
                "the page; q to quit")
     seen: dict[str, int] = {}
     try:
-        for fr in auto_shutter(S, preview=preview, on_status=lambda m: emit(m, "info"),
+        for fr in auto_shutter(S, preview=preview, on_status=emit,      # takes (line, level): the focus watch sends one
                                duration=duration, max_captures=max_pages, require_new=False):
             page = pipeline.identify_page(S, st, fr.image, doc)
             if page is None:
