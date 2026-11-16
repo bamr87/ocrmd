@@ -33,7 +33,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 | [`docs/setup.md`](setup.md) | What a working install needs beyond `pip install`: macOS camera permission, Claude credentials and which models they reach, the local OCR engines, and where settings come from. |
 | [`docs/web-ui.md`](web-ui.md) | What each view of `ocrmd serve` shows and does — library, scan, documents, page, jobs and settings — and the rules it shares with the CLI. |
 | [`docs/adr/`](adr/README.md) | Every hard-to-reverse decision made for ocrmd, one record each, and the format a new record follows. |
-| [`docs/amendments/`](amendments/README.md) | The append-only log of changes to [the constitution](constitution.md). |
+| [`docs/amendments/`](amendments/README.md) | The append-only log of changes to [the constitution](constitution.md), one numbered record per amendment. |
 
 ### `examples/`
 
