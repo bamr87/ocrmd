@@ -1,6 +1,6 @@
 # ocrmd
 
-> Scan books and pages into cross-checked Markdown: local OCR diffed against a Claude vision read, with full-text search.
+> ocrmd's direction is to become the ultimate open home for all things document digitization: data, tools, resources and transparency, with cross-checked OCR, disagreement flags, a searchable inventory and a local-first path for everyone ([constitution](docs/constitution.md) §1).
 
 [![CI](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml/badge.svg)](https://github.com/bamr87/ocrmd/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/bamr87/ocrmd)](LICENSE)
 

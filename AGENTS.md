@@ -2,7 +2,7 @@
 
 # ocrmd
 
-> A webcam, image and PDF book scanner that reads every page twice — local OCR and a vision LLM — and diffs the readings into cross-checked Markdown with a searchable inventory.
+> ocrmd's direction is to become the ultimate open home for all things document digitization: data, tools, resources and transparency, with cross-checked OCR, disagreement flags, a searchable inventory and a local-first path for everyone ([constitution](docs/constitution.md) §1).
 
 ## What this repo is
 
