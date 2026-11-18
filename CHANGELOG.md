@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/bamr87/ocrmd/compare/v0.1.1...v0.2.0) (2026-11-18)
+
+
+### Added
+
+* **etl:** name what each figure shows, read twice and reconciled ([df273b6](https://github.com/bamr87/ocrmd/commit/df273b6db85ca6c2e1fc72181caab8b74f7d49fd))
+* **etl:** name what each figure shows, read twice and reconciled ([cb932c9](https://github.com/bamr87/ocrmd/commit/cb932c95c3fdaf18cc711c62f4eac532051bd37c))
+
+
+### Fixed
+
+* **deps:** keep typer below 0.29 until the reference generator is ported ([6ff5412](https://github.com/bamr87/ocrmd/commit/6ff5412ff7a250b76a8057399c51e1e42c84e7c5))
+* **scan:** keep the scan alive when the focus watch reports with a level ([c918cce](https://github.com/bamr87/ocrmd/commit/c918cce80e12692ec9a37f507977d7f55aebfd08))
+* **serve:** refuse a non-loopback --host unless --allow-remote is passed ([0aec735](https://github.com/bamr87/ocrmd/commit/0aec7355c8309a4af08ce7e19d7c811c8da1404c))
+* **serve:** refuse a non-loopback --host unless --allow-remote is passed ([c74944d](https://github.com/bamr87/ocrmd/commit/c74944dd3f2338c610817704ae5a0b42214b00bc))
+* **tools:** read option types from typer 0.29's type_descriptor ([2e54b19](https://github.com/bamr87/ocrmd/commit/2e54b1946da698070646d34990f0e8518e9b0997))
+* **tools:** read option types from typer 0.29's type_descriptor ([8c62950](https://github.com/bamr87/ocrmd/commit/8c62950b5bfce20344b8e5b6bfcf428b2c1730da))
+
 ## [0.1.1](https://github.com/bamr87/ocrmd/compare/v0.1.0...v0.1.1) (2026-10-31)
 
 
