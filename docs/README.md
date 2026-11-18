@@ -14,7 +14,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 
 | Document | What it covers |
 | --- | --- |
-| [`AGENTS.md`](../AGENTS.md) | A webcam, image and PDF book scanner that reads every page twice — local OCR and a vision LLM — and diffs the readings into cross-checked Markdown with a searchable inventory. |
+| [`AGENTS.md`](../AGENTS.md) | ocrmd's direction is to become the ultimate open home for all things document digitization: data, tools, resources and transparency, with cross-checked OCR, disagreement flags, a searchable inventory and a local-first path for everyone… |
 | [`CHANGELOG.md`](../CHANGELOG.md) | Release history: the notable changes in each version, newest first. |
 | [`PRD.md`](../PRD.md) | What ocrmd is for and whom it serves: the problem, users, goals and non-goals, current features, requirements, proposed success metrics and open questions. |
 
@@ -33,7 +33,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 | [`docs/setup.md`](setup.md) | What a working install needs beyond `pip install`: macOS camera permission, Claude credentials and which models they reach, the local OCR engines, and where settings come from. |
 | [`docs/web-ui.md`](web-ui.md) | What each view of `ocrmd serve` shows and does — library, scan, documents, page, jobs and settings — and the rules it shares with the CLI. |
 | [`docs/adr/`](adr/README.md) | Every hard-to-reverse decision made for ocrmd, one record each, and the format a new record follows. |
-| [`docs/amendments/`](amendments/README.md) | The append-only log of changes to [the constitution](constitution.md). |
+| [`docs/amendments/`](amendments/README.md) | The append-only log of changes to [the constitution](constitution.md), one numbered record per amendment. |
 
 ### `examples/`
 

@@ -6,11 +6,17 @@
 > Agents read this before [AGENTS.md](../AGENTS.md) conventions, the [PRD](../PRD.md), or the
 > [feature catalog](../features/features.yml). Ratified by merged PR; amended only per § 8.
 
-## 1. Mission
+## 1. Missions
 
-ocrmd turns physical books and loose pages into cross-checked Markdown, plain text and JSON from a webcam, a folder of photos or a PDF, and keeps an inventory of everything scanned. Every page is read twice (local OCR engines and a vision model, Claude by default) and the readings are diffed, flagging disagreements rather than silently picking one.
+ocrmd's direction is to become the ultimate open home for all things document digitization — data, tools, resources and transparency, gathered in one place that anyone can inspect and reuse.
 
-_Source: [PRD.md](../PRD.md)._
+1. **Provide data, tools, resources and transparency for all stakeholders, archivists, librarians, scholars and digitization practitioners, and the general public.** Anyone turning paper into text is a first-class audience. The aim is a shared, inspectable commons: the same readings, the same diffs, and the same inventory for everyone.
+2. **Turn physical books and loose pages into cross-checked Markdown, plain text and JSON, and flag disagreements rather than silently picking a winner.** Every page is read twice — local OCR engines and a vision model, Claude by default — from a webcam, a folder of photos or a PDF, so provenance stays visible on the page.
+3. **Keep a searchable inventory of everything scanned, work fully offline when the model pass is deferred, and send only page images off the machine, and only to the configured provider.** Accuracy, disagreement markers and local-first operation are the default path, not a later mode.
+
+These missions set the course; they do not claim the work is finished. They serve the PRD goals: accurate transcriptions with visible disagreement, a searchable inventory, an offline OCR-only path, and a tight rule for what may leave the machine.
+
+_Source: [PRD.md](../PRD.md) §1.1._
 
 ## 2. Invariants (non-negotiable)
 

@@ -8,6 +8,22 @@ Product requirements for [`bamr87/ocrmd`](https://github.com/bamr87/ocrmd), deri
 
 ocrmd turns physical books and loose pages into cross-checked Markdown, plain text and JSON from a webcam, a folder of photos or a PDF, and keeps an inventory of everything scanned. Every page is read twice (local OCR engines and a vision model, Claude by default) and the readings are diffed, flagging disagreements rather than silently picking one.
 
+## 1.1 Missions
+
+ocrmd's direction is to become the ultimate open home for all things document digitization — data, tools, resources and transparency, gathered in one place that anyone can inspect and reuse.
+
+1. **Provide data, tools, resources and transparency for all stakeholders, archivists, librarians, scholars and digitization practitioners, and the general public.** Anyone turning paper into text is a first-class audience. The aim is a shared, inspectable commons: the same readings, the same diffs, and the same inventory for everyone.
+2. **Turn physical books and loose pages into cross-checked Markdown, plain text and JSON, and flag disagreements rather than silently picking a winner.** Every page is read twice — local OCR engines and a vision model, Claude by default — from a webcam, a folder of photos or a PDF, so provenance stays visible on the page.
+3. **Keep a searchable inventory of everything scanned, work fully offline when the model pass is deferred, and send only page images off the machine, and only to the configured provider.** Accuracy, disagreement markers and local-first operation are the default path, not a later mode.
+
+These missions set the course; they do not claim the work is finished. They serve the PRD goals: accurate transcriptions with visible disagreement, a searchable inventory, an offline OCR-only path, and a tight rule for what may leave the machine.
+
+**Requirement**
+
+- MR1: Constitution §1 states one direction statement and exactly three numbered missions, and the README and AGENTS.md taglines match that direction and link to constitution §1.
+
+Feature [OCRMD-011](features/features.yml) traces to requirement MR1.
+
 ## 2. Target users
 
 - People digitizing books and documents (e.g. study material) on a Mac
@@ -50,9 +66,11 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 | [OCRMD-004](features/features.yml) | Corpus per document | shipped | [`ocrmd/store.py`](ocrmd/store.py) · [`README.md`](README.md) | FR1 |
 | [OCRMD-005](features/features.yml) | Exports: md, txt, json, jsonl | shipped | [`ocrmd/export`](ocrmd/export) · [`README.md`](README.md) | TBD |
 | [OCRMD-006](features/features.yml) | Structured-data ETL pipelines and destinations | shipped | [`ocrmd/etl.py`](ocrmd/etl.py) · [`README.md`](README.md) | TBD |
+| [OCRMD-007](features/features.yml) | Component identification in figures | partial | [`ocrmd/pipelines/components.yaml`](ocrmd/pipelines/components.yaml) · [`docs/corpus.md`](docs/corpus.md) | TBD |
 | [OCRMD-008](features/features.yml) | On-machine vision pass (local VLM cross-check) | planned | [`ocrmd/llm.py`](ocrmd/llm.py) · [`PRD.md`](PRD.md) | FR4 |
 | [OCRMD-009](features/features.yml) | Structure-aware digital-PDF path | planned | [`ocrmd/pdfsrc.py`](ocrmd/pdfsrc.py) · [`PRD.md`](PRD.md) | FR5 |
 | [OCRMD-010](features/features.yml) | Table-structure reconstruction for camera scans | planned | [`ocrmd/ocr.py`](ocrmd/ocr.py) · [`PRD.md`](PRD.md) | FR6 |
+| [OCRMD-011](features/features.yml) | Constitution missions | planned | [`docs/constitution.md`](docs/constitution.md) · [`PRD.md`](PRD.md) | MR1 |
 
 **Requirement → feature trace**
 
@@ -63,10 +81,11 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 | NFR1 | OCRMD-002 |
 | NFR3 | OCRMD-003 |
 | FR1 | OCRMD-004 |
-| TBD | OCRMD-005, OCRMD-006 |
+| TBD | OCRMD-005, OCRMD-006, OCRMD-007 |
 | FR4 | OCRMD-008 |
 | FR5 | OCRMD-009 |
 | FR6 | OCRMD-010 |
+| MR1 | OCRMD-011 |
 <!-- features:end -->
 
 ## 5. Requirements

@@ -71,10 +71,18 @@ features:
     surface: infra
     link: "ocrmd/etl.py"
     docs: "README.md"
-
-  # Planned — cycle 1 day 20 deep dive. OCRMD-007 is claimed by both open PR #22
-  # (figure components, partial) and PR #26 (constitution missions, planned).
-  # These ids start at 008 so either open PR can keep 007 after a rebase.
+  - id: OCRMD-007
+    title: "Component identification in figures"
+    description: "The bundled `components` extraction pipeline names the parts, fasteners, tools and cables each figure shows; every figure is read twice and the readings are diffed (`crosscheck`), keeping every item and both sides of a disagreement. Not yet run against a live model."
+    implemented: true
+    status: partial
+    prd: [TBD]
+    surface: cli
+    link: "ocrmd/pipelines/components.yaml"
+    docs: "docs/corpus.md"
+  # Planned — cycle 1 day 20 deep dive. OCRMD-007 is figure components (partial) and
+  # OCRMD-011 is the constitution missions (amendment 0002); these ids start at
+  # 008 so neither open PR had to renumber the other.
   - id: OCRMD-008
     title: "On-machine vision pass (local VLM cross-check)"
     description: "Optional local vision-language model as the second reading so page images need not leave the machine; default remains Claude, and the reconcile/diff contract is unchanged"
@@ -101,4 +109,12 @@ features:
     prd: [FR6]
     surface: infra
     link: "ocrmd/ocr.py"
+  - id: OCRMD-011
+    title: "Constitution missions"
+    description: "One direction statement and exactly three numbered missions in constitution §1, with matching README and AGENTS.md taglines linked to that section."
+    implemented: true
+    status: planned
+    prd: [MR1]
+    surface: docs
+    link: "docs/constitution.md"
     docs: "PRD.md"
