@@ -201,3 +201,35 @@ def test_library_search_export_and_sinks_from_the_command_line(cli_root, monkeyp
     cli_root.sinks = [SinkConfig(name="study", url="http://localhost:1/intake")]
     r = runner.invoke(cli.app, ["send", "--doc", "austen", "--page", "2", "--to", "study", "-o", "hint=question 3", "--dry-run"])
     assert r.exit_code == 0 and "would send" in r.output and '"hint": "question 3"' in r.output and "Bennet" in r.output, r.output
+
+
+@pytest.fixture
+def served(monkeypatch, cli_root):
+    """Stand-in for uvicorn so `serve` never binds a port; records the host it would have bound."""
+    import uvicorn
+    from ocrmd.web import app as webapp
+    calls: list[str] = []
+    monkeypatch.setattr(uvicorn, "run", lambda application, host, port, **kw: calls.append(host))
+    monkeypatch.setattr(webapp, "create_app", lambda settings: object())
+    return calls
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20", "::", "myhost.local"])
+def test_serve_refuses_a_non_loopback_host_without_allow_remote(served, host):
+    r = runner.invoke(cli.app, ["serve", "--host", host, "--no-open"])
+    assert r.exit_code == 2
+    assert "--allow-remote" in r.output and "no authentication" in r.output
+    assert served == []
+
+
+def test_serve_binds_a_non_loopback_host_only_with_allow_remote(served):
+    r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allow-remote", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert "warning" in r.output and served == ["0.0.0.0"]
+
+
+@pytest.mark.parametrize("host", [None, "127.0.0.1", "localhost", "::1", "127.0.0.2"])
+def test_serve_loopback_hosts_are_unchanged(served, host):
+    r = runner.invoke(cli.app, ["serve", "--no-open"] + (["--host", host] if host else []))
+    assert r.exit_code == 0, r.output
+    assert served == [host or "127.0.0.1"]

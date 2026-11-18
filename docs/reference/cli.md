@@ -384,6 +384,7 @@ ocrmd serve [OPTIONS]
 | `--host` | text | `127.0.0.1` | bind address; keep it local, there is no authentication |
 | `--port` | integer | `8765` | — |
 | `--open` / `--no-open` | switch | `--open` | open the UI in a browser |
+| `--allow-remote` | flag | off | allow a non-loopback --host; the UI has no authentication, so anyone who can reach the port can read your scans |
 
 ## `ocr-bench`
 
