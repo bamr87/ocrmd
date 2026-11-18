@@ -30,7 +30,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'   # add ,pdf
 python3 tools/docs_index.py --write                               # regenerate the docs/README.md index after adding or renaming a doc
 ```
 
-The driver uses a throwaway `OCRMD_ROOT` ([run-ocrmd skill](.claude/skills/run-ocrmd/SKILL.md)). [CI](.github/workflows/ci.yml) runs `ruff` on Linux for pull requests and the full suite on **macos-latest** for `main` pushes and manual runs (Apple Vision and AVFoundation are macOS-only). `.vscode/` debug configs run `ocrmd.cli` in-process, so breakpoints work anywhere, including under uvicorn. Every command and option: [docs/reference/cli.md](docs/reference/cli.md).
+The driver uses a throwaway `OCRMD_ROOT` ([run-ocrmd skill](.claude/skills/run-ocrmd/SKILL.md)). [CI](.github/workflows/ci.yml) runs `ruff` and `pytest` on Linux (RapidOCR) for pull requests and the full suite on **macos-latest** for `main` pushes and manual runs (Apple Vision and AVFoundation are macOS-only; tests that assert Vision's reading are marked `needs_vision` and skip on Linux). `.vscode/` debug configs run `ocrmd.cli` in-process, so breakpoints work anywhere, including under uvicorn. Every command and option: [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Layout
 
