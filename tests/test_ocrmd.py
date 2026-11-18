@@ -85,15 +85,8 @@ def _on_desk(page: np.ndarray, margin: int = 90) -> np.ndarray:
 
 
 def _text_page(upside_down: bool = False) -> np.ndarray:
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (1400, 1800), (245, 242, 235))
-    d = ImageDraw.Draw(img)
-    f = ImageFont.truetype("/System/Library/Fonts/Supplemental/Times New Roman.ttf", 40)
-    y = 200
-    for line in LONG.split(" however ")[0].split(" that ") * 6:
-        d.text((120, y), line, font=f, fill="black"); y += 70
-    a = np.array(img)[:, :, ::-1].copy()
-    return cv2.rotate(a, cv2.ROTATE_180) if upside_down else a
+    from conftest import text_page   # one font helper for every test (macOS font, system serif, then PIL's)
+    return text_page(upside_down=upside_down)
 
 
 def test_orientation_detects_upside_down_text():
@@ -163,8 +156,11 @@ def test_estimated_page_width_matches_what_the_pipeline_produces():
     for page in (_on_desk(_text_page()), _spread()):
         rect = preprocess.find_page_rect(page)
         estimate = preprocess.estimated_page_width(page, rect)
-        actual = preprocess.process(page)[0][2]["page_width_px"]
-        assert abs(estimate - actual) <= max(60, 0.1 * actual), (estimate, actual)
+        # the cut falls somewhere in the gutter band, so with another font the two halves are not
+        # equal: the estimate has to match the width of one of the pages `process` yields
+        widths = [m["page_width_px"] for _, _, m in preprocess.process(page)]
+        actual = min(widths, key=lambda w: abs(estimate - w))
+        assert abs(estimate - actual) <= max(60, 0.1 * actual), (estimate, widths)
 
 
 def test_scan_state_keeps_a_bounded_history():

@@ -16,14 +16,37 @@ LONG = ("it is a truth universally acknowledged that a single man in possession 
         "must be in want of a wife however little known the feelings or views of such a man may be")
 
 
+_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",                     # macOS
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",           # Debian/Ubuntu (fonts-liberation)
+    "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf",                    # Fedora
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",                           # Debian/Ubuntu (fonts-dejavu-core)
+    "/usr/share/fonts/dejavu/DejaVuSerif.ttf",                                    # Fedora
+    "C:/Windows/Fonts/times.ttf",                                                 # Windows
+)
+
+
+def text_font(size: int = 40):
+    """A font for drawing synthetic pages on any OS: Times New Roman on macOS, a system serif elsewhere,
+    and PIL's built-in font (scalable on Pillow >= 10.1) when no system font is installed. Tests draw
+    with this rather than a hard-coded path, so a missing font never raises `OSError` on Linux."""
+    from PIL import ImageFont
+    for path in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:  # Pillow < 10.1: only the tiny bitmap font exists
+        return ImageFont.load_default()
+
+
 def text_page(lines: list[str] | None = None, size=(1400, 1800), upside_down: bool = False) -> np.ndarray:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     img = Image.new("RGB", size, (245, 242, 235))
     d = ImageDraw.Draw(img)
-    try:
-        f = ImageFont.truetype("/System/Library/Fonts/Supplemental/Times New Roman.ttf", 40)
-    except OSError:  # non-mac CI: PIL's bitmap font is enough for geometry tests
-        f = ImageFont.load_default()
+    f = text_font(40)
     y = 200
     for line in (lines or LONG.split(" however ")[0].split(" that ") * 6):
         d.text((120, y), line, font=f, fill="black"); y += 70
