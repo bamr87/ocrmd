@@ -7,10 +7,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import FakeProvider, on_desk, text_page
+from conftest import FakeProvider, needs_vision, on_desk, text_page
 from ocrmd import llm as llm_mod, pipeline, render, review
 from ocrmd.llm import LLMPageError, LLMUnavailable
-from ocrmd.ocr import OcrResult, available_engine
+from ocrmd.ocr import OcrResult, available_engine, available_engines
 
 needs_ocr = pytest.mark.skipif(available_engine() is None, reason="no local OCR engine")
 
@@ -39,6 +39,18 @@ def test_ocr_only_page_then_llm_upgrade_keeps_ocr_cached(root, store):
     assert fm2["llm"]["prompt"] == root.prompt_version and store.page(pid)["page_label"] == "12"
     hint = prov.calls[0][1]
     assert hint is not None and hint.part is None
+
+
+@pytest.mark.skipif("rapidocr" not in available_engines(), reason="rapidocr not installed")
+def test_a_page_is_ingested_and_read_with_rapidocr_alone(root, store):
+    """The Linux/Windows path: RapidOCR is the only engine, with no Apple Vision to lean on. It must take a
+    frame to a page file whose body carries what the engine read (runs on Linux CI as it does on a Mac)."""
+    root.ocr_engines = ["rapidocr"]
+    pid = _ingest(root, store)
+    r = pipeline.run_page(root, store, store.page(pid), None, "book")
+    fm, body = render.read_page(r.path)
+    assert r.status == "unverified" and "possession" in body
+    assert pipeline.run_ocr(root, store, store.page(pid)).engine.startswith("rapidocr@")
 
 
 @needs_ocr
@@ -312,6 +324,7 @@ def test_a_bracketed_capture_carries_its_variants_through_every_stage(root, stor
     assert len(res.words) >= sum(len(b.text.split()) for b in res.blocks if not b.focus)
 
 
+@needs_vision
 @needs_ocr
 def test_a_bracket_recovers_text_the_capture_could_not_read(root, store):
     """The point of the feature, end to end: a page whose top half is out of focus, bracketed with an
@@ -479,6 +492,7 @@ def test_admission_is_off_unless_asked_for(root, store):
     assert len(got.pages) == 1 and not got.rejected
 
 
+@needs_vision
 @needs_ocr
 def test_half_a_spread_can_be_kept_when_the_other_half_is_not(root, store):
     """Refusing the whole frame because one page of a spread is unreadable would lose a good page."""
@@ -550,6 +564,7 @@ def test_the_layout_stage_reruns_when_its_version_moves_and_keeps_a_humans_boxes
     assert fm["references"]["figures"][0]["caption"] == "my caption"
 
 
+@needs_vision
 @needs_ocr
 def test_open_flags_are_located_on_the_page(root, store):
     pid = _ingest(root, store, lines=["the quick brown fox jumps over the lazy dog"] * 6 + ["invoice total 44.60 paid"])

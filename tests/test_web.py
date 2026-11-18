@@ -6,7 +6,7 @@ import cv2
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import FakeProvider, on_desk, text_page
+from conftest import FakeProvider, needs_vision, on_desk, text_page
 from ocrmd import pipeline, render
 from ocrmd.ocr import available_engine
 from ocrmd.web.app import create_app
@@ -54,6 +54,7 @@ def test_the_flat_view_is_served_and_rendered_on_demand(client, root, store):
     assert pl.flat_path(root, pid).exists()
 
 
+@needs_vision
 @needs_ocr
 def test_a_selected_region_is_read_and_handed_back_with_its_crop(client, root, store):
     _seed(root, store)
@@ -111,6 +112,7 @@ def test_index_and_system_endpoints(client):
     assert client.get("/api/documents/../etc").status_code in (400, 404)
 
 
+@needs_vision
 @needs_ocr
 def test_document_page_flags_and_review_flow(client, root, store):
     pid, r = _seed(root, store)
@@ -241,6 +243,7 @@ def test_delete_pages_and_document(client, root, store, monkeypatch):
 
 
 # --- the page model ---------------------------------------------------------------------------------
+@needs_vision
 @needs_ocr
 def test_the_page_model_is_served_drawn_and_editable(client, root, store):
     pid, _ = _seed(root, store)

@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from conftest import needs_vision                                    # noqa: E402
 from ocrmd import llm, preprocess                                    # noqa: E402
 from ocrmd.camview import CameraView, handle_key, load_view, save_view  # noqa: E402
 from ocrmd.hud import ScanState, draw as draw_hud                     # noqa: E402
@@ -89,6 +90,7 @@ def _text_page(upside_down: bool = False) -> np.ndarray:
     return text_page(upside_down=upside_down)
 
 
+@needs_vision
 def test_orientation_detects_upside_down_text():
     for upside_down, expected in ((False, 0), (True, 180)):
         parts = preprocess.process(_on_desk(_text_page(upside_down)))

@@ -9,8 +9,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ocrmd.config import load_settings          # noqa: E402
+from ocrmd.ocr import available_engines          # noqa: E402
 from ocrmd.llm import LLMResult, PageContext, Transcription  # noqa: E402
 from ocrmd.store import Store                  # noqa: E402
+
+HAS_VISION = "apple_vision" in available_engines()
+# Apple Vision is macOS-only. RapidOCR (the Linux/Windows engine) is a supported way to ingest and read
+# pages, but these tests assert what Vision reads off synthetic pages: RapidOCR reads the same pages
+# differently (an empty enlarged region, another orientation, no disagreement to flag), which says
+# nothing about the pipeline. Marked, with a reason, rather than left to fail off macOS.
+needs_vision = pytest.mark.skipif(not HAS_VISION, reason="asserts Apple Vision's reading of a synthetic page; "
+                                  "RapidOCR (the Linux engine) reads it differently")
 
 LONG = ("it is a truth universally acknowledged that a single man in possession of a good fortune "
         "must be in want of a wife however little known the feelings or views of such a man may be")
