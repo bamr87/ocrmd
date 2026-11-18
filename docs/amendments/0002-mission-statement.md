@@ -5,9 +5,9 @@
 - **Date:** 2026-11-16
 - **Proposed by:** Grok Bot (agent), at the maintainer's request
 - **Ratified by:**
-- **Affects:** constitution §1; PRD §1.1; feature OCRMD-007
+- **Affects:** constitution §1; PRD §1.1; feature OCRMD-011
 - **Supersedes:** none
-- **Related:** [PRD.md](../../PRD.md) §1.1; feature OCRMD-007
+- **Related:** [PRD.md](../../PRD.md) §1.1; feature OCRMD-011
 
 ## Context
 
@@ -30,4 +30,4 @@ _Source: [PRD.md](../PRD.md) §1.1._
 
 ## Consequences
 
-Agents and reviewers judge fit against these three missions before inventing scope, treating them as the direction of the repo rather than a description of what already ships. The same text is added as PRD §1.1 so the constitution's `_Source:` line stays accurate. The original PRD purpose / overview paragraph is left in place. This PR also aligns the README and AGENTS.md taglines with the missions and links them to constitution §1, and adds feature OCRMD-007 to the feature catalog, traced to requirement MR1. Merging this PR ratifies amendment 0002. Until then the record stays `Status: proposed`.
+Agents and reviewers judge fit against these three missions before inventing scope, treating them as the direction of the repo rather than a description of what already ships. The same text is added as PRD §1.1 so the constitution's `_Source:` line stays accurate. The original PRD purpose / overview paragraph is left in place. This PR also aligns the README and AGENTS.md taglines with the missions and links them to constitution §1, and adds feature OCRMD-011 to the feature catalog, traced to requirement MR1. Merging this PR ratifies amendment 0002. Until then the record stays `Status: proposed`.

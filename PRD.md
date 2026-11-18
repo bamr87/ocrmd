@@ -22,7 +22,7 @@ These missions set the course; they do not claim the work is finished. They serv
 
 - MR1: Constitution §1 states one direction statement and exactly three numbered missions, and the README and AGENTS.md taglines match that direction and link to constitution §1.
 
-Feature [OCRMD-007](features/features.yml) traces to requirement MR1.
+Feature [OCRMD-011](features/features.yml) traces to requirement MR1.
 
 ## 2. Target users
 
@@ -66,15 +66,16 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 | [OCRMD-004](features/features.yml) | Corpus per document | shipped | [`ocrmd/store.py`](ocrmd/store.py) · [`README.md`](README.md) | FR1 |
 | [OCRMD-005](features/features.yml) | Exports: md, txt, json, jsonl | shipped | [`ocrmd/export`](ocrmd/export) · [`README.md`](README.md) | TBD |
 | [OCRMD-006](features/features.yml) | Structured-data ETL pipelines and destinations | shipped | [`ocrmd/etl.py`](ocrmd/etl.py) · [`README.md`](README.md) | TBD |
-| [OCRMD-007](features/features.yml) | Constitution missions | planned | [`docs/constitution.md`](docs/constitution.md) · [`PRD.md`](PRD.md) | MR1 |
+| [OCRMD-007](features/features.yml) | Component identification in figures | partial | [`ocrmd/pipelines/components.yaml`](ocrmd/pipelines/components.yaml) · [`docs/corpus.md`](docs/corpus.md) | TBD |
+| [OCRMD-011](features/features.yml) | Constitution missions | planned | [`docs/constitution.md`](docs/constitution.md) · [`PRD.md`](PRD.md) | MR1 |
 
 **Requirement → feature trace**
 
 | Requirement | Features |
 | --- | --- |
-| TBD | OCRMD-001, OCRMD-002, OCRMD-003, OCRMD-005, OCRMD-006 |
+| TBD | OCRMD-001, OCRMD-002, OCRMD-003, OCRMD-005, OCRMD-006, OCRMD-007 |
 | FR1 | OCRMD-004 |
-| MR1 | OCRMD-007 |
+| MR1 | OCRMD-011 |
 <!-- features:end -->
 
 ## 5. Requirements
