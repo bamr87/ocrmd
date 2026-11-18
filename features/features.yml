@@ -22,7 +22,7 @@ features:
     description: "CLI: scan, ingest (incl. `--watch`), verify (incl. Batches API), review, status, reprocess, delete, build, read, library, search, export, send, etl, ocr-bench, doctor"
     implemented: true
     status: shipped
-    prd: [TBD]
+    prd: [FR2, FR3]
     surface: cli
     link: "ocrmd/cli.py"
     docs: "README.md"
@@ -31,7 +31,7 @@ features:
     description: "Local OCR: Apple Vision + RapidOCR voting (Tesseract fallback)"
     implemented: true
     status: shipped
-    prd: [TBD]
+    prd: [NFR1]
     surface: ui
     link: "ocrmd/ocr.py"
     docs: "README.md"
@@ -40,13 +40,13 @@ features:
     description: "Vision-model providers: Anthropic (default) and xAI"
     implemented: true
     status: shipped
-    prd: [TBD]
+    prd: [NFR3]
     surface: infra
     link: "ocrmd/llm.py"
     docs: "README.md"
   - id: OCRMD-004
     title: "Corpus per document"
-    description: "Corpus per document (`documents/<slug>/pages/NNNN.md`) with rich front matter"
+    description: "Corpus per document (`documents/{slug}/pages/NNNN.md`) with rich front matter"
     implemented: true
     status: shipped
     prd: [FR1]
@@ -71,3 +71,34 @@ features:
     surface: infra
     link: "ocrmd/etl.py"
     docs: "README.md"
+
+  # Planned — cycle 1 day 20 deep dive. OCRMD-007 is claimed by both open PR #22
+  # (figure components, partial) and PR #26 (constitution missions, planned).
+  # These ids start at 008 so either open PR can keep 007 after a rebase.
+  - id: OCRMD-008
+    title: "On-machine vision pass (local VLM cross-check)"
+    description: "Optional local vision-language model as the second reading so page images need not leave the machine; default remains Claude, and the reconcile/diff contract is unchanged"
+    implemented: false
+    status: planned
+    prd: [FR4]
+    surface: infra
+    link: "ocrmd/llm.py"
+    docs: "PRD.md"
+  - id: OCRMD-009
+    title: "Structure-aware digital-PDF path"
+    description: "Optional Docling (or Marker) layout, table and reading-order pass on born-digital PDFs, reconciled with the existing pdf_text layer, engine vote and Claude cross-check"
+    implemented: false
+    status: planned
+    prd: [FR5]
+    surface: infra
+    link: "ocrmd/pdfsrc.py"
+    docs: "PRD.md"
+  - id: OCRMD-010
+    title: "Table-structure reconstruction for camera scans"
+    description: "Dedicated table-structure model (TableFormer-style / Docling tables) so local OCR does not flatten ruled tables before the LLM pass and reconcile"
+    implemented: false
+    status: planned
+    prd: [FR6]
+    surface: infra
+    link: "ocrmd/ocr.py"
+    docs: "PRD.md"
