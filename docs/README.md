@@ -16,6 +16,7 @@ New to ocrmd? Read [setup](setup.md), then [scanning](scanning.md) or point `ocr
 | --- | --- |
 | [`AGENTS.md`](../AGENTS.md) | ocrmd's direction is to become the ultimate open home for all things document digitization: data, tools, resources and transparency, with cross-checked OCR, disagreement flags, a searchable inventory and a local-first path for everyone… |
 | [`CHANGELOG.md`](../CHANGELOG.md) | Release history: the notable changes in each version, newest first. |
+| [`SECURITY.md`](../SECURITY.md) | Supported versions and how to report a vulnerability privately. |
 | [`PRD.md`](../PRD.md) | What ocrmd is for and whom it serves: the problem, users, goals and non-goals, current features, requirements, proposed success metrics and open questions. |
 
 ### `docs/`
