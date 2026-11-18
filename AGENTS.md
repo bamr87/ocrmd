@@ -101,7 +101,7 @@ Each was measured; the long form is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Settings and credentials
 
 - Precedence: defaults → `~/.config/ocrmd/config.toml` → `<root>/ocrmd.toml` → `OCRMD_<FIELD>` env → CLI flags. Every `Settings` field is an `OCRMD_*` variable; invalid values fail fast naming the key ([generated list](docs/reference/settings.md), [commented example](ocrmd.example.toml)). `OCRMD_ROOT` moves all data; by default `raw/`, `processed/`, `ocr/`, `llm/`, `documents/` and `ocrmd.db` sit beside the code, all gitignored.
-- Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`; first found wins, never overriding the environment); `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN`. **A subscription OAuth token only serves `claude-haiku-5-5`** (other models return a bare 429), so set `OCRMD_MODEL=claude-haiku-5-5` with it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`.
+- Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`; first found wins, never overriding the environment), templated by [.env.example](.env.example), every line commented out; `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN`. **A subscription OAuth token only serves `claude-haiku-5-5`** (other models return a bare 429), so set `OCRMD_MODEL=claude-haiku-5-5` with it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`.
 
 ## Fleet context
 
