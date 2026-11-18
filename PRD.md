@@ -60,21 +60,31 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 
 | ID | Feature | Status | Where | Requirements |
 | --- | --- | --- | --- | --- |
-| [OCRMD-001](features/features.yml) | CLI: scan, ingest | shipped | [`ocrmd/cli.py`](ocrmd/cli.py) · [`README.md`](README.md) | TBD |
-| [OCRMD-002](features/features.yml) | Local OCR: Apple Vision + RapidOCR voting (Tesseract… | shipped | [`ocrmd/ocr.py`](ocrmd/ocr.py) · [`README.md`](README.md) | TBD |
-| [OCRMD-003](features/features.yml) | Vision-model providers: Anthropic (default) and xAI | shipped | [`ocrmd/llm.py`](ocrmd/llm.py) · [`README.md`](README.md) | TBD |
+| [OCRMD-001](features/features.yml) | CLI: scan, ingest | shipped | [`ocrmd/cli.py`](ocrmd/cli.py) · [`README.md`](README.md) | FR2, FR3 |
+| [OCRMD-002](features/features.yml) | Local OCR: Apple Vision + RapidOCR voting (Tesseract… | shipped | [`ocrmd/ocr.py`](ocrmd/ocr.py) · [`README.md`](README.md) | NFR1 |
+| [OCRMD-003](features/features.yml) | Vision-model providers: Anthropic (default) and xAI | shipped | [`ocrmd/llm.py`](ocrmd/llm.py) · [`README.md`](README.md) | NFR3 |
 | [OCRMD-004](features/features.yml) | Corpus per document | shipped | [`ocrmd/store.py`](ocrmd/store.py) · [`README.md`](README.md) | FR1 |
 | [OCRMD-005](features/features.yml) | Exports: md, txt, json, jsonl | shipped | [`ocrmd/export`](ocrmd/export) · [`README.md`](README.md) | TBD |
 | [OCRMD-006](features/features.yml) | Structured-data ETL pipelines and destinations | shipped | [`ocrmd/etl.py`](ocrmd/etl.py) · [`README.md`](README.md) | TBD |
 | [OCRMD-007](features/features.yml) | Component identification in figures | partial | [`ocrmd/pipelines/components.yaml`](ocrmd/pipelines/components.yaml) · [`docs/corpus.md`](docs/corpus.md) | TBD |
+| [OCRMD-008](features/features.yml) | On-machine vision pass (local VLM cross-check) | planned | [`ocrmd/llm.py`](ocrmd/llm.py) · [`PRD.md`](PRD.md) | FR4 |
+| [OCRMD-009](features/features.yml) | Structure-aware digital-PDF path | planned | [`ocrmd/pdfsrc.py`](ocrmd/pdfsrc.py) · [`PRD.md`](PRD.md) | FR5 |
+| [OCRMD-010](features/features.yml) | Table-structure reconstruction for camera scans | planned | [`ocrmd/ocr.py`](ocrmd/ocr.py) · [`PRD.md`](PRD.md) | FR6 |
 | [OCRMD-011](features/features.yml) | Constitution missions | planned | [`docs/constitution.md`](docs/constitution.md) · [`PRD.md`](PRD.md) | MR1 |
 
 **Requirement → feature trace**
 
 | Requirement | Features |
 | --- | --- |
-| TBD | OCRMD-001, OCRMD-002, OCRMD-003, OCRMD-005, OCRMD-006, OCRMD-007 |
+| FR2 | OCRMD-001 |
+| FR3 | OCRMD-001 |
+| NFR1 | OCRMD-002 |
+| NFR3 | OCRMD-003 |
 | FR1 | OCRMD-004 |
+| TBD | OCRMD-005, OCRMD-006, OCRMD-007 |
+| FR4 | OCRMD-008 |
+| FR5 | OCRMD-009 |
+| FR6 | OCRMD-010 |
 | MR1 | OCRMD-011 |
 <!-- features:end -->
 
@@ -92,6 +102,12 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 - NFR2: Test suite (~306 checks)
 - NFR3: Cost awareness: `doctor --costs`, batch mode at reduced price
 
+**Functional (planned — cycle 1 day 20 deep dive)**
+
+- FR4: An optional on-machine vision-language model can be the second reading, so page images need not leave the machine; the default remains Claude, and disagreements stay visible in the Markdown (OCRMD-008)
+- FR5: Born-digital PDFs can take a structure-aware path (layout, tables, reading order via Docling or Marker) that is still reconciled against the PDF text layer, the local engines and the vision pass (OCRMD-009)
+- FR6: Ruled tables on camera scans are reconstructed as tables, not flattened prose, before reconcile (OCRMD-010)
+
 ## 6. Success metrics (proposed — not defined in sources)
 
 - OCR vs LLM disagreement rate per page
@@ -103,6 +119,8 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 
 - Supported non-macOS camera capture: TBD
 - xAI provider not exercised live (per README)
+- Nougat was considered as a math/LaTeX specialist and is not proposed: it is narrow (arXiv-style English papers), slower, and appears unmaintained relative to Docling / olmOCR-class local VLMs
+- Open PRs #22 and #26 both add a feature id OCRMD-007 (figure components vs constitution missions). This PR starts new ids at OCRMD-008 so either can keep 007. Rebase if those PRs land first and take 008+
 
 ## 8. Links
 
