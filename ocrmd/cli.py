@@ -865,12 +865,36 @@ def build(doc: str | None = None):
         typer.echo(_build(st, slug))
 
 
+def _is_loopback(host: str) -> bool:
+    """True for `localhost` and any loopback address (127.0.0.0/8, ::1, ::ffff:127.x). A name is not resolved:
+    anything that is not provably loopback counts as remote, so a typo errs toward refusing."""
+    import ipaddress
+    h = host.strip().strip("[]").lower()
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return ip.is_loopback or bool(getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_loopback)
+
+
 @app.command()
 def serve(host: str = typer.Option("127.0.0.1", help="bind address; keep it local, there is no authentication"),
           port: int = typer.Option(8765),
-          open_browser: bool = typer.Option(True, "--open/--no-open", help="open the UI in a browser")):
+          open_browser: bool = typer.Option(True, "--open/--no-open", help="open the UI in a browser"),
+          allow_remote: bool = typer.Option(False, "--allow-remote",
+                                            help="allow a non-loopback --host; the UI has no authentication, so anyone who can reach the port can read your scans")):
     """Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765."""
     import threading, webbrowser
+    if not _is_loopback(host):
+        if not allow_remote:
+            typer.echo(f"refusing to bind {host}: the web UI has no authentication, so anyone who can reach "
+                       f"{host}:{port} could read your scanned pages and text. Pass --allow-remote to bind it "
+                       "anyway (trusted network only), or use the default 127.0.0.1.", err=True)
+            raise typer.Exit(2)
+        typer.echo(f"warning: binding {host} with no authentication; the UI is open to everyone who can reach "
+                   f"{host}:{port}", err=True)
     import uvicorn
     from .web.app import create_app
     application = create_app(S)
