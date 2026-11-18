@@ -4,8 +4,9 @@ name: ci
 # duplicate pair cost ~60 billable minutes for no extra signal.
 #
 # macOS runs only on pushes to main and manual runs (bamr87/bamr87#268: private-repo Actions
-# spend is held at $0 on purpose). PRs get a cheap Linux lint job. To run the macOS suite on a
-# branch before merging:
+# spend is held at $0 on purpose). PRs get a cheap Linux lint job and a Linux pytest job (RapidOCR
+# is the engine there; tests that assert Apple Vision's reading are skipped with a reason, see
+# `needs_vision` in tests/conftest.py). To run the macOS suite on a branch before merging:
 #   gh workflow run ci.yml -R bamr87/ocrmd --ref <branch>
 on:
   push:
@@ -28,6 +29,22 @@ jobs:
         with: { python-version: "3.12" }
       - run: python -m pip install ruff
       - run: ruff check ocrmd tests
+
+  test-linux:
+    # Pull requests only: the macOS suite below runs on main, so without this a failure that ruff
+    # cannot see (a generated reference gone stale, a dependency release) is first found after merge.
+    # Linux bills at 1x and needs no Apple Vision: RapidOCR is the engine, the same as the documented
+    # Linux install. Fonts are installed explicitly because synthetic pages are drawn with a system serif.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-liberation fonts-dejavu-core libgl1
+      - run: python -m pip install -e '.[dev,rapidocr]'
+      - run: pytest -q
 
   test:
     # Apple Vision (pyobjc) and AVFoundation are macOS-only; the pipeline tests need a local OCR engine.
