@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import pytest
 
-from conftest import on_desk, text_page
+from conftest import needs_vision, on_desk, text_page
 from ocrmd import pipeline, preprocess
 from ocrmd.ocr import available_engine
 
@@ -150,6 +150,7 @@ def test_the_model_sees_the_same_crop_and_the_ocr_draft(root, store):
     assert prov.crops[0].shape[1] / max(1, out.size[0]) == pytest.approx(out.scale, abs=0.5)
 
 
+@needs_vision
 @needs_ocr
 def test_a_provider_that_cannot_read_regions_is_simply_not_asked(root, store):
     class Old:                                             # e.g. an older provider, or xAI
