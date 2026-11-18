@@ -8,7 +8,7 @@ The install commands are in the README's [Quick start](../README.md#quick-start)
 
 **Camera permission:** macOS must authorize the app that runs `ocrmd` (Terminal, iTerm, VS Code…): System Settings → Privacy & Security → Camera. `ocrmd doctor` tells you if it's denied.
 
-**Claude credentials** (put them in `.env` next to the project, or `~/.config/ocrmd/.env`):
+**Claude credentials** (put them in `.env` next to the project, or `~/.config/ocrmd/.env`; [`.env.example`](../.env.example) is the template, so start with `cp .env.example .env`):
 
 | Variable | Notes |
 |---|---|

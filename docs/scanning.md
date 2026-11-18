@@ -133,6 +133,28 @@ book
 
 **This is not a substitute for framing.** On that same store, admission removes the captures that were never going to be pages, but the share of illegible pages among the ones still made only falls from 73 % to 69 % — the rest fail on resolution, focus and angle, which is what the px/page readout and the framing advice are for. Fix the rig first; the shutter can only refuse what it can detect.
 
+## Illustrated pages: manuals, diagrams, assembly steps
+
+Everything above was measured on pages of text, and a page that is mostly drawings breaks three of its assumptions at once. Measured on the first capture of an illustrated assembly manual (a two-page spread, a heading and six step diagrams, 787 px across the spread):
+
+| | defaults | with the settings below |
+|---|---|---|
+| admitted as a page | no — "only 5 word(s) legible (needs 60)" | yes |
+| orientation | sideways (270): the cascade votes with text, and there were five words | upright |
+| figure regions found | 0 — the heading, read sideways as two tall boxes, masked the rows the diagrams sit in | 5: four of the six diagrams, plus one that is the small print nobody could read |
+
+Set these in `<root>/ocrmd.toml` for a root that holds such a document:
+
+```toml
+admit_captures = false            # a diagram page is not an unreadable page
+orientation_probe = true          # ask OCR at all four rotations; the cascade needs text to vote with
+ocr_engines = ["apple_vision"]    # the probe crashes inside RapidOCR's ONNX detector on the machine it was measured on
+```
+
+**Then get closer than you would for text.** The 900 px/page readout is the floor for *body text*; a diagram is a fraction of a page, and in that capture each one was about 110 px wide — the two fainter ones were not found at all, and nothing can name the parts in a drawing that size. Frame one page, or one step, so the drawing itself has several hundred pixels across it.
+
+What is in the figures is not part of the transcription: the page body carries the printed text and a `![figure](../figures/…)` reference where each figure sits, and [`ocrmd etl -p components`](corpus.md#what-the-figures-show-components) names what each one shows.
+
 ## Tuning the auto-shutter
 
 `ocrmd.toml` (each key's default and note: [settings reference](reference/settings.md)): `motion_threshold`, `stable_frames`, `settle_frames`, `geometry_frames`, `geometry_tolerance`, `novelty_threshold`, `blur_threshold`, `occlusion_cover`, `occlusion_rebaseline`, `focus_bracket*`, `admit_*`. The preview window shows the live gate state and numbers, and every capture's sharpness/occlusion/px-per-page goes to `ocrmd.log`.

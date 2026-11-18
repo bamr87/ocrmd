@@ -50,12 +50,13 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 | [OCRMD-004](features/features.yml) | Corpus per document | shipped | [`ocrmd/store.py`](ocrmd/store.py) · [`README.md`](README.md) | FR1 |
 | [OCRMD-005](features/features.yml) | Exports: md, txt, json, jsonl | shipped | [`ocrmd/export`](ocrmd/export) · [`README.md`](README.md) | TBD |
 | [OCRMD-006](features/features.yml) | Structured-data ETL pipelines and destinations | shipped | [`ocrmd/etl.py`](ocrmd/etl.py) · [`README.md`](README.md) | TBD |
+| [OCRMD-007](features/features.yml) | Component identification in figures | partial | [`ocrmd/pipelines/components.yaml`](ocrmd/pipelines/components.yaml) · [`docs/corpus.md`](docs/corpus.md) | TBD |
 
 **Requirement → feature trace**
 
 | Requirement | Features |
 | --- | --- |
-| TBD | OCRMD-001, OCRMD-002, OCRMD-003, OCRMD-005, OCRMD-006 |
+| TBD | OCRMD-001, OCRMD-002, OCRMD-003, OCRMD-005, OCRMD-006, OCRMD-007 |
 | FR1 | OCRMD-004 |
 <!-- features:end -->
 

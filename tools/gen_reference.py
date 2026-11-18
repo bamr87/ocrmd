@@ -18,7 +18,7 @@ therefore drops OCRMD_* and USER from its environment, points OCRMD_ROOT and HOM
 `ocrmd.config.settings` for a pure-defaults `Settings` before `ocrmd.cli` is imported.
 """
 from __future__ import annotations
-import argparse, ast, atexit, inspect, io, json, os, re, shutil, sys, tempfile, tokenize
+import argparse, ast, atexit, inspect, io, json, os, re, shutil, sys, tempfile, tokenize, typing
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -85,9 +85,26 @@ def _opt_type(p) -> str:
         return "flag"
     if getattr(p, "is_flag", False):
         return "switch"
+    name = _type_name(p)
     name = {"str": "text", "text": "text", "int": "integer", "integer": "integer", "float": "number",
-            "boolean": "switch", "path": "path"}.get(p.type.name, p.type.name)
+            "bool": "switch", "boolean": "switch", "path": "path"}.get(name, name)
     return name + (", repeatable" if getattr(p, "multiple", False) else "")
+
+
+def _type_name(p) -> str:
+    """The parameter's value type, from click's `.type` or, since typer 0.29 (which vendors click and drops
+    `.type`), from typer's `type_descriptor`. Both spell the same names, mapped to words in `_opt_type`."""
+    if getattr(p, "type", None) is not None:
+        return p.type.name
+    desc = p.type_descriptor
+    if getattr(desc, "is_path", False):
+        return "path"
+    if getattr(desc, "is_choice", False):
+        return "choice"
+    ann = desc.annotation
+    args = typing.get_args(ann) if typing.get_origin(ann) in (list, tuple) else ()
+    ann = args[0] if args else ann
+    return getattr(ann, "__name__", str(ann)).lower()
 
 
 def _opt_default(p) -> str:
