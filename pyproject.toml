@@ -1,6 +1,6 @@
 [project]
 name = "ocrmd"
-version = "0.1.1"
+version = "0.2.0"
 description = "Scan physical books and pages into cross-checked Markdown, text and JSON, with an inventory of everything scanned"
 readme = "README.md"
 requires-python = ">=3.12"
