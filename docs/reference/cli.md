@@ -38,7 +38,7 @@ Given before the command: `ocrmd --debug verify`.
 | [`build`](#build) | Regenerate document markdown + nav links from page files (and document.yaml). |
 | [`serve`](#serve) | Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765. |
 | [`ocr-bench`](#ocr-bench) | Score local OCR against the LLM transcriptions in the store (bag-of-words F1 per page). |
-| [`doctor`](#doctor) | Show engines, cameras, credentials, configuration, database health and spend. |
+| [`doctor`](#doctor) | Show engines, cameras, credentials, configuration, orientation, database health and spend. |
 
 ## `scan`
 
@@ -255,6 +255,8 @@ ocrmd reconstruct [OPTIONS]
 
 Ingest image files or PDFs (png/jpg/tiff/webp, pdf with the `pdf` extra) as pages.
 
+Which way up each page is comes from a geometry cascade unless `orientation_probe` is on (OCRMD_ORIENTATION_PROBE=true): the probe asks OCR at all four rotations and is measurably better (the cascade is about 30% right end to end on real captures) but costs 4–8 extra OCR passes a page, and with rapidocr it has crashed inside RapidOCR's ONNX detector. See docs/scanning.md.
+
 ```text
 ocrmd ingest [OPTIONS] PATHS...
 ```
@@ -406,7 +408,7 @@ ocrmd ocr-bench [OPTIONS]
 
 ## `doctor`
 
-Show engines, cameras, credentials, configuration, database health and spend.
+Show engines, cameras, credentials, configuration, orientation, database health and spend.
 
 ```text
 ocrmd doctor [OPTIONS]

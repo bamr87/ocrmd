@@ -111,3 +111,27 @@ def test_the_root_is_created_and_the_doctor_answers(tmp_path):
         assert (tmp_path / "fresh" / "ocrmd.db").exists() and lib.documents() == []
         rep = lib.doctor()
         assert rep["library"]["documents"] == 0 and rep["sinks"] == []
+
+
+def test_the_doctor_reports_the_orientation_probe(tmp_path, monkeypatch):
+    monkeypatch.delenv("OCRMD_ORIENTATION_PROBE", raising=False)
+    with Library(tmp_path / "off", provider=None) as lib:
+        rep = lib.doctor()
+        assert rep["config"]["orientation_probe"] is False
+        assert rep["orientation"]["probe"] is False
+    monkeypatch.setenv("OCRMD_ORIENTATION_PROBE", "true")
+    with Library(tmp_path / "on", provider=None) as lib:
+        assert lib.doctor()["config"]["orientation_probe"] is True
+
+
+def test_the_doctor_counts_the_rotation_applied_to_stored_pages(tmp_path):
+    import json
+    with Library(tmp_path / "rot", provider=None) as lib:
+        lib.st.ensure_document("book")
+        for i, rot in enumerate([0, 0, 90, 180, 270, 270, 270]):
+            pid = f"p{i:015d}"
+            lib.st.add_page(pid, "book", f"sha{i}", 0, None, 1200, None)
+            (lib.s.processed / f"{pid}.json").write_text(json.dumps({"orientation": rot}))
+        lib.st.add_page("nometa000000000", "book", "sha-x", 0, None, 1200, None)   # no processed meta on disk
+        rot = lib.doctor()["orientation"]["rotation_applied"]
+        assert rot == {"0": 2, "90": 1, "180": 1, "270": 3, "unknown": 1}

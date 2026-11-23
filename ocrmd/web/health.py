@@ -1,5 +1,6 @@
 """Doctor report as data, shared by `ocrmd doctor` and the web UI."""
 from __future__ import annotations
+import json
 from pathlib import Path
 from ..config import Settings
 from ..store import Store
@@ -33,6 +34,23 @@ def cameras(root: Path | None = None) -> list[dict]:
     return out
 
 
+ROTATIONS = (0, 90, 180, 270)
+
+
+def rotation_applied(s: Settings, st: Store) -> dict[str, int]:
+    """Stored pages per rotation preprocess applied, read from processed/<id>.json. This is what was
+    done, not whether it was right: there is no ground truth for which way up a page really is."""
+    counts = {str(r): 0 for r in ROTATIONS} | {"unknown": 0}
+    for page in st.pages():
+        try:
+            rot = json.loads((s.processed / f"{page['id']}.json").read_text()).get("orientation")
+            key = str(int(rot) % 360)
+        except (OSError, ValueError, TypeError, AttributeError):
+            key = "unknown"
+        counts[key if key in counts else "unknown"] += 1
+    return counts
+
+
 def doctor_report(s: Settings, st: Store, probe_cameras: bool = True) -> dict:
     from ..capture import camera_authorized
     pipeline.backfill_page_meta(s, st)
@@ -41,11 +59,14 @@ def doctor_report(s: Settings, st: Store, probe_cameras: bool = True) -> dict:
         "root": str(s.root),
         "config": {"model": s.model, "provider": s.provider, "prompt_version": s.prompt_version, "focus": s.focus,
                    "focus_bracket": s.focus_bracket, "llm_workers": s.llm_workers,
+                   "orientation_probe": s.orientation_probe,
                    "log": str(s.log_path) if s.log_path else None},
         "ocr_engine": pipeline.ocr_version(s),          # the configured engine set, e.g. ocr@3:apple_vision+rapidocr
         "ocr_engines_installed": ocr.available_engines(),
         "credentials": {"anthropic": llm_mod.credentials_available("anthropic"), "xai": llm_mod.credentials_available("xai")},
         "dictionary": Path("/usr/share/dict/words").exists(),
+        # off by default for a measured reason (docs/reference/settings.md); the doctor says so out loud
+        "orientation": {"probe": s.orientation_probe, "rotation_applied": rotation_applied(s, st)},
         "cameras": cameras(s.root) if probe_cameras else [],
         "camera_authorized": camera_authorized(),
         "db_path": str(s.db_path), "db_integrity": st.integrity(),
