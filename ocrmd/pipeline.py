@@ -835,7 +835,8 @@ def render_page(s: Settings, st: Store, page, slug: str, meta: dict, ocr_res: oc
         "context": {"title": None, "author": [], "chapter": None, "section": None, "running_head": None,
                     "citation_key": None, "tags": [], "project": None},
         "references": {"cites": [], "figures": [], "footnotes": 0, "related": []},
-        "source": {"type": "webcam" if source.startswith("webcam") else "pdf" if meta.get("source") == "pdf" else "file",
+        "source": {"type": "webcam" if source.startswith("webcam") else "mobile_scan" if source.startswith("mobile_scan")
+                   else "mobile" if source.startswith("mobile") else "pdf" if meta.get("source") == "pdf" else "file",
                    "device": source.split(":", 1)[1] if ":" in source else None,
                    "raw": f"raw/{page['raw_sha256']}.jpg",
                    "sha256": page["raw_sha256"], "phash": page["phash"], "part": page["part"]},

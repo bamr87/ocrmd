@@ -52,6 +52,7 @@ class Job:
     total: int = 0
     log: deque = field(default_factory=lambda: deque(maxlen=1000))
     cancel: threading.Event = field(default_factory=threading.Event)
+    results: list = field(default_factory=list)   # ingest: what became of each file (see `_job_ingest`)
 
     def emit(self, line: str, level: str = "info") -> None:
         self.log.append({"at": time.time(), "level": level, "line": line})
@@ -59,7 +60,8 @@ class Job:
     def to_dict(self, with_log: bool = False) -> dict:
         d = {"id": self.id, "kind": self.kind, "doc": self.doc, "options": self.options, "status": self.status,
              "created_at": self.created_at, "started_at": self.started_at, "ended_at": self.ended_at,
-             "error": self.error, "done": self.done, "total": self.total, "log_lines": len(self.log)}
+             "error": self.error, "done": self.done, "total": self.total, "log_lines": len(self.log),
+             "results": list(self.results)}
         if with_log:
             d["log"] = list(self.log)
         return d
@@ -320,35 +322,62 @@ class JobManager:
                      "info")
 
     def _job_ingest(self, job: Job) -> None:
+        """Files → pages, each read and (with a provider) verified as it lands.
+
+        Every file also gets a structured entry in `job.results` — the pages it became, the page it
+        duplicated, why a crop was refused — because the phone app shows the operator what happened to
+        each shot, and a log line is not something a program should parse. `source` names where the
+        files came from when it is not a file someone picked (`mobile:<device>` for the phone app);
+        `client_ids` maps a saved file back to the id its uploader gave it.
+        """
         s, st = self.s, self.st
         slug = job.doc
         files = [Path(p) for p in job.options.get("files", [])]
         if not slug or not files:
             raise ValueError("ingest needs a document and files")
+        source = job.options.get("source")
+        client_ids = job.options.get("client_ids") or {}
         st.ensure_document(slug)
         render.ensure_document_meta(s.documents / slug, slug)
         prov = self._provider(job)
         job.total = len(files)
         health = LLMHealth(s.llm_failure_limit)
+
+        def ref(pid: str | None) -> dict | None:
+            row = st.page(pid) if pid else None
+            return {"document": row["document"], "sequence": row["sequence"]} if row is not None else None
+
         for f in files:
             if job.cancel.is_set():
                 job.emit("cancelled", "warn"); break
-            def landed(name: str, res: pipeline.Ingested) -> None:
+            result = {"file": f.name, "client_id": client_ids.get(str(f)), "pages": [], "duplicate_of": None,
+                      "rejected": [], "error": None}
+            job.results.append(result)
+
+            def landed(name: str, res: pipeline.Ingested, result=result) -> None:
+                result["rejected"] += list(res.rejected)
                 if not res.pages:
-                    job.emit(f"duplicate: {name}", "warn"); return
+                    result["duplicate_of"] = ref(res.duplicate_of)
+                    job.emit(f"duplicate: {name}" if res.duplicate_of else f"refused: {name}: {'; '.join(res.rejected)}",
+                             "warn"); return
                 job.emit(f"{name} -> {len(res.pages)} page(s)", "info")
                 for pid in res.pages:
                     process_page(s, st, pid, None if health.degraded else prov, slug, health=health, emit=job.emit)
+                    row = st.page(pid)
+                    if row is not None:
+                        result["pages"].append({"sequence": row["sequence"], "status": row["status"]})
             if f.suffix.lower() == ".pdf":
                 try:
                     pipeline.ingest_pdf(s, st, f, slug, on_page=landed)
                 except RuntimeError as e:
+                    result["error"] = str(e)
                     job.emit(str(e), "error")
                 job.done += 1; continue
-            img = cv2.imread(str(f))
+            img = cv2.imread(str(f))                     # applies EXIF orientation: a phone photo comes upright
             if img is None:
+                result["error"] = "unreadable image"
                 job.emit(f"unreadable: {f.name}", "error"); job.done += 1; continue
-            landed(f.name, pipeline.ingest_frame(s, st, img, slug, f"file:{f.name}"))
+            landed(f.name, pipeline.ingest_frame(s, st, img, slug, source or f"file:{f.name}"))
             job.done += 1
         render.build_document(s.documents / slug, slug)
         library_mod.sync_document(s, st, slug)

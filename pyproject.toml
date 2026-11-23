@@ -27,6 +27,7 @@ pdf = ["pymupdf"]               # `ocrmd ingest file.pdf`
 # itself, for running an exported pipeline (`ocrmd etl --export-docetl out/ && docetl run out/pipeline.yaml`)
 # through their optimizer. It is a large install (litellm, modal, pandas, scikit-learn, ...).
 docetl = ["docetl>=0.3"]
+mobile = ["segno>=1.6"]         # QR codes for pairing the phone app (`ocrmd pair`, Settings); without it the code is typed
 dev = ["pytest>=8", "ruff>=0.5", "httpx"]   # httpx: FastAPI's TestClient
 
 [project.urls]
