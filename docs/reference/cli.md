@@ -37,6 +37,8 @@ Given before the command: `ocrmd --debug verify`.
 | [`delete`](#delete) | Delete pages (or a whole document): database rows, artifacts, page files — and the raw capture when no page refers to it any more. |
 | [`build`](#build) | Regenerate document markdown + nav links from page files (and document.yaml). |
 | [`serve`](#serve) | Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765. |
+| [`pair`](#pair) | Pair the phone app: print a one-time code, and a QR code carrying it, valid for 10 minutes. |
+| [`devices`](#devices) | List the devices paired with this ocrmd (the phone app), or revoke one. |
 | [`ocr-bench`](#ocr-bench) | Score local OCR against the LLM transcriptions in the store (bag-of-words F1 per page). |
 | [`doctor`](#doctor) | Show engines, cameras, credentials, configuration, database health and spend. |
 
@@ -375,16 +377,50 @@ ocrmd build [OPTIONS]
 
 Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765.
 
+With `--lan` it is also the server the phone app talks to (`/api/v1`): this machine's browser needs nothing, every other machine must be paired (`ocrmd pair`, or Settings in the UI).
+
 ```text
 ocrmd serve [OPTIONS]
 ```
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--host` | text | `127.0.0.1` | bind address; keep it local, there is no authentication |
+| `--host` | text | `127.0.0.1` | bind address; keep it local unless you pass --lan |
 | `--port` | integer | `8765` | — |
 | `--open` / `--no-open` | switch | `--open` | open the UI in a browser |
-| `--allow-remote` | flag | off | allow a non-loopback --host; the UI has no authentication, so anyone who can reach the port can read your scans |
+| `--lan` | flag | off | open the port to the local network for the phone app (binds 0.0.0.0 unless --host says otherwise); every request from another machine needs a paired device's token — see `ocrmd pair` |
+| `--allow-remote` | flag | off | allow a non-loopback --host with NO authentication, so anyone who can reach the port can read your scans; prefer --lan |
+
+## `pair`
+
+Pair the phone app: print a one-time code, and a QR code carrying it, valid for 10 minutes.
+
+Scan the QR code with the app (or the phone's camera), or type the server address and code into the app's pairing screen. The server must be running with `ocrmd serve --lan`. Only a hash of the code is stored; the device's own token is handed to the phone alone, never printed.
+
+```text
+ocrmd pair [OPTIONS]
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--name` | text | — | what to call the device in `ocrmd devices` (default: the name the phone gives itself) |
+| `--host` | text | — | the address the phone should dial (default: this machine's LAN address) |
+| `--port` | integer | `8765` | the port `ocrmd serve --lan` listens on |
+
+## `devices`
+
+List the devices paired with this ocrmd (the phone app), or revoke one.
+
+A revoked device's next request is refused; pairing it again makes a new token.
+
+```text
+ocrmd devices [OPTIONS]
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--revoke` | text, repeatable | — | revoke a device (or cancel a pending code) by id or name; repeatable |
+| `--all` | flag | off | include revoked devices |
 
 ## `ocr-bench`
 

@@ -21,6 +21,8 @@ Without credentials ocrmd runs OCR-only and you can fill in the LLM pass later w
 
 **Local OCR engines.** On macOS Apple Vision (through pyobjc, no extra install) is the primary engine; `pip install 'ocrmd[rapidocr]'` adds RapidOCR (PP-OCR on ONNX Runtime, models fetched on first use), which is the primary engine on Linux/Windows. When two engines are installed they both read every page and *vote*: words they agree on are trusted, words they disagree on are flagged for the LLM comparison, lines one missed are filled from the other (`ocr_ensemble = false` turns this off, or set `ocr_engines = ["apple_vision"]`). Tesseract (`ocrmd[tesseract]` + the binary) is supported but measured far behind on camera images. `ocrmd ocr-bench` measures whatever is installed against the LLM transcriptions already in your store, so you can see what a change buys before trusting it.
 
+**A phone as the camera.** `pip install 'ocrmd[mobile]'` adds QR codes for pairing (without it you type the code); then `ocrmd serve --lan` and `ocrmd pair`. The phone needs the ocrmd app from [mobile/](../mobile/README.md) and the same network as this computer — [the phone app](mobile.md) has the rest.
+
 Page images are sent to the provider you configure; nothing else leaves the machine.
 
 ## Configuration

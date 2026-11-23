@@ -1,7 +1,11 @@
-"""FastAPI backend for the ocrmd web UI. Local, single-user, no authentication: bind to 127.0.0.1.
+"""FastAPI backend for the ocrmd web UI and the phone app. Single-user; local by default.
 
 Everything the CLI can do is reachable here, plus what a terminal cannot show: the live HUD stream,
-page images beside their transcription, and click-to-resolve review.
+page images beside their transcription, and click-to-resolve review. Two surfaces share one core:
+`/api` is the browser SPA's own, and `/api/v1` (v1.py) is the versioned, typed contract the phone app
+is built against. Who may call either is `auth.py`: bound to loopback nothing is checked, as before;
+`serve --lan` opens the port to the local network and then requires a paired device's token from
+anything that is not this machine.
 """
 from __future__ import annotations
 import logging, re, time
@@ -13,11 +17,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .. import __version__
 from ..config import Settings
 from ..store import Store
-from .. import library as library_mod, pipeline, render, review, sinks as sinks_mod
+from .. import edits, library as library_mod, pipeline, render, sinks as sinks_mod
 from ..export import FORMATS, export_document
 from ..session import ScanOptions, ScanSession, make_provider
+from . import auth, v1, views
+from .. import devices as devices_mod
 from .health import cameras as list_cameras, doctor_report
 from .jobs import JobManager, KINDS, BUNDLED_PIPELINES, pipelines as etl_pipelines
 
@@ -118,10 +125,13 @@ def _slug(slug: str) -> str:
     return slug
 
 
-def create_app(s: Settings) -> FastAPI:
+def create_app(s: Settings, access: str = "local") -> FastAPI:
+    """`access` is who may connect (auth.MODES): `local` (loopback bind, nothing checked), `paired`
+    (`serve --lan`: a device token from anything that is not this machine), `open` (`--allow-remote`)."""
     s.ensure_dirs()
     st = Store(s.db_path)
-    app = FastAPI(title="ocrmd", version="0.3.0", docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="ocrmd", version=__version__, docs_url="/api/docs", redoc_url=None)
+    app.add_middleware(auth.AccessMiddleware, st=st, mode=access)
     holder: dict[str, ScanSession | None] = {"session": None}
 
     def scan_running(doc: str | None = None) -> bool:
@@ -129,6 +139,8 @@ def create_app(s: Settings) -> FastAPI:
         return bool(ses and ses.running and (doc is None or ses.opts.doc == doc))
 
     jobs = JobManager(s, st, scan_running)
+    app.include_router(v1.router(s, st, jobs, lambda: holder["session"].opts.doc if scan_running() else None,
+                                 devices_mod.ClaimGuard(), access))
     sink_cache: dict[tuple[str, str], Any] = {}
 
     def sink_registry() -> list:
@@ -158,51 +170,10 @@ def create_app(s: Settings) -> FastAPI:
         return row
 
     def page_payload(slug: str, row) -> dict:
-        path = render.page_path(s.documents / slug, row["sequence"])
-        fm, body = render.read_page(path) if path.exists() else ({}, "")
-        flags = [{"n": f.n, "ocr": f.ocr, "llm": f.llm, "context": f.context(body, 60)} for f in review.parse_flags(body)]
-        pages = st.pages(slug)
-        seqs = [p["sequence"] for p in pages]
-        i = seqs.index(row["sequence"])
-        nxt_flag = next((p["sequence"] for p in pages[i + 1:] if p["status"] == "flagged"), None)
-        prev_flag = next((p["sequence"] for p in reversed(pages[:i]) if p["status"] == "flagged"), None)
-        pid = row["id"]
-        return {
-            "slug": slug, "sequence": row["sequence"], "id": pid, "status": row["status"],
-            "page_label": row["page_label"], "part": row["part"], "width_px": row["width_px"], "advice": row["advice"],
-            "reviewed_by": row["reviewed_by"], "llm_error": st.stage_error(pid, "llm"),
-            "frontmatter": fm, "body": body, "flags": flags, "unresolved": len(flags),
-            "images": {k: f"/api/documents/{slug}/pages/{row['sequence']}/image/{k}"
-                       for k, p in (("flat", s.processed / f"{pid}.png"),   # rendered on first request
-                                    ("processed", s.processed / f"{pid}.png"), ("bin", s.processed / f"{pid}.bin.png"),
-                                    ("raw", s.raw / f"{row['raw_sha256']}.jpg")) if p.exists()},
-            "prev": seqs[i - 1] if i > 0 else None, "next": seqs[i + 1] if i + 1 < len(seqs) else None,
-            "prev_flagged": prev_flag, "next_flagged": nxt_flag, "exists": path.exists(),
-            "fidelity": row["fidelity"] if "fidelity" in row.keys() else None,
-            "layout": f"/api/documents/{slug}/pages/{row['sequence']}/layout" if pipeline.layout_path(s, pid).exists() else None,
-            "figures": [{"n": n, "asset": f.get("asset"), "caption": f.get("caption"), "bbox": f.get("bbox"),
-                         "url": f"/api/documents/{slug}/pages/{row['sequence']}/figures/{n}.png"}
-                        for n, f in enumerate(((fm.get("references") or {}).get("figures") or []), 1)
-                        if isinstance(f, dict)],
-        }
+        return views.page_payload(s, st, slug, row)
 
     def doc_payload(slug: str) -> dict:
-        counts = st.counts(slug)
-        meta = render.load_document_meta(s.documents / slug)
-        pages = st.pages(slug)
-        info = library_mod.info(s, st, slug)
-        return {"slug": slug, "title": meta.get("title"), "kind": meta.get("kind"), "tags": meta.get("tags") or [],
-                "author": info.author, "year": info.year, "isbn": info.isbn, "project": info.project,
-                "page_labels": info.page_labels, "last_captured_at": info.last_captured_at, "created_at": info.created_at,
-                "exports": info.exports, "done": info.done,
-                "pages": len(pages), "counts": counts,
-                "needs_reshoot": [p["sequence"] for p in pages if p["status"] in ("illegible", "suspect")],
-                "flagged": counts.get("flagged", 0), "unverified": counts.get("unverified", 0) + counts.get("error", 0),
-                "duplicates": len(st.duplicates(slug)), "refused": len(st.rejected_captures(slug)),
-                "extracted": sorted(p.name for p in (s.documents / slug / "extracted").glob("*")
-                                    if p.is_file()) if (s.documents / slug / "extracted").exists() else [],
-                "scanning": scan_running(slug),
-                "document_md": f"/api/documents/{slug}/document.md" if (s.documents / slug / f"{slug}.md").exists() else None}
+        return views.doc_payload(s, st, slug, scan_running(slug))
 
     # --- static ----------------------------------------------------------------------------------
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -267,22 +238,7 @@ def create_app(s: Settings) -> FastAPI:
         if slug not in st.documents():
             raise HTTPException(404, "no such document")
         d = doc_payload(slug)
-        rows = []
-        for p in st.pages(slug):
-            path = render.page_path(s.documents / slug, p["sequence"])
-            agreement = overlap = continuity = None
-            if path.exists():
-                try:
-                    fm = render.read_page(path)[0]
-                    v = fm.get("verification") or {}
-                    agreement, overlap = v.get("agreement"), v.get("overlap")
-                    continuity = (fm.get("processing") or {}).get("continuity")
-                except Exception:
-                    pass
-            rows.append({"sequence": p["sequence"], "id": p["id"], "status": p["status"], "page_label": p["page_label"],
-                         "part": p["part"], "width_px": p["width_px"], "advice": p["advice"], "continuity": continuity,
-                         "agreement": agreement, "overlap": overlap, "llm_error": st.stage_error(p["id"], "llm"),
-                         "captured_at": p["captured_at"], "reviewed_by": p["reviewed_by"]})
+        rows = views.page_rows(s, st, slug)
         d["page_list"] = rows
         d["meta"] = render.load_document_meta(s.documents / slug)
         return d
@@ -555,9 +511,15 @@ def create_app(s: Settings) -> FastAPI:
         media = {"md": "text/markdown", "txt": "text/plain", "jsonl": "application/x-ndjson", "json": "application/json"}[fmt]
         return FileResponse(path, media_type=media, filename=path.name)
 
-    def _write(slug: str, row, fm: dict, body: str) -> dict:
-        render.write_page(s.documents / slug, row["sequence"], fm, body)
-        return page_payload(slug, st.page_by_sequence(slug, row["sequence"]))
+    def _edited(slug: str, seq: int, write) -> dict:
+        """Run one of `edits`' writes and answer with the page as it now stands."""
+        try:
+            write()
+        except edits.EditConflict as e:
+            raise HTTPException(409, str(e)) from e
+        except edits.FlagNotFound as e:
+            raise HTTPException(404, str(e)) from e
+        return page_payload(slug, st.page_by_sequence(slug, seq))
 
     @app.put("/api/documents/{slug}/pages/{seq}")
     def api_page_edit(slug: str, seq: int, edit: PageEdit):
@@ -565,69 +527,27 @@ def create_app(s: Settings) -> FastAPI:
         `verify` sees the file as hand-edited and keeps these values."""
         _slug(slug)
         row = page_row(slug, seq)
-        path = render.page_path(s.documents / slug, seq)
-        if not path.exists():
-            raise HTTPException(409, "page has no file yet; run verify")
-        fm, body = render.read_page(path)
-        if edit.body is not None:
-            body = edit.body
-        if edit.page_label is not None:
-            fm["page_label"] = edit.page_label or None
-            st.set_status(row["id"], row["status"], fm["page_label"])
-        if edit.context:
-            ctx = fm.setdefault("context", {})
-            for k, v in edit.context.items():
-                if k in ("title", "author", "chapter", "section", "running_head", "citation_key", "tags", "project"):
-                    ctx[k] = v
-        fm.setdefault("verification", {})["flagged_spans"] = review.unresolved(body)
-        return _write(slug, row, fm, body)
+        return _edited(slug, seq, lambda: edits.edit_page(s, st, slug, row, body=edit.body, page_label=edit.page_label,
+                                                          context=edit.context))
 
     @app.post("/api/documents/{slug}/pages/{seq}/resolve")
     def api_resolve(slug: str, seq: int, r: Resolve):
         _slug(slug)
         row = page_row(slug, seq)
-        path = render.page_path(s.documents / slug, seq)
-        if not path.exists():
-            raise HTTPException(409, "page has no file yet")
-        fm, body = render.read_page(path)
-        if not any(f.n == r.n for f in review.parse_flags(body)):
-            raise HTTPException(404, f"flag #{r.n} not found")
-        body = review.resolve(body, r.n, r.chosen)
-        fm.setdefault("verification", {})["flagged_spans"] = review.unresolved(body)
-        return _write(slug, row, fm, body)
+        return _edited(slug, seq, lambda: edits.resolve_flag(s, st, slug, row, r.n, r.chosen))
 
     @app.post("/api/documents/{slug}/pages/{seq}/signoff")
     def api_signoff(slug: str, seq: int, so: SignOff):
         _slug(slug)
         row = page_row(slug, seq)
-        path = render.page_path(s.documents / slug, seq)
-        if not path.exists():
-            raise HTTPException(409, "page has no file yet")
-        fm, body = render.read_page(path)
-        left = review.unresolved(body)
-        if left:
-            raise HTTPException(409, f"{left} disagreement(s) still unresolved")
-        v = fm.setdefault("verification", {})
-        v["reviewed_by"] = {"who": so.who, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-        v["status"] = "reviewed"
-        v["flagged_spans"] = 0
-        st.set_reviewed(row["id"], so.who, "reviewed")
-        render.write_page(s.documents / slug, seq, fm, body)
-        st.set_fingerprint(row["id"], review.fingerprint(fm, body))
-        return page_payload(slug, st.page_by_sequence(slug, seq))
+        return _edited(slug, seq, lambda: edits.sign_off(s, st, slug, row, so.who))
 
     @app.post("/api/documents/{slug}/pages/{seq}/reopen")
     def api_reopen(slug: str, seq: int):
         """Undo a sign-off: the page goes back to flagged/verified by its numbers."""
         _slug(slug)
         row = page_row(slug, seq)
-        path = render.page_path(s.documents / slug, seq)
-        fm, body = render.read_page(path)
-        v = fm.setdefault("verification", {})
-        v["reviewed_by"] = None
-        v["status"] = "flagged" if review.unresolved(body) else "verified"
-        st.set_reviewed(row["id"], None, v["status"])
-        return _write(slug, row, fm, body)
+        return _edited(slug, seq, lambda: edits.reopen(s, st, slug, row))
 
     # --- deletion --------------------------------------------------------------------------------
     def _deleted(out: pipeline.Deleted, slug: str, rebuild: bool = True) -> dict:

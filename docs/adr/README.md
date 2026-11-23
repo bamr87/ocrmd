@@ -17,3 +17,4 @@ This directory records decisions for ocrmd that are hard to reverse: the stack, 
 | ID | Title | Status |
 | --- | --- | --- |
 | 0001 | [Record architecture decisions](0001-record-architecture-decisions.md) | accepted |
+| 0002 | [The phone app is a paired client of the operator's own ocrmd](0002-phone-app-as-a-paired-client.md) | proposed |

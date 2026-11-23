@@ -6,13 +6,13 @@
 
 ## What this repo is
 
-`ocrmd` turns a webcam pointed at a book (or a folder of images/PDFs) into cross-checked Markdown, and keeps an inventory of everything scanned. Every page is read **twice** — by local OCR engines and by a vision LLM — and the readings are diffed. Disagreements become `==[word]==[^ocrmd-n]` marks in the page file rather than a silent choice; digits are never auto-resolved. That cross-check is the product: an early version fabricated a table of contents for a page it could not read, and only the diff caught it. The root is a searchable **library**; documents **export** as md/txt/json/jsonl, a page can be **sent** to any receiver speaking the contract in [sinks.py](ocrmd/sinks.py), and [api.py](ocrmd/api.py) exposes it all to other programs. One operator at a desk, macOS first.
+`ocrmd` turns a webcam pointed at a book (or a folder of images/PDFs) into cross-checked Markdown, and keeps an inventory of everything scanned. Every page is read **twice** — by local OCR engines and by a vision LLM — and the readings are diffed. Disagreements become `==[word]==[^ocrmd-n]` marks in the page file rather than a silent choice; digits are never auto-resolved. That cross-check is the product: an early version fabricated a table of contents for a page it could not read, and only the diff caught it. The root is a searchable **library**; documents **export** as md/txt/json/jsonl, a page can be **sent** to any receiver speaking the contract in [sinks.py](ocrmd/sinks.py), and [api.py](ocrmd/api.py) exposes it all to other programs. A **phone app** for iOS and Android ([mobile/](mobile/README.md)) is a paired client of the same server: it shoots and reviews pages, the computer reads them. One operator at a desk, macOS first.
 
-A change is done when `ruff check ocrmd tests` and `pytest` pass, `docs/reference/` is regenerated if a command, option or `Settings` field changed, and the matching `docs/` guide and [ARCHITECTURE.md](docs/ARCHITECTURE.md) section describe what the code now does. Read that section before changing a subsystem: most non-obvious constants there were measured, not guessed.
+A change is done when `ruff check ocrmd tests` and `pytest` pass, `docs/reference/` is regenerated if a command, option, `Settings` field or `/api/v1` route changed (and `mobile/` still passes `npm run check` after an `/api/v1` change), and the matching `docs/` guide and [ARCHITECTURE.md](docs/ARCHITECTURE.md) section describe what the code now does. Read that section before changing a subsystem: most non-obvious constants there were measured, not guessed.
 
 ## Stack & commands
 
-Python 3.12+, typer, FastAPI, SQLite (WAL), OpenCV, Apple Vision (pyobjc) / RapidOCR, the Anthropic SDK.
+Python 3.12+, typer, FastAPI, SQLite (WAL), OpenCV, Apple Vision (pyobjc) / RapidOCR, the Anthropic SDK. The phone app: TypeScript, Expo SDK 58 (React Native 0.88), Expo Router, Jest.
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'   # add ,pdf for PDF ingest; ,tesseract as a last resort
@@ -30,7 +30,13 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'   # add ,pdf
 python3 tools/docs_index.py --write                               # regenerate the docs/README.md index after adding or renaming a doc
 ```
 
-The driver uses a throwaway `OCRMD_ROOT` ([run-ocrmd skill](.claude/skills/run-ocrmd/SKILL.md)). [CI](.github/workflows/ci.yml) runs `ruff` and `pytest` on Linux (RapidOCR) for pull requests and the full suite on **macos-latest** for `main` pushes and manual runs (Apple Vision and AVFoundation are macOS-only; tests that assert Vision's reading are marked `needs_vision` and skip on Linux). `.vscode/` debug configs run `ocrmd.cli` in-process, so breakpoints work anywhere, including under uvicorn. Every command and option: [docs/reference/cli.md](docs/reference/cli.md).
+```sh
+.venv/bin/ocrmd serve --lan && .venv/bin/ocrmd pair               # the server open to paired phones; a one-time pairing code + QR
+cd mobile && npm install && npm run check                         # the phone app: regenerate API types, tsc, jest (Node 22+)
+cd mobile && npx expo start                                       # run it in Expo Go or a simulator (docs/mobile.md)
+```
+
+The driver uses a throwaway `OCRMD_ROOT` ([run-ocrmd skill](.claude/skills/run-ocrmd/SKILL.md)). [CI](.github/workflows/ci.yml) runs `ruff` and `pytest` on Linux (RapidOCR) for pull requests, the phone app's `npm run check` on Linux for every run, and the full suite on **macos-latest** for `main` pushes and manual runs (Apple Vision and AVFoundation are macOS-only; tests that assert Vision's reading are marked `needs_vision` and skip on Linux). `.vscode/` debug configs run `ocrmd.cli` in-process, so breakpoints work anywhere, including under uvicorn. Every command and option: [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Layout
 
@@ -41,11 +47,11 @@ Capture ──▶ Admit? ──▶ Preprocess ──▶ Local OCR ──▶ LLM 
                      SQLite state + on-disk artifacts (append-only)
 ```
 
-- **Drivers:** `cli.py` (typer) and `web/app.py` (FastAPI; `web/static/` is a dependency-free SPA served as package data) over one core — `session.ScanSession` owns a scan run (capture generator, OCR worker thread, LLM pool, health, events) and `pipeline.py` runs the stages.
+- **Drivers:** `cli.py` (typer), `web/app.py` (FastAPI; `web/static/` is a dependency-free SPA served as package data) and `web/v1.py` (the phone app's versioned API; access in `web/auth.py`, pairing in `devices.py`) over one core — `session.ScanSession` owns a scan run (capture generator, OCR worker thread, LLM pool, health, events) and `pipeline.py` runs the stages.
 - **Capture:** `capture.py`, `focus.py`, `scene.py`, `legibility.py`, `occlusion.py` (a reference paper-mask tracker, *not* skin detection), `camctl.py` (AVFoundation control plus the OpenCV↔AVFoundation camera-index map — they number cameras differently, and OpenCV reports `-1` for every property on macOS).
-- **Stages:** `preprocess.py` (incl. `legible()`, the derived flat rendering), `ocr.py`, `multifocus.py`, `llm.py`, `reconcile.py`, `review.py`, `render.py`; state in `store.py`, settings in `config.py`.
+- **Stages:** `preprocess.py` (incl. `legible()`, the derived flat rendering), `ocr.py`, `multifocus.py`, `llm.py`, `reconcile.py`, `review.py`, `render.py`; a person's writes in `edits.py`; state in `store.py`, settings in `config.py`.
 - **After the scan:** `library.py`, `export/`, `etl.py`, `sinks.py`, `api.py`, `reconstruct.py` / `annotate.py`, `bench.py`.
-- **Outside the package:** `tests/`, `docs/` (guides, generated `reference/`, `adr/`), `tools/`, `examples/`, `features/` + `verify/` (fleet verify kit), `.claude/` (skills, verifier agent).
+- **Outside the package:** `mobile/` (the Expo app; `src/api/schema.d.ts` is generated), `tests/`, `docs/` (guides, generated `reference/` incl. `openapi-v1.json`, `adr/`), `tools/`, `examples/`, `features/` + `verify/` (fleet verify kit), `.claude/` (skills, verifier agent).
 
 ## Conventions
 
@@ -55,9 +61,9 @@ Capture ──▶ Admit? ──▶ Preprocess ──▶ Local OCR ──▶ LLM 
 - **Commits:** Conventional Commits; the PR title is the squash subject. release-please writes `CHANGELOG.md` and the version (`release.yml`) — never edit either by hand.
 - **Branches:** `feature/`, `fix/`, `docs/`, `refactor/`, `test/` or `chore/` off `main`.
 - **Style:** `ruff` with `line-length = 120`, `select = ["E","F","W","B"]`, and `E401/E501/E701/E702/E731/B008` ignored — compact multi-statement lines and grouped imports are deliberate, and so is typer's `B008` default-in-signature idiom. Match the surrounding density. Module docstrings explain the *why*; inline comments carry the measurement that justifies a constant. When you change a threshold, say what you measured.
-- **Tests:** synthetic PIL-rendered pages, a temporary root per test, `FakeProvider` instead of the API ([conftest.py](tests/conftest.py): `text_page`, `on_desk`, `with_hand`, `root`, `store`). Tests needing a real OCR engine skip without one. For pipeline behaviour prefer an end-to-end test through `run_page`/`verify` over unit-testing a helper.
+- **Tests:** synthetic PIL-rendered pages, a temporary root per test, `FakeProvider` instead of the API ([conftest.py](tests/conftest.py): `text_page`, `on_desk`, `with_hand`, `root`, `store`). Tests needing a real OCR engine skip without one. For pipeline behaviour prefer an end-to-end test through `run_page`/`verify` over unit-testing a helper. Remote access is tested with `TestClient(app, client=(ip, port))`: a loopback peer is this machine, anything else is a phone. The app's logic lives in `mobile/src/lib` with no React Native in it, so Jest tests it on Linux.
 - **Markdown:** one paragraph per line.
-- **Never:** push to `main`, commit secrets or lockfiles, suppress type errors, leave empty exception handlers, hand-edit generated files (`docs/reference/`, the docs index span), or edit the vendored `tools/docs_index.py`.
+- **Never:** push to `main`, commit secrets or lockfiles (`mobile/package-lock.json` included: `mobile/package.json` pins exact versions instead), suppress type errors, leave empty exception handlers, hand-edit generated files (`docs/reference/`, `mobile/src/api/schema.d.ts`, the docs index span), or edit the vendored `tools/docs_index.py`.
 
 ## Stages and versions
 
@@ -72,7 +78,7 @@ Capture ──▶ Admit? ──▶ Preprocess ──▶ Local OCR ──▶ LLM 
 
 - The search index, the catalogue mirror, the exports and the flat rendering are *derived*: no version, no page id, rebuilt from the files (`ocrmd index --force`, `ocrmd export`).
 - **A page's id is the sha256 of its *processed* image**, so bumping `preprocess@N` changes the page identities themselves — that is why `reprocess` exists and why it discards the OCR/LLM results and re-pays for the LLM pass. Raw captures in `raw/` are immutable.
-- **Gating and processing stay identical between the CLI and the web server**: new behaviour goes in `session.py`/`pipeline.py`, never in a driver.
+- **Gating and processing stay identical between the CLI, the web server and the phone app**: new behaviour goes in `session.py`/`pipeline.py` (a person's writes in `edits.py`), never in a driver. A phone capture is the same `ingest` job a browser upload starts.
 
 ## Invariants
 
@@ -92,6 +98,8 @@ Each was measured; the long form is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Nothing is deleted automatically.** A failed stage records its error; the page stays `unverified` until the next `verify` retries it.
 - **An extracted row names its page.** [etl.py](ocrmd/etl.py) attaches `_document`/`_page`/`_page_id` at the source and merges them through every operator (`_pages` for a reduce). Its system prompt is the transcription stage's refusal: use the text, leave the field empty, never fill in what such a document would probably say.
 - **A picture is read twice too.** Nothing local can read a drawing, so one `map` over a figure crop is exactly the single unreconciled reading the cross-check exists to prevent. The bundled `components` pipeline asks twice on different evidence and `crosscheck` (free) reconciles them: every item kept with who read it, both sides of a disagreement kept, digits never resolved, a claimed printed label looked for in the page text. Operators with `image: true` run under `etl.SYSTEM_PICTURE`, not `SYSTEM`. Don't collapse it to one call. Its match threshold (0.80) was set on hand-written part names, and the pipeline has not yet run against a live model — say so until it has.
+- **The phone is a client, not a second pipeline** ([ADR 0002](docs/adr/0002-phone-app-as-a-paired-client.md)). It never OCRs, never calls the provider, and keeps nothing the computer does not; a feature that would read a page on the phone adds evidence for the computer to reconcile, never a verdict. Its contract is `/api/v1`: answers are pydantic models, the OpenAPI document and the app's types are generated, changes are additive, a breaking change is `/api/v2`.
+- **Another machine gets in only with a paired device's token.** `serve --lan` checks every non-local request (`web/auth.py`); codes and tokens are stored as SHA-256 hashes and a token exists in clear only in the one `POST /api/v1/pair` answer — never print or log one; device management answers this machine only. Loopback without `--lan` is unchanged, and `--allow-remote` stays the explicit no-auth mode.
 - **Sending is not a stage.** `sinks.send_page` writes no file, marks no stage, moves no version. A down receiver is a **502** from the web route (not a 500), never retried into a silent success. Options are checked against the receiver's descriptor before the wire (`coerce_options`); receiver vocabulary stays in the receiver. The *text* travels, never the photograph — a receiver with the image would re-read it single-pass and overrule the cross-check.
 - **The search index is never written by a write path.** `library.reindex` compares page-file mtimes on every search and re-reads only what changed; `Store.delete_page` drops a deleted page's row. Don't hook `render.write_page` or the web routes.
 - **A region read writes nothing.** `pipeline.read_region` (drag-a-box, `ocrmd read`) cuts the selection from the flat rendering, enlarges it on its own terms (`REGION_MAX_SCALE`) and returns the model's answer *beside* the OCR one. No stage is marked; the operator is the reconciler, and only Save writes.
@@ -101,7 +109,7 @@ Each was measured; the long form is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Settings and credentials
 
 - Precedence: defaults → `~/.config/ocrmd/config.toml` → `<root>/ocrmd.toml` → `OCRMD_<FIELD>` env → CLI flags. Every `Settings` field is an `OCRMD_*` variable; invalid values fail fast naming the key ([generated list](docs/reference/settings.md), [commented example](ocrmd.example.toml)). `OCRMD_ROOT` moves all data; by default `raw/`, `processed/`, `ocr/`, `llm/`, `documents/` and `ocrmd.db` sit beside the code, all gitignored.
-- Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`; first found wins, never overriding the environment), templated by [.env.example](.env.example), every line commented out; `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN`. **A subscription OAuth token only serves `claude-haiku-5-5`** (other models return a bare 429), so set `OCRMD_MODEL=claude-haiku-5-5` with it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`.
+- Credentials come from `.env` (cwd → project root → `~/.config/ocrmd/.env`; first found wins, never overriding the environment), templated by [.env.example](.env.example), every line commented out; `CLAUDE_CODE_OAUTH_TOKEN` is re-exported as `ANTHROPIC_AUTH_TOKEN`. **A subscription OAuth token only serves `claude-haiku-5-5`** (other models return a bare 429), so set `OCRMD_MODEL=claude-haiku-5-5` with it. `ANTHROPIC_API_KEY` reaches every model and is required for `verify --batch`. Paired phones' tokens are not settings: they are hashed in `ocrmd.db` (`devices`) and managed with `ocrmd pair` / `ocrmd devices`.
 
 ## Fleet context
 
