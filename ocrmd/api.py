@@ -27,7 +27,7 @@ import cv2, numpy as np
 
 from .config import Settings, load_settings
 from .store import Store, DONE_STATUSES
-from . import library as library_mod, pipeline, render, review, sinks as sinks_mod
+from . import edits, library as library_mod, pipeline, render, review, sinks as sinks_mod
 from .export import FORMATS, export_document
 from .session import LLMHealth, make_provider, process_page
 
@@ -317,6 +317,28 @@ class Library:
                     question: str | None = None) -> pipeline.RegionRead:
         """One rectangle of a page read on its own terms; nothing is written (see `pipeline.read_region`)."""
         return pipeline.read_region(self.s, self.st, self._row(doc, sequence), bbox, self.provider if llm else None, question)
+
+    # --- a person's writes (see edits.py: the same rules the web UI and the phone app write by) ------
+    def edit(self, doc: str, sequence: int, *, body: str | None = None, page_label: str | None = None,
+             context: dict | None = None) -> PageInfo:
+        """A human edit of the body, printed label or context; it survives the next `verify`."""
+        row = self._row(doc, sequence)
+        edits.edit_page(self.s, self.st, doc, row, body=body, page_label=page_label, context=context)
+        return self.page(doc, sequence)
+
+    def resolve(self, doc: str, sequence: int, n: int, chosen: str) -> PageInfo:
+        """Settle disagreement `n` on the page with `chosen`."""
+        edits.resolve_flag(self.s, self.st, doc, self._row(doc, sequence), n, chosen)
+        return self.page(doc, sequence)
+
+    def sign_off(self, doc: str, sequence: int, who: str) -> PageInfo:
+        """Mark the page reviewed; raises `edits.EditConflict` while a disagreement is open."""
+        edits.sign_off(self.s, self.st, doc, self._row(doc, sequence), who)
+        return self.page(doc, sequence)
+
+    def reopen(self, doc: str, sequence: int) -> PageInfo:
+        edits.reopen(self.s, self.st, doc, self._row(doc, sequence))
+        return self.page(doc, sequence)
 
     # --- destinations --------------------------------------------------------------------------------
     def sinks(self) -> list:
