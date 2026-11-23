@@ -17,8 +17,9 @@ What you get, per root directory:
 - **Exports** — the same pages as Markdown, plain text, one JSON document or JSON-lines (`ocrmd export`).
 - **Destinations** — hand a page's reading to another system that speaks a small HTTP contract (`ocrmd send`); [law-ai](https://github.com/bamr87/law-ai) is the worked example.
 - **A library** — `from ocrmd.api import Library` embeds all of it in another program.
+- **A phone app** — iOS and Android, paired with your computer: the phone is the camera and a review screen, the computer does the reading ([mobile/](mobile/README.md)).
 
-Built and tuned on a fixed camera over a textbook. Page images are sent to the provider you configure; nothing else leaves the machine.
+Built and tuned on a fixed camera over a textbook. Page images are sent to the provider you configure; nothing else leaves the machine — a paired phone sends its photos *to* it.
 
 ## Features
 
@@ -27,6 +28,7 @@ Built and tuned on a fixed camera over a textbook. Page images are sent to the p
 - Ingests from a webcam (an auto-shutter that waits for a page turn to finish), a folder of photos or a PDF
 - A SQLite inventory with full-text search across every scanned page
 - Exports to Markdown, plain text and JSON, plus a local web UI for scanning, review and editing
+- A phone app for iOS and Android: shoot pages with the phone's camera or document scanner (queued offline), review disagreements on the phone; the computer still reads every page ([docs/mobile.md](docs/mobile.md))
 - Structured-data extraction (`ocrmd etl`) and hand-off to configured destinations (`ocrmd send`)
 - Rebuilds pages from their Markdown and scores them against the photograph (`ocrmd reconstruct`); folds pen and highlighter marks back into the Markdown (`ocrmd annotate`)
 - Works offline: without credentials it runs OCR-only, and `ocrmd verify` fills in the model pass later
@@ -75,7 +77,15 @@ ocrmd doctor --costs
 ocrmd --debug verify                           # full tracebacks and debug logs
 ```
 
-Every command and option, with its default, is in the generated [CLI reference](docs/reference/cli.md).
+With a phone instead of a webcam ([docs/mobile.md](docs/mobile.md)):
+
+```sh
+ocrmd serve --lan                              # the UI, and the phone app's API, open to paired devices on the LAN
+ocrmd pair                                     # a one-time code and QR code; scan it with the app
+ocrmd devices --revoke "Kitchen iPad"          # paired phones; revoke one
+```
+
+Every command and option, with its default, is in the generated [CLI reference](docs/reference/cli.md); the phone app's API is in the [API reference](docs/reference/api.md).
 
 ## Configuration
 
@@ -88,6 +98,7 @@ Every setting has a default, can be set in `ocrmd.toml` (project root) or `~/.co
 - [Setup](docs/setup.md) — credentials, camera permission, OCR engines, configuration.
 - [Scanning with a webcam](docs/scanning.md) — the rig, the scan window and its keys, getting captures the OCR can use, what the shutter refuses, tuning it.
 - [The web UI](docs/web-ui.md) — library, scan, documents, page review and editing, jobs, settings.
+- [The phone app](docs/mobile.md) — pairing a phone, shooting pages with it, the offline upload queue, review on the phone, security, building the app.
 - [Output](docs/output.md) — the files on disk, each page's verification status, and which edits survive a re-run.
 - [Inventory, search, exports and extraction](docs/corpus.md) — `library`, `search`, `export` and `etl`.
 - [Destinations and the library API](docs/integrations.md) — the sink contract and `ocrmd.api.Library`.
@@ -100,6 +111,7 @@ Every setting has a default, can be set in `ocrmd.toml` (project root) or `~/.co
 | Path | What lives there |
 | --- | --- |
 | `ocrmd/` | The package (flat, no sub-packages): CLI, pipeline stages, capture, OCR engines, LLM providers, store, exports, sinks, and `web/` (FastAPI + a dependency-free SPA) |
+| `mobile/` | The phone app for iOS and Android: Expo (React Native, TypeScript), a client of the server's `/api/v1` |
 | `tests/` | pytest suite: synthetic PIL-rendered pages, a fake provider, a temporary root per test |
 | `docs/` | Guides, [architecture](docs/ARCHITECTURE.md), generated `reference/`, and [ADRs](docs/adr/README.md) |
 | `tools/` | `gen_reference.py` (writes `docs/reference/`) and `docs_index.py` (writes the docs index) |
