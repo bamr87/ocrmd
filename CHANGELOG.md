@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/bamr87/ocrmd/compare/v0.2.0...v0.3.0) (2026-11-23)
+
+
+### Added
+
+* **mobile:** add the ocrmd phone app for iOS and Android ([8e6ec2a](https://github.com/bamr87/ocrmd/commit/8e6ec2aaf534a31d5d89dd07d2b2dece43d474ce))
+* phone app for iOS and Android as a paired client (serve --lan, /api/v1, mobile/) ([159d8d9](https://github.com/bamr87/ocrmd/commit/159d8d94d5a6580adc437717ba9da13c86eda0d2))
+* **serve:** pair phones with serve --lan and a versioned /api/v1 ([810b2d8](https://github.com/bamr87/ocrmd/commit/810b2d818fe85f80ac07a1d9bad2518b5b2f4fb1))
+
+
+### Changed
+
+* **web:** share page views and human-edit writes across clients ([e503093](https://github.com/bamr87/ocrmd/commit/e503093205fea669bc401962c509da8ab161b5f2))
+
 ## [0.2.0](https://github.com/bamr87/ocrmd/compare/v0.1.1...v0.2.0) (2026-11-18)
 
 
