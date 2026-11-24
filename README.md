@@ -89,7 +89,7 @@ Every command and option, with its default, is in the generated [CLI reference](
 
 ## Configuration
 
-Every setting has a default, can be set in `ocrmd.toml` (project root) or `~/.config/ocrmd/config.toml`, and can be overridden by an `OCRMD_<KEY>` environment variable; CLI flags win over all of them. Invalid values fail fast with the offending key named, and `ocrmd doctor` prints the effective model/provider/focus/workers. The generated [settings reference](docs/reference/settings.md) lists every key with its variable, default and the measurement behind it; [ocrmd.example.toml](ocrmd.example.toml) is a commented file to start from.
+Every setting has a default, can be set in `ocrmd.toml` (project root) or `~/.config/ocrmd/config.toml`, and can be overridden by an `OCRMD_<KEY>` environment variable; CLI flags win over all of them. Invalid values fail fast with the offending key named, and `ocrmd doctor` prints the effective model/provider/focus/workers, whether the orientation probe is on (`orientation:`, naming `OCRMD_ORIENTATION_PROBE` when it is off) and how many stored pages had each rotation applied. The generated [settings reference](docs/reference/settings.md) lists every key with its variable, default and the measurement behind it; [ocrmd.example.toml](ocrmd.example.toml) is a commented file to start from.
 
 ## Documentation
 

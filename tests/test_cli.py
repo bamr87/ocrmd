@@ -273,3 +273,32 @@ def test_serve_loopback_hosts_are_unchanged(served, host):
     r = runner.invoke(cli.app, ["serve", "--no-open"] + (["--host", host] if host else []))
     assert r.exit_code == 0, r.output
     assert served == [host or "127.0.0.1"] and served.access == ["local"]
+
+
+def test_doctor_prints_the_orientation_probe(cli_root, monkeypatch):
+    monkeypatch.setattr(cli, "S", cli_root.model_copy(update={"orientation_probe": False}))
+    out = runner.invoke(cli.app, ["doctor"]).output
+    line = next(ln for ln in out.splitlines() if ln.startswith("orientation:"))
+    assert "probe=off" in line and "OCRMD_ORIENTATION_PROBE" in line and "docs/scanning.md" in line
+    monkeypatch.setattr(cli, "S", cli_root.model_copy(update={"orientation_probe": True}))
+    out = runner.invoke(cli.app, ["doctor"]).output
+    assert "orientation: probe=on" in out
+
+
+def test_doctor_prints_the_rotation_applied(cli_root):
+    import json
+    from ocrmd.store import Store
+    st = Store(cli_root.db_path); st.ensure_document("book")
+    for i, rot in enumerate([0, 90, 90, 270]):
+        st.add_page(f"q{i:015d}", "book", f"sha{i}", 0, None, 1200, None)
+        (cli_root.processed / f"q{i:015d}.json").write_text(json.dumps({"orientation": rot}))
+    st.close()
+    out = runner.invoke(cli.app, ["doctor"]).output
+    assert "rotation applied: 0° 1 · 90° 2 · 180° 0 · 270° 1" in out, out
+    assert "sideways" not in out
+
+
+def test_ingest_help_names_the_orientation_probe():
+    import re
+    out = re.sub(r"\x1b\[[0-9;]*m", "", runner.invoke(cli.app, ["ingest", "--help"], env={"COLUMNS": "200"}).output)
+    assert "OCRMD_ORIENTATION_PROBE" in out and "orientation_probe" in out

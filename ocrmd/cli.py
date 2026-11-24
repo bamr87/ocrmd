@@ -576,7 +576,13 @@ def ingest(paths: list[Path], doc: str = typer.Option(..., help="document slug")
            watch: bool = typer.Option(False, "--watch", help="keep watching the directory for new files (Ctrl-C to stop)"),
            title: str | None = typer.Option(None), tag: list[str] = typer.Option([], "--tag"),
            project: str | None = typer.Option(None)):
-    """Ingest image files or PDFs (png/jpg/tiff/webp, pdf with the `pdf` extra) as pages."""
+    """Ingest image files or PDFs (png/jpg/tiff/webp, pdf with the `pdf` extra) as pages.
+
+    Which way up each page is comes from a geometry cascade unless `orientation_probe` is on
+    (OCRMD_ORIENTATION_PROBE=true): the probe asks OCR at all four rotations and is measurably better
+    (the cascade is about 30% right end to end on real captures) but costs 4–8 extra OCR passes a page,
+    and with rapidocr it has crashed inside RapidOCR's ONNX detector. See docs/scanning.md.
+    """
     st = _store(); st.ensure_document(doc)
     render.ensure_document_meta(S.documents / doc, doc, title=title, tags=list(tag), project=project)
     prov = _provider(no_llm, provider, model)
@@ -1010,7 +1016,7 @@ def ocr_bench(doc: str | None = None,
 
 @app.command()
 def doctor(costs: bool = False):
-    """Show engines, cameras, credentials, configuration, database health and spend."""
+    """Show engines, cameras, credentials, configuration, orientation, database health and spend."""
     from .web.health import doctor_report
     rep = doctor_report(S, _store())
     typer.echo(f"root:        {rep['root']}")
@@ -1021,6 +1027,15 @@ def doctor(costs: bool = False):
                f"   installed: {', '.join(rep['ocr_engines_installed']) or 'none'}")
     typer.echo(f"anthropic:   {'credentials found' if rep['credentials']['anthropic'] else 'no credentials (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in .env)'}")
     typer.echo(f"xai:         {'XAI_API_KEY set' if rep['credentials']['xai'] else 'no credentials'}")
+    if rep["orientation"]["probe"]:
+        typer.echo("orientation: probe=on (OCR at all four rotations)")
+    else:
+        typer.secho("orientation: probe=off (geometry cascade, ~30% right end to end on real captures — "
+                    "set OCRMD_ORIENTATION_PROBE=true, see docs/scanning.md)", fg="yellow")
+    rot = rep["orientation"]["rotation_applied"]
+    if any(rot.values()):
+        typer.echo("             rotation applied: " + " · ".join(f"{r}° {rot[r]}" for r in ("0", "90", "180", "270"))
+                   + (f" · unknown {rot['unknown']}" if rot["unknown"] else ""))
     if not rep["dictionary"]:
         typer.secho("dictionary:  /usr/share/dict/words missing — orientation falls back to weaker evidence", fg="yellow")
     for cam in rep["cameras"]:
