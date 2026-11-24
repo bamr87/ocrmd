@@ -19,7 +19,7 @@ repo: bamr87/ocrmd
 features:
   - id: OCRMD-001
     title: "CLI: scan, ingest"
-    description: "CLI: scan, ingest (incl. `--watch`), verify (incl. Batches API), review, status, reprocess, delete, build, read, library, search, export, send, etl, ocr-bench, doctor"
+    description: "CLI: scan, ingest (incl. `--watch`), verify (incl. Batches API), review, status, reprocess, delete, build, read, library, search, export, send, etl, ocr-bench, doctor, serve (incl. `--lan`), pair, devices"
     implemented: true
     status: shipped
     prd: [FR2, FR3]
@@ -118,3 +118,21 @@ features:
     surface: docs
     link: "docs/constitution.md"
     docs: "PRD.md"
+  - id: OCRMD-012
+    title: "Phone app for iOS and Android"
+    description: "An Expo (React Native) app that pairs with the operator's own ocrmd, shoots pages with the phone's camera or its document scanner into an offline upload queue, shows what each shot became, and reviews pages (resolve disagreements, edit, sign off) and searches the library. A client only: the computer reads every page. Type-checked against the generated /api/v1 contract and unit-tested in CI; not yet run on a physical device."
+    implemented: true
+    status: partial
+    prd: [FR7]
+    surface: ui
+    link: "mobile/"
+    docs: "docs/mobile.md"
+  - id: OCRMD-013
+    title: "Paired-device access and the /api/v1 contract"
+    description: "`ocrmd serve --lan` opens the server to the local network for paired devices only; `ocrmd pair` (or Settings → Phones & tablets) issues a one-time code exchanged for a hashed bearer token; `ocrmd devices` lists and revokes. `/api/v1` is the versioned, typed API with a generated OpenAPI document (docs/reference/openapi-v1.json)."
+    implemented: true
+    status: shipped
+    prd: [FR7, NFR4]
+    surface: infra
+    link: "ocrmd/web/v1.py"
+    docs: "docs/mobile.md"

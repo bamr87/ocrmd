@@ -913,14 +913,53 @@ async function settingsView(slug) {
       <div class="panel">${doctor.cameras.map((c) => `<div><b>${c.index}: ${esc(c.name)}</b> ${c.format ? `${c.format[0]}×${c.format[1]}` : ""} <span class="muted small">focus ${esc(c.focus || "?")} (${(c.focus_modes || []).join(", ") || "fixed"}) · exposure ${esc(c.exposure || "?")}</span>${c.warning ? `<div class="warn small">${esc(c.warning)}</div>` : ""}</div>`).join("") || '<span class="muted">none found</span>'}</div>
       <h2>Documents</h2>
       <div class="panel">${doctor.documents.map((d) => `<div><b>${esc(d.slug)}</b> ${d.pages} page(s): ${Object.entries(d.counts).map(([k, n]) => `${n} ${k}`).join(", ")}</div>`).join("") || '<span class="muted">none</span>'}</div>
+      <h2>Phones &amp; tablets</h2>
+      <div class="panel" id="devices"><span class="muted">loading…</span></div>
     </div>
   </div>`;
+  devicesPanel();
   $("#m-doc").onchange = () => { location.hash = `#/settings/${$("#m-doc").value}`; };
   const sd = $("#save-doc");
   if (sd) sd.onclick = async () => {
     const body = {};
     view.querySelectorAll("[data-k]").forEach((i) => { const k = i.dataset.k; body[k] = ["author", "tags"].includes(k) ? i.value.split(",").map((x) => x.trim()).filter(Boolean) : k === "year" ? (i.value ? Number(i.value) : null) : (i.value || null); });
     try { await api(`/api/documents/${encodeURIComponent(slug)}/meta`, { method: "PUT", body }); toast("document.yaml saved — run Build to inherit into pages", "ok"); } catch (e) { toast(e.message, "err"); }
+  };
+}
+
+/* ---------- paired devices: the phone app (ocrmd/devices.py, /api/v1) ---------- */
+async function devicesPanel() {
+  const box = $("#devices");
+  if (!box) return;
+  let server, devices;
+  try { [server, devices] = await Promise.all([api("/api/v1/server"), api("/api/v1/devices")]); }
+  catch (e) { box.innerHTML = `<span class="muted">${esc(e.message)}</span>`; return; }
+  const when = (t) => (t ? esc(t.replace("T", " ").slice(0, 16)) : "never");
+  box.innerHTML = `
+    ${server.access === "paired" ? '<div class="small ok">Open to paired devices on the local network (<code>serve --lan</code>).</div>'
+      : `<div class="small warn">This server only answers this computer${server.access === "open" ? " — and everyone else, with no authentication (<code>--allow-remote</code>)" : ""}. Restart it with <code>ocrmd serve --lan</code> so the phone app can reach it.</div>`}
+    <table class="small" style="margin-top:8px">${devices.map((d) => `<tr><td><b>${esc(d.name || "unnamed")}</b> <span class="muted">${esc(d.platform || "")}</span></td>
+      <td class="muted">${d.pending ? "waiting for its code" : `last seen ${when(d.last_seen_at)}`}</td>
+      <td><button data-revoke="${esc(d.id)}">${d.pending ? "Cancel" : "Revoke"}</button></td></tr>`).join("") || '<tr><td class="muted">no paired devices</td></tr>'}</table>
+    <div class="row" style="margin-top:8px"><input id="pair-name" placeholder="name (optional)"><button class="primary" id="pair-new">Pair a phone</button></div>
+    <div id="pair-out"></div>
+    <div class="muted small" style="margin-top:8px">The app is in <code>mobile/</code>; a device's token is shown to the phone alone. From a terminal: <code>ocrmd pair</code>, <code>ocrmd devices</code>.</div>`;
+  box.querySelectorAll("[data-revoke]").forEach((b) => { b.onclick = async () => {
+    try { await api(`/api/v1/devices/${encodeURIComponent(b.dataset.revoke)}`, { method: "DELETE" }); devicesPanel(); } catch (e) { toast(e.message, "err"); }
+  }; });
+  $("#pair-new").onclick = async () => {
+    try {
+      const p = await api("/api/v1/devices/pairings", { method: "POST", body: { name: $("#pair-name").value || null } });
+      await devicesPanel();                      // the new code is listed as waiting; then show it below
+      const mins = Math.round((p.expires_at * 1000 - Date.now()) / 60000);
+      // the QR code is an SVG this server drew (segno); nothing user-supplied goes into it
+      $("#pair-out").innerHTML = `<div class="row" style="margin-top:8px;align-items:flex-start">
+        ${p.qr_svg ? `<div style="background:#fff;padding:4px">${p.qr_svg}</div>` : '<div class="muted small">pip install \'ocrmd[mobile]\' for a QR code</div>'}
+        <dl class="kv small"><dt>code</dt><dd class="mono" style="font-size:1.4em">${esc(p.code)}</dd><dt>server</dt><dd class="mono">${esc(p.server)}</dd>
+        <dt>valid</dt><dd>${mins} min, once</dd></dl></div>
+        <div class="muted small">Scan it with the ocrmd app (or the phone's camera), or type the server and code into the app.</div>`;
+      setTimeout(devicesPanel, (p.expires_at * 1000 - Date.now()) + 1000);
+    } catch (e) { toast(e.message, "err"); }
   };
 }
 

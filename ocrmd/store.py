@@ -1,4 +1,4 @@
-"""SQLite state: documents, pages, captures, stages, llm_calls, batches.
+"""SQLite state: documents, pages, captures, stages, llm_calls, batches, paired devices.
 
 One connection, shared across threads (`scan` runs OCR on one worker and LLM calls on a small pool).
 Every method takes the lock, so callers never see a half-applied read-then-write sequence, and the
@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS page_text(
 CREATE TABLE IF NOT EXISTS doc_exports(
   document TEXT NOT NULL, format TEXT NOT NULL, path TEXT NOT NULL, at TEXT NOT NULL,
   PRIMARY KEY(document, format));
+CREATE TABLE IF NOT EXISTS devices(
+  id TEXT PRIMARY KEY, name TEXT, platform TEXT, code_hash TEXT, code_expires REAL, token_hash TEXT UNIQUE,
+  created_at TEXT NOT NULL, paired_at TEXT, last_seen_at TEXT, revoked_at TEXT);
 CREATE INDEX IF NOT EXISTS pages_doc_seq ON pages(document, sequence);
 CREATE INDEX IF NOT EXISTS page_text_doc ON page_text(document, sequence);
 CREATE INDEX IF NOT EXISTS pages_status ON pages(document, status);
@@ -509,3 +512,53 @@ class Store:
     @_locked
     def open_batches(self):
         return self.db.execute("SELECT * FROM batches WHERE status='in_progress' ORDER BY created_at").fetchall()
+
+    # paired devices (devices.py holds the policy; only hashes of codes and tokens are stored) -----
+    @_locked
+    def add_pairing(self, device_id: str, name: str | None, code_hash: str, expires: float) -> None:
+        self.db.execute("INSERT INTO devices(id, name, code_hash, code_expires, created_at) VALUES(?,?,?,?,?)",
+                        (device_id, name, code_hash, expires, now()))
+        self.db.commit()
+
+    @_locked
+    def claim_pairing(self, code_hash: str, at: float, token_hash: str, name: str, platform: str | None):
+        """Exchange a live, unclaimed pairing code for a token, once. Returns the device row, or None."""
+        row = self.db.execute("SELECT * FROM devices WHERE code_hash=? AND token_hash IS NULL AND revoked_at IS NULL "
+                              "AND code_expires>=?", (code_hash, at)).fetchone()
+        if row is None:
+            return None
+        self.db.execute("UPDATE devices SET token_hash=?, code_hash=NULL, code_expires=NULL, name=COALESCE(name, ?), "
+                        "platform=?, paired_at=?, last_seen_at=? WHERE id=?",
+                        (token_hash, name, platform, now(), now(), row["id"]))
+        self.db.commit()
+        return self.db.execute("SELECT * FROM devices WHERE id=?", (row["id"],)).fetchone()
+
+    @_locked
+    def device_by_token(self, token_hash: str):
+        return self.db.execute("SELECT * FROM devices WHERE token_hash=? AND revoked_at IS NULL", (token_hash,)).fetchone()
+
+    @_locked
+    def touch_device(self, device_id: str) -> None:
+        self.db.execute("UPDATE devices SET last_seen_at=? WHERE id=?", (now(), device_id))
+        self.db.commit()
+
+    @_locked
+    def devices(self, include_revoked: bool = False) -> list[sqlite3.Row]:
+        q = "SELECT * FROM devices" + ("" if include_revoked else " WHERE revoked_at IS NULL") + " ORDER BY created_at"
+        return self.db.execute(q).fetchall()
+
+    @_locked
+    def revoke_device(self, device_id: str) -> bool:
+        """Revoke a paired device or cancel a pending pairing. The row stays, as the record that it existed."""
+        cur = self.db.execute("UPDATE devices SET revoked_at=?, code_hash=NULL WHERE id=? AND revoked_at IS NULL",
+                              (now(), device_id))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    @_locked
+    def cancel_pairings(self) -> int:
+        """Void every pairing code not yet claimed (too many wrong guesses, or the operator changed their mind)."""
+        cur = self.db.execute("UPDATE devices SET revoked_at=?, code_hash=NULL WHERE token_hash IS NULL AND revoked_at IS NULL",
+                              (now(),))
+        self.db.commit()
+        return cur.rowcount

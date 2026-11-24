@@ -1,0 +1,21 @@
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+# generated native projects (`npx expo prebuild`); EAS Build makes its own
+/ios
+/android
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.metro-health-check*
+npm-debug.*
+*.tsbuildinfo
+.env*.local
+# no lockfiles in this repo (AGENTS.md): package.json pins exact versions instead
+package-lock.json
+yarn.lock
+pnpm-lock.yaml

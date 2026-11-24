@@ -207,12 +207,18 @@ def test_library_search_export_and_sinks_from_the_command_line(cli_root, monkeyp
 
 @pytest.fixture
 def served(monkeypatch, cli_root):
-    """Stand-in for uvicorn so `serve` never binds a port; records the host it would have bound."""
+    """Stand-in for uvicorn so `serve` never binds a port; records the host it would have bound, and in
+    `.access` the access mode the app was built with."""
     import uvicorn
     from ocrmd.web import app as webapp
-    calls: list[str] = []
+
+    class Served(list):
+        access: list[str]
+
+    calls = Served()
+    calls.access = []
     monkeypatch.setattr(uvicorn, "run", lambda application, host, port, **kw: calls.append(host))
-    monkeypatch.setattr(webapp, "create_app", lambda settings: object())
+    monkeypatch.setattr(webapp, "create_app", lambda settings, access="local": calls.access.append(access) or object())
     return calls
 
 
@@ -227,14 +233,46 @@ def test_serve_refuses_a_non_loopback_host_without_allow_remote(served, host):
 def test_serve_binds_a_non_loopback_host_only_with_allow_remote(served):
     r = runner.invoke(cli.app, ["serve", "--host", "0.0.0.0", "--allow-remote", "--no-open"])
     assert r.exit_code == 0, r.output
-    assert "warning" in r.output and served == ["0.0.0.0"]
+    assert "warning" in r.output and served == ["0.0.0.0"] and served.access == ["open"]
+
+
+def test_serve_lan_binds_every_interface_for_paired_devices_only(served):
+    r = runner.invoke(cli.app, ["serve", "--lan", "--no-open"])
+    assert r.exit_code == 0, r.output
+    assert served == ["0.0.0.0"] and served.access == ["paired"]
+    assert "phone app: http://" in r.output and "0 paired device(s)" in r.output
+
+
+def test_serve_lan_keeps_a_concrete_host_and_refuses_allow_remote_with_it(served):
+    r = runner.invoke(cli.app, ["serve", "--lan", "--host", "192.168.1.20", "--no-open"])
+    assert r.exit_code == 0 and served == ["192.168.1.20"] and served.access == ["paired"]
+    assert "http://192.168.1.20:8765" in r.output
+    r = runner.invoke(cli.app, ["serve", "--lan", "--allow-remote", "--no-open"])
+    assert r.exit_code == 2 and "pick one" in r.output
+
+
+def test_pair_prints_a_one_time_code_and_devices_lists_and_revokes(cli_root):
+    from ocrmd import devices as devices_mod
+    from ocrmd.store import Store
+    r = runner.invoke(cli.app, ["pair", "--name", "my phone", "--host", "192.168.1.20"])
+    assert r.exit_code == 0, r.output
+    code = next(line.split()[-1] for line in r.output.splitlines() if line.startswith("code:"))
+    assert "ocrmd://pair?server=http%3A%2F%2F192.168.1.20%3A8765&code=" + code.replace("-", "") in r.output
+    assert "my phone" in runner.invoke(cli.app, ["devices"]).output and "waiting for the code" in runner.invoke(cli.app, ["devices"]).output
+    st = Store(cli_root.db_path)
+    dev, token = devices_mod.claim(st, code, "Pixel", "android")
+    assert token not in runner.invoke(cli.app, ["devices"]).output           # a token is never printed
+    r = runner.invoke(cli.app, ["devices", "--revoke", "my phone"])
+    assert r.exit_code == 0 and f"revoked {dev.id}" in r.output and "no paired devices" in r.output
+    assert devices_mod.authenticate(st, token) is None
+    assert runner.invoke(cli.app, ["devices", "--revoke", "nobody"]).exit_code == 1
 
 
 @pytest.mark.parametrize("host", [None, "127.0.0.1", "localhost", "::1", "127.0.0.2"])
 def test_serve_loopback_hosts_are_unchanged(served, host):
     r = runner.invoke(cli.app, ["serve", "--no-open"] + (["--host", host] if host else []))
     assert r.exit_code == 0, r.output
-    assert served == [host or "127.0.0.1"]
+    assert served == [host or "127.0.0.1"] and served.access == ["local"]
 
 
 def test_doctor_prints_the_orientation_probe(cli_root, monkeypatch):

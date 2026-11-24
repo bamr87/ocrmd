@@ -872,43 +872,103 @@ def build(doc: str | None = None):
 
 
 def _is_loopback(host: str) -> bool:
-    """True for `localhost` and any loopback address (127.0.0.0/8, ::1, ::ffff:127.x). A name is not resolved:
-    anything that is not provably loopback counts as remote, so a typo errs toward refusing."""
-    import ipaddress
-    h = host.strip().strip("[]").lower()
-    if h == "localhost" or h.endswith(".localhost"):
-        return True
-    try:
-        ip = ipaddress.ip_address(h)
-    except ValueError:
-        return False
-    return ip.is_loopback or bool(getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_loopback)
+    from .devices import is_loopback
+    return is_loopback(host)
 
 
 @app.command()
-def serve(host: str = typer.Option("127.0.0.1", help="bind address; keep it local, there is no authentication"),
+def serve(host: str = typer.Option("127.0.0.1", help="bind address; keep it local unless you pass --lan"),
           port: int = typer.Option(8765),
           open_browser: bool = typer.Option(True, "--open/--no-open", help="open the UI in a browser"),
+          lan: bool = typer.Option(False, "--lan",
+                                   help="open the port to the local network for the phone app (binds 0.0.0.0 unless --host says otherwise); every request from another machine needs a paired device's token — see `ocrmd pair`"),
           allow_remote: bool = typer.Option(False, "--allow-remote",
-                                            help="allow a non-loopback --host; the UI has no authentication, so anyone who can reach the port can read your scans")):
-    """Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765."""
+                                            help="allow a non-loopback --host with NO authentication, so anyone who can reach the port can read your scans; prefer --lan")):
+    """Run the web UI: live scanning, page browser, review, jobs, metadata — at http://127.0.0.1:8765.
+
+    With `--lan` it is also the server the phone app talks to (`/api/v1`): this machine's browser needs
+    nothing, every other machine must be paired (`ocrmd pair`, or Settings in the UI).
+    """
     import threading, webbrowser
-    if not _is_loopback(host):
+    from . import devices as devices_mod
+    if lan and allow_remote:
+        _fail("pick one: --lan (paired devices only) or --allow-remote (no authentication)", 2)
+    if lan and _is_loopback(host):
+        host = "0.0.0.0"
+    access = "paired" if lan else "local"
+    if not _is_loopback(host) and not lan:
         if not allow_remote:
             typer.echo(f"refusing to bind {host}: the web UI has no authentication, so anyone who can reach "
-                       f"{host}:{port} could read your scanned pages and text. Pass --allow-remote to bind it "
-                       "anyway (trusted network only), or use the default 127.0.0.1.", err=True)
+                       f"{host}:{port} could read your scanned pages and text. Use --lan to open it to paired "
+                       "devices only (the phone app), pass --allow-remote to bind it anyway (trusted network "
+                       "only), or use the default 127.0.0.1.", err=True)
             raise typer.Exit(2)
+        access = "open"
         typer.echo(f"warning: binding {host} with no authentication; the UI is open to everyone who can reach "
                    f"{host}:{port}", err=True)
     import uvicorn
     from .web.app import create_app
-    application = create_app(S)
-    url = f"http://{host}:{port}"
+    application = create_app(S, access=access)
+    url = f"http://{'127.0.0.1' if lan and host in ('0.0.0.0', '::') else host}:{port}"
     typer.echo(f"ocrmd web UI at {url}  (Ctrl-C to stop)")
+    if lan:
+        st = _store()
+        n = len([d for d in devices_mod.list_devices(st) if not d.pending])
+        typer.echo(f"phone app: {devices_mod.server_url(host, port)} — {n} paired device(s); pair another with "
+                   "`ocrmd pair` or in Settings. Requests from other machines without a token are refused.")
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     uvicorn.run(application, host=host, port=port, log_level="warning")
+
+
+@app.command()
+def pair(name: str | None = typer.Option(None, "--name", help="what to call the device in `ocrmd devices` (default: the name the phone gives itself)"),
+         host: str | None = typer.Option(None, "--host", help="the address the phone should dial (default: this machine's LAN address)"),
+         port: int = typer.Option(8765, help="the port `ocrmd serve --lan` listens on")):
+    """Pair the phone app: print a one-time code, and a QR code carrying it, valid for 10 minutes.
+
+    Scan the QR code with the app (or the phone's camera), or type the server address and code into the
+    app's pairing screen. The server must be running with `ocrmd serve --lan`. Only a hash of the code is
+    stored; the device's own token is handed to the phone alone, never printed.
+    """
+    from . import devices as devices_mod
+    st = _store()
+    p = devices_mod.start_pairing(st, name)
+    url = devices_mod.server_url(host, port)
+    link = devices_mod.pair_link(url, p.code)
+    qr = devices_mod.qr_terminal(link)
+    if qr:
+        typer.echo(qr)
+    else:
+        typer.echo("(pip install 'ocrmd[mobile]' to print a QR code here)")
+    typer.echo(f"server: {url}")
+    typer.secho(f"code:   {p.display}", bold=True)
+    typer.echo(f"link:   {link}")
+    typer.echo(f"valid for {devices_mod.PAIR_TTL // 60} minutes, once. Start the server with `ocrmd serve --lan` if it "
+               "is not running; the phone must be on the same network.")
+
+
+@app.command()
+def devices(revoke: list[str] = typer.Option([], "--revoke", help="revoke a device (or cancel a pending code) by id or name; repeatable"),
+            all_: bool = typer.Option(False, "--all", help="include revoked devices")):
+    """List the devices paired with this ocrmd (the phone app), or revoke one.
+
+    A revoked device's next request is refused; pairing it again makes a new token.
+    """
+    from . import devices as devices_mod
+    st = _store()
+    for ref in revoke:
+        try:
+            d = devices_mod.revoke(st, ref)
+        except LookupError as e:
+            _fail(str(e))
+        typer.secho(f"revoked {d.id} ({d.name or 'unnamed'})", fg="yellow")
+    rows = devices_mod.list_devices(st, include_revoked=all_)
+    if not rows:
+        typer.echo("no paired devices; pair one with `ocrmd pair`")
+        return
+    for d in rows:
+        typer.secho(d.describe(), fg="red" if d.revoked_at else "yellow" if d.pending else None)
 
 
 @app.command("ocr-bench")

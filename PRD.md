@@ -27,6 +27,7 @@ Feature [OCRMD-011](features/features.yml) traces to requirement MR1.
 ## 2. Target users
 
 - People digitizing books and documents (e.g. study material) on a Mac
+- The same people with a phone as the camera and a review screen (iOS and Android), paired with their own computer
 - Developers embedding the pipeline via `ocrmd.api.Library`
 - Downstream systems receiving pages via the destination HTTP contract (e.g. law-ai)
 
@@ -46,11 +47,12 @@ Feature [OCRMD-011](features/features.yml) traces to requirement MR1.
 
 ## 4. Core features (current)
 
-- CLI: scan, ingest (incl. `--watch`), verify (incl. Batches API), review, status, reprocess, delete, build, read, library, search, export, send, etl, ocr-bench, doctor
+- CLI: scan, ingest (incl. `--watch`), verify (incl. Batches API), review, status, reprocess, delete, build, read, library, search, export, send, etl, ocr-bench, doctor, serve (incl. `--lan`), pair, devices
 - Local OCR: Apple Vision + RapidOCR voting (Tesseract fallback)
 - Vision-model providers: Anthropic (default) and xAI
 - Corpus per document (`documents/<slug>/pages/NNNN.md`) with rich front matter
 - Exports: md, txt, json, jsonl; local web UI
+- Phone app (iOS, Android): capture into an offline queue and review, against the operator's own server (`serve --lan`, `pair`, `devices`, `/api/v1`)
 - Structured-data ETL pipelines and destinations
 
 ## Feature catalog
@@ -108,6 +110,11 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 - FR5: Born-digital PDFs can take a structure-aware path (layout, tables, reading order via Docling or Marker) that is still reconciled against the PDF text layer, the local engines and the vision pass (OCRMD-009)
 - FR6: Ruled tables on camera scans are reconstructed as tables, not flattened prose, before reconcile (OCRMD-010)
 
+**Functional and non-functional (phone app — ADR 0002)**
+
+- FR7: A phone (iOS or Android) paired with the operator's own ocrmd can capture pages into an offline queue that uploads when the computer is reachable, report what each capture became, and review pages (resolve disagreements, edit, sign off); every page is still read and reconciled on the computer, never on the phone (OCRMD-012, OCRMD-013)
+- NFR4: Another machine reaches the server only with a paired device's token, obtained once by exchanging a one-time, expiring code made on the computer; codes and tokens are stored only as hashes; loopback behaviour is unchanged; the phone's API (`/api/v1`) is versioned, typed and generated, and changes additively (OCRMD-013)
+
 ## 6. Success metrics (proposed — not defined in sources)
 
 - OCR vs LLM disagreement rate per page
@@ -117,7 +124,8 @@ Every user-facing capability has a stable id in the feature catalog [`features/f
 
 ## 7. Roadmap / open questions
 
-- Supported non-macOS camera capture: TBD
+- Supported non-macOS camera capture: TBD (a phone is now an alternative to the webcam on any platform, FR7)
+- Phone app: HTTPS for the LAN link, background upload, store distribution and on-device OCR as additional evidence are not decided (ADR 0002)
 - xAI provider not exercised live (per README)
 - Nougat was considered as a math/LaTeX specialist and is not proposed: it is narrow (arXiv-style English papers), slower, and appears unmaintained relative to Docling / olmOCR-class local VLMs
 - Open PRs #22 and #26 both add a feature id OCRMD-007 (figure components vs constitution missions). This PR starts new ids at OCRMD-008 so either can keep 007. Rebase if those PRs land first and take 008+

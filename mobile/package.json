@@ -1,0 +1,46 @@
+{
+  "name": "ocrmd-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The ocrmd phone app: shoot pages with the phone's camera, review the cross-checked transcriptions, on iOS and Android.",
+  "license": "MIT",
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo start --ios",
+    "android": "expo start --android",
+    "gen:api": "npx --yes openapi-typescript@7.13.0 ../docs/reference/openapi-v1.json -o src/api/schema.d.ts --default-non-nullable false",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "check": "npm run gen:api && git diff --exit-code -- src/api/schema.d.ts && npm run typecheck && npm test -- --ci"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "58.0.17",
+    "expo": "58.0.26",
+    "expo-build-properties": "58.0.12",
+    "expo-camera": "58.0.14",
+    "expo-constants": "58.0.16",
+    "expo-crypto": "58.0.8",
+    "expo-device": "58.0.5",
+    "expo-file-system": "58.0.14",
+    "expo-image": "58.0.18",
+    "expo-keep-awake": "58.0.4",
+    "expo-linking": "58.0.17",
+    "expo-router": "58.0.32",
+    "expo-secure-store": "58.0.3",
+    "expo-splash-screen": "58.0.14",
+    "expo-status-bar": "58.0.5",
+    "react": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-safe-area-context": "5.11.1",
+    "react-native-screens": "4.30.1"
+  },
+  "devDependencies": {
+    "@react-native/jest-preset": "0.88.1",
+    "@types/jest": "30.0.0",
+    "@types/react": "19.3.0",
+    "jest": "30.5.2",
+    "jest-expo": "58.0.15",
+    "typescript": "6.0.3"
+  }
+}
