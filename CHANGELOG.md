@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/bamr87/ocrmd/compare/v0.3.0...v0.3.1) (2026-11-27)
+
+
+### Fixed
+
+* **doctor:** report the orientation probe and the rotation applied to stored pages ([a31d92b](https://github.com/bamr87/ocrmd/commit/a31d92b0610d2fb7fec7dcc470dc0e0e1b4626a6)), closes [#34](https://github.com/bamr87/ocrmd/issues/34)
+
 ## [0.3.0](https://github.com/bamr87/ocrmd/compare/v0.2.0...v0.3.0) (2026-11-23)
 
 
