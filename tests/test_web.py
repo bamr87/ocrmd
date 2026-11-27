@@ -100,6 +100,19 @@ def test_extraction_pipelines_are_listed_and_run_as_a_job(client, root, store):
     assert client.get("/api/documents/web-book/extracted/../../ocrmd.db").status_code in (404, 400)
 
 
+def test_the_page_bridge_is_written_only_when_asked_for(client, monkeypatch):
+    """The fleet's assistant panel is for whoever works on ocrmd: a user's page never carries the tag."""
+    monkeypatch.delenv("FLEET_ASSIST", raising=False)
+    assert "fleet-assist" not in client.get("/").text
+    monkeypatch.setenv("FLEET_ASSIST", "1")
+    page = client.get("/").text
+    assert page.count("<fleet-assist ") == 1 and 'repo="bamr87/ocrmd"' in page
+    assert page.index("<fleet-assist ") < page.index("</body>")
+    assert client.get("/static/fleet-assist.js").status_code == 200
+    monkeypatch.setenv("FLEET_ASSIST", "0")
+    assert "fleet-assist" not in client.get("/").text
+
+
 def test_index_and_system_endpoints(client):
     assert "<title>ocrmd</title>" in client.get("/").text
     assert client.get("/static/app.js").status_code == 200

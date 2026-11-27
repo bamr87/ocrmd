@@ -8,7 +8,7 @@ is built against. Who may call either is `auth.py`: bound to loopback nothing is
 anything that is not this machine.
 """
 from __future__ import annotations
-import logging, re, time
+import logging, os, re, time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,13 @@ from .jobs import JobManager, KINDS, BUNDLED_PIPELINES, pipelines as etl_pipelin
 
 log = logging.getLogger("ocrmd.web")
 STATIC = Path(__file__).parent / "static"
+# The fleet's page bridge (bamr87/bamr87 templates/assistant, vendored as static/fleet-assist.js): with it a Claude
+# Code session paired through the Harness Console can see the page a developer has open. It is a tool for whoever
+# works ON ocrmd, not for whoever uses it, and every address ocrmd serves is a loopback one, so the page cannot
+# tell the two apart: the tag is written only under FLEET_ASSIST=1 (the switch the kit's MkDocs adapter uses).
+FLEET_ASSIST_TAG = ('<script src="/static/fleet-assist.js" defer></script>\n'
+                    '<fleet-assist repo="bamr87/ocrmd" branch="main" source="ocrmd/web/static/index.html" '
+                    'framework="static-html"></fleet-assist>\n')
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 DOC_META_FIELDS = ("title", "author", "edition", "publisher", "year", "isbn", "citation", "citation_key",
@@ -180,7 +187,10 @@ def create_app(s: Settings, access: str = "local") -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index():
-        return (STATIC / "index.html").read_text(encoding="utf-8")
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        if os.environ.get("FLEET_ASSIST") == "1":
+            html = html.replace("</body>", FLEET_ASSIST_TAG + "</body>", 1)
+        return html
 
     # --- system ----------------------------------------------------------------------------------
     @app.get("/api/doctor")

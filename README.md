@@ -129,6 +129,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,rapidocr]'
 .venv/bin/ruff check ocrmd tests
 .venv/bin/python -m pytest
 .venv/bin/python tools/gen_reference.py --write   # after changing a command, an option or a setting
+FLEET_ASSIST=1 .venv/bin/ocrmd serve              # the web UI with the fleet's assistant panel (development only)
 ```
 
 Full commands, conventions and invariants for humans and AI agents live in [AGENTS.md](AGENTS.md).
